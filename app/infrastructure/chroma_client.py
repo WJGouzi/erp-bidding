@@ -155,7 +155,10 @@ class ChromaDBClient:
         self, name: str, tenant: Optional[str] = None, database: Optional[str] = None,
         metadata: Optional[dict] = None, get_or_create: bool = True,
     ) -> dict:
-        """创建或获取集合。"""
+        """创建或获取集合。
+
+        返回包含 id 的集合信息 dict。
+        """
         tenant, database, name = self._norm_ctx(tenant, database, name)
         if self.auto_provision:
             self._ensure_tenant_database(tenant, database)
@@ -164,7 +167,8 @@ class ChromaDBClient:
             try:
                 return self.get_collection(name, tenant, database)
             except RuntimeError as e:
-                if "404" not in str(e) and "not found" not in str(e).lower():
+                err_msg = str(e).lower()
+                if "404" not in err_msg and "not found" not in err_msg and "does not exist" not in err_msg:
                     raise
 
         payload: dict[str, Any] = {"name": name}
@@ -176,7 +180,16 @@ class ChromaDBClient:
             params={"tenant": tenant, "database": database},
             json=payload,
         )
-        return result if isinstance(result, dict) else {"name": name}
+        # 如果 POST 返回了包含 id 的 dict，直接使用
+        if isinstance(result, dict) and result.get("id"):
+            return result
+        # 否则回退：重试一次 GET（处理创建后的传播延迟）
+        try:
+            import time
+            time.sleep(0.5)
+            return self.get_collection(name, tenant, database)
+        except RuntimeError:
+            return {"name": name}
 
     def get_collection(self, name: str, tenant: Optional[str] = None, database: Optional[str] = None) -> dict:
         """获取集合信息。"""
@@ -208,8 +221,11 @@ class ChromaDBClient:
     ):
         """写入或更新向量数据。"""
         tenant, database, collection = self._norm_ctx(tenant, database, collection)
-        self.create_collection(collection, tenant, database, get_or_create=True)
-        cid = self._collection_id(collection, tenant, database)
+        col_info = self.create_collection(collection, tenant, database, get_or_create=True)
+        # 优先从 create_collection 返回值取 id，避免立即再 GET
+        cid = col_info.get("id") if isinstance(col_info, dict) else None
+        if not cid:
+            cid = self._collection_id(collection, tenant, database)
 
         total = len(ids)
         if total == 0:

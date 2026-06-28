@@ -96,7 +96,7 @@ def _save_doc_chunks(file_id: int, chunks: list[dict], chroma_ids: list[str]):
             content=chunk["text"],
             section_path=chunk.get("section_path", ""),
             content_type=chunk.get("content_type", "paragraph"),
-            extra_metadata=json.dumps(chunk.get("metadata", {}), ensure_ascii=False) if chunk.get("metadata") else None,
+            # extra_metadata 暂未使用，元数据已存入 ChromaDB metadatas
             chroma_id=chroma_id,
         )
         db.session.add(doc_chunk)

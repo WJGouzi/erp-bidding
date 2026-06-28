@@ -34,7 +34,7 @@ from .pipeline import (
     batch_delete_tasks,
     cancel_task_execution,
     confirm_catalog,
-    confirm_check_items,
+    save_review,
     create_derived_task,
     create_original_task,
     delete_task,
@@ -98,7 +98,7 @@ class BiddingTaskService:
     get_packages = staticmethod(get_packages)
     select_package = staticmethod(select_package)
     get_check_items = staticmethod(get_check_items)
-    confirm_check_items = staticmethod(confirm_check_items)
+    save_review = staticmethod(save_review)
     get_catalog_options = staticmethod(get_catalog_options)
     confirm_catalog = staticmethod(confirm_catalog)
     get_generate_config = staticmethod(get_generate_config)

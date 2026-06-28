@@ -56,7 +56,7 @@ from .task_pipeline.workflow import (
     _delete_task_records,
     batch_delete_tasks,
     confirm_catalog,
-    confirm_check_items,
+    save_review,
     extract_catalog_from_file,
     get_subject_templates,
     create_derived_task,

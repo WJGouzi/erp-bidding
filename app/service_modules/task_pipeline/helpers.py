@@ -1751,88 +1751,13 @@ def _detect_package_info(text):
 
 
 def _extract_package_numbers(text):
-    """调用大模型从招标文本中提取分包列表，失败时回退到正则提取。
+    """从招标文本中提取分包列表（仅正则，无LLM）。
     
     返回 [{"package_no": "...", "package_name": "..."}]
     """
     if not text:
         return []
-    # 优先用大模型提取
-    try:
-        llm_result = _extract_packages_with_llm(text)
-        if llm_result is not None:
-            return llm_result
-    except Exception as exc:
-        logger.warning("[packages] LLM 分包提取异常，回退正则: %s", exc)
-    # 回退到正则提取
     return _extract_packages_fallback(text)
-
-
-def _extract_packages_with_llm(text):
-    """用大模型从招标文本中提取分包信息。
-    
-    使用前 8000 字符作为上下文，以提升识别准确率。
-    返回 [{"package_no": "...", "package_name": "..."}] 或 None（不可用/失败时）。
-    """
-    adapter = LLMAdapter(
-        api_key=current_app.config.get("OPENAI_API_KEY"),
-        base_url=current_app.config.get("OPENAI_BASE_URL"),
-        default_model=current_app.config.get("OPENAI_MODEL_NAME"),
-    )
-    if not adapter.is_available():
-        logger.warning("[packages] LLM 不可用，跳过模型调用")
-        return None
-
-    detail_text = text
-    system_prompt = (
-        "你是一个专业的招标文件解析助手。你的任务是从招标文本中提取所有分包（包号）信息。\n\n"
-        "分包在招标文件中常见的描述方式包括：\n"
-        "- 第X包、包X、包号X（X 可以是数字或中文数字）\n"
-        "- 采购包、标包、包段等提法\n"
-        "- '本项目分为X个包' 后列出的各个包\n\n"
-        "请严格按照要求的 JSON 格式输出，不要输出任何其他文字。"
-    )
-    user_prompt = (
-        "请从以下招标文本中提取所有分包信息，以 JSON 数组格式返回。\n"
-        "格式：[{\"package_no\": \"包号\", \"package_name\": \"包名称或描述\"}]\n\n"
-        "规则：\n"
-        "1. package_no 为包号标识（如 \"01\"、\"1\"、\"一\"），保持原文格式\n"
-        "2. package_name 为该包的名称或内容描述（如 \"信息化设备采购\"），无名称则填空字符串 \"\"\n"
-        "3. 如果整个项目只有1个包（即整包采购），视为无分包，返回 []\n"
-        "4. 如果文本中完全没有提及分包或包号信息，返回 []\n"
-        "5. 只返回 JSON 数组，不要包含任何解释、前缀或后缀文字\n"
-        "6. 不要添加 Markdown 代码块标记\n\n"
-        "招标文本：\n" + detail_text
-    )
-    try:
-        raw = adapter.generate_text(
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            temperature=0.1,
-            max_tokens=1000,
-        )
-        if not raw:
-            return None
-        cleaned = raw.strip()
-        cleaned = re.sub(r'^```\w*\n|```$', '', cleaned.strip(), flags=re.MULTILINE).strip()
-        array_match = re.search(r'\[.*\]', cleaned, re.DOTALL)
-        if array_match:
-            cleaned = array_match.group()
-        data = json.loads(cleaned)
-        if isinstance(data, list):
-            validated = []
-            for item in data:
-                if isinstance(item, dict) and item.get("package_no"):
-                    validated.append({
-                        "package_no": str(item["package_no"]).strip(),
-                        "package_name": (item.get("package_name") or "").strip(),
-                    })
-            return validated if validated else []
-        return []
-    except Exception as exc:
-        logger.warning("[packages] LLM 提取异常: %s", exc)
-        return None
-
 
 def _extract_packages_fallback(text):
     """正则方式回退提取包号。"""

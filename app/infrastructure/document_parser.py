@@ -27,6 +27,7 @@ class StructuredDocument:
         self.file_sha256 = file_sha256
         self.parse_version = parse_version
         self.sections = []  # list[Section]
+        self.tables = []  # list of python-docx Table objects
 
     def to_dict(self) -> dict:
         return {
@@ -34,6 +35,25 @@ class StructuredDocument:
             "file_sha256": self.file_sha256,
             "parse_version": self.parse_version,
             "sections": [s.to_dict() for s in self.sections],
+            "tables": [
+                {
+                    "headers": (
+                        # python-docx Table: 表头在第一行
+                        [cell.text.strip() for cell in t.rows[0].cells]
+                        if hasattr(t, "rows") and not hasattr(t, "headers")
+                        # TableStub: headers 属性直接可用
+                        else list(t.headers)
+                    ),
+                    "rows": (
+                        # python-docx Table: 从第二行开始取数据
+                        [[cell.text.strip() for cell in row.cells] for row in list(t.rows)[1:]]
+                        if hasattr(t, "rows") and not hasattr(t, "headers")
+                        # TableStub: rows 属性直接可用
+                        else [list(row) for row in t.rows]
+                    ),
+                }
+                for t in self.tables
+            ] if self.tables else [],
         }
 
     def to_json(self) -> str:
@@ -74,6 +94,19 @@ class StructuredDocument:
         for s_data in data.get("sections", []):
             section = Section.from_dict(s_data)
             doc.sections.append(section)
+        # 表格数据以纯文本形式缓存（不可序列化 python-docx 原生对象）
+        # 缓存的表格数据在 to_dict 中已转为 headers/rows 格式
+        table_data = data.get("tables", [])
+        if table_data:
+            from collections import namedtuple
+            TableStub = namedtuple("TableStub", ["headers", "rows"])
+            doc.tables = [
+                TableStub(
+                    headers=t.get("headers", []),
+                    rows=t.get("rows", []),
+                )
+                for t in table_data
+            ]
         return doc
 
 
@@ -175,7 +208,7 @@ class DocumentParser:
             self._parse_spreadsheet_structured(payload, doc, ext)
         else:
             # 纯文本兜底
-            text = payload.decode("utf-8", errors="ignore")
+            text = payload.decode("utf-8", errors="replace")
             section = Section(title="全文", level=1)
             section.content.append(ContentBlock(ContentBlock.TYPE_PARAGRAPH, text))
             doc.sections.append(section)
@@ -200,7 +233,7 @@ class DocumentParser:
             self._parse_docx_fallback(payload, doc)
             return
 
-        # Heading 样式映射
+        # Heading 样式映射（含 toc 样式）
         heading_map = {}
         for i in range(1, 10):
             style_name = f"Heading {i}"
@@ -208,6 +241,17 @@ class DocumentParser:
                 heading_map[style_name] = i
             except Exception:
                 pass
+
+
+        # 文本内容级别的标题检测模式
+        text_heading_patterns = [
+            (1, r'^第[一二三四五六七八九十零〇百千万亿]+[章节篇部]'),      # 第一章
+            (2, r'^[一二三四五六七八九十零〇]+[、，,．.]'),              # 一、
+            (2, r'^\d+[、，,．.]'),                                   # 1.
+            (2, r'^\d+\.\d+\s'),                                   # 1.1
+            (3, r'^（[一二三四五六七八九十零〇]+）'),                    # （一）
+            (3, r'^\d+\.\d+\.\d+\s'),                            # 1.1.1
+        ]
 
         stack = [Section(title="__root__", level=0)]
         current_section = stack[-1]
@@ -226,35 +270,100 @@ class DocumentParser:
                 # 弹出比当前层级深或相等的章节
                 while stack and stack[-1].level >= heading_level:
                     stack.pop()
-                if stack:
+                # 仅剩 __root__ 时直接加到 doc.sections（修复章节消失 bug）
+                if len(stack) == 1 and stack[0].level == 0:
+                    doc.sections.append(new_section)
+                elif stack:
                     stack[-1].children.append(new_section)
                 else:
                     doc.sections.append(new_section)
                 stack.append(new_section)
                 current_section = new_section
             else:
-                block = ContentBlock(ContentBlock.TYPE_PARAGRAPH, text)
-                # 尝试判断列表
-                num_prefix = re.match(r'^[\d一二三四五六七八九十]+[、.．\s]', text)
-                bullet_prefix = re.match(r'^[-\u2022\u25cf\u25cb\u25a0]\s', text)
-                if num_prefix or bullet_prefix:
-                    block.type = ContentBlock.TYPE_LIST
-                    block.level = 0
-                current_section.content.append(block)
+                # 文本内容级标题检测（当样式为 Normal 但内容像标题时）
+                text_heading = 0
+                for level, pattern in text_heading_patterns:
+                    if re.match(pattern, text):
+                        text_heading = level
+                        break
+                
+                if text_heading > 0 and heading_level == 0:
+                    # 跳过目录项（含 tab 或纯数字页码的短标题）
+                    if "\t" in text:
+                        # 来自 TOC 目录的条目，不作为章节
+                        block = ContentBlock(ContentBlock.TYPE_PARAGRAPH, text)
+                        current_section.content.append(block)
+                        continue
+                    new_section = Section(title=text, level=text_heading)
+                    while stack and stack[-1].level >= text_heading:
+                        stack.pop()
+                    # 仅剩 __root__ 时直接加到 doc.sections（修复章节消失 bug）
+                    if len(stack) == 1 and stack[0].level == 0:
+                        doc.sections.append(new_section)
+                    elif stack:
+                        stack[-1].children.append(new_section)
+                    else:
+                        doc.sections.append(new_section)
+                    stack.append(new_section)
+                    current_section = new_section
+                else:
+                    block = ContentBlock(ContentBlock.TYPE_PARAGRAPH, text)
+                    # 尝试判断列表
+                    num_prefix = re.match(r'^[\d一二三四五六七八九十]+[、.．\s]', text)
+                    bullet_prefix = re.match(r'^[-\u2022\u25cf\u25cb\u25a0]\s', text)
+                    if num_prefix or bullet_prefix:
+                        block.type = ContentBlock.TYPE_LIST
+                        block.level = 0
+                    current_section.content.append(block)
 
-        # 解析表格
-        for table in document.tables:
-            self._parse_table(table, doc)
+        # 在解析表格前，先保存栈中的段落内容
+        if stack:
+            root_section = stack[0]
+            # 将 root section 中的非标题内容保存为一个前言章节
+            if root_section.content:
+                from_title = root_section.content[0].text[:30] if root_section.content[0].text else ""
+                preamble = Section(title=from_title or "前言", level=1)
+                preamble.content = list(root_section.content)
+                root_section.content = []
+                doc.sections.insert(0, preamble)
+            # 将 root 下的子章节（文本检测到的标题）转移到 doc.sections
+            if root_section.children:
+                for child in root_section.children:
+                    child.level = 1  # 提升到顶级
+                    doc.sections.append(child)
+                root_section.children = []
 
-        # 如果没有检测到任何标题层级，把所有内容放到一个根章节下
-        if not any(s.title for s in doc.sections if s.title != "__root__"):
-            root = Section(title="全文", level=1)
-            for s in doc.sections:
-                root.children.extend(s.children) if s.children else root.content.extend(s.content)
-            doc.sections = [root] if root.content or root.children else []
+        # 解析表格（带位置感知）
+        for table_idx, table in enumerate(document.tables):
+            self._parse_table(table, doc, table_index=table_idx, docx_document=document)
 
-    def _parse_table(self, table, doc: StructuredDocument):
-        """从 python-docx Table 对象提取结构化表格。"""
+        # 保存原始表格对象供 table_parser 使用
+        doc.tables = list(document.tables)
+
+        # 清理空的根章节
+        doc.sections = [s for s in doc.sections if s.title != "__root__"]
+        
+        # 如果没有检测到任何标题层级（纯文本），把内容放到一个根章节下
+        if not doc.sections:
+            root_content = []
+            if stack and stack[0].children:
+                doc.sections = stack[0].children
+            elif stack:
+                root = Section(title="全文", level=1)
+                for s in stack:
+                    root.content.extend(s.content)
+                if root.content or root.children:
+                    doc.sections = [root]
+
+    def _parse_table(self, table, doc: StructuredDocument, table_index: int = 0, docx_document=None):
+        """从 python-docx Table 对象提取结构化表格，并尝试分配到正确的章节。
+
+        Args:
+            table: python-docx Table 对象
+            doc: StructuredDocument 目标文档
+            table_index: 表格在 document.tables 中的索引（用于定位章节）
+            docx_document: 可选的 python-docx Document，用于定位表格在正文中的位置
+        """
         block = ContentBlock(ContentBlock.TYPE_TABLE)
         rows_data = []
         for row_idx, row in enumerate(table.rows):
@@ -265,17 +374,80 @@ class DocumentParser:
                 rows_data.append(cells)
         block.rows = rows_data
 
-        # 加到最后的章节下
-        if doc.sections:
-            target = doc.sections[-1]
-            # 找到最深的子章节
-            while target.children:
-                target = target.children[-1]
-            target.content.append(block)
-        else:
+        if not doc.sections:
             s = Section(title="表格", level=1)
             s.content.append(block)
             doc.sections.append(s)
+            return
+
+        # 尝试定位表格在文档体中的位置
+        target_section = doc.sections[-1]  # 默认：最后章节
+        if docx_document and hasattr(docx_document, "element") and hasattr(docx_document.element, "body"):
+            try:
+                body = docx_document.element.body
+                # 遍历 body 子元素，找到所有表格的索引
+                table_elements = []
+                for child in body:
+                    tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+                    if tag == "tbl":
+                        table_elements.append(child)
+                
+                # 找到当前表格前面的段落文本
+                if table_index < len(table_elements):
+                    tbl_elem = table_elements[table_index]
+                    prev_text = ""
+                    # 找表格前最近的段落文本
+                    for child in body:
+                        if child is tbl_elem:
+                            break
+                        tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+                        if tag in ("p", "pPr"):
+                            # 提取段落文本
+                            texts = child.itertext() if hasattr(child, "itertext") else []
+                            for t in texts:
+                                if t.strip():
+                                    prev_text = t.strip()
+                        elif tag == "tbl":
+                            prev_text = ""  # 表格后的内容
+                    
+                    if prev_text:
+                        # 按标题定位
+                        target_section = self._find_section_by_text(doc, prev_text)
+            except Exception as exc:
+                pass
+
+        # 添加到目标章节
+        target = target_section
+        while target.children:
+            target = target.children[-1]
+        target.content.append(block)
+
+    def _find_section_by_text(self, doc, text: str):
+        """根据文本片段找到包含它的章节。"""
+        if not text:
+            return doc.sections[-1] if doc.sections else None
+
+        best_section = None
+        best_match_len = 0
+
+        def _search(node, depth=0):
+            nonlocal best_section, best_match_len
+            node_text = getattr(node, "title", "") or ""
+            if node_text and text in node_text and len(text) > best_match_len:
+                best_section = node
+                best_match_len = len(text)
+            for block in getattr(node, "content", []):
+                block_text = getattr(block, "text", "") or ""
+                if block_text and text in block_text and len(text) > best_match_len:
+                    best_section = node
+                    best_match_len = len(text)
+            for child in getattr(node, "children", []):
+                _search(child, depth + 1)
+
+        for section in doc.sections:
+            _search(section)
+
+        return best_section or (doc.sections[-1] if doc.sections else None)
 
     def _parse_docx_fallback(self, payload: bytes, doc: StructuredDocument):
         """DOCX 降级解析：使用 docx2python 提取纯文本。"""
@@ -289,7 +461,7 @@ class DocumentParser:
                     doc.sections.append(section)
         except Exception as exc:
             logger.warning("[parser] docx2python 也失败: %s", exc)
-            text = payload.decode("utf-8", errors="ignore")
+            text = payload.decode("utf-8", errors="replace")
             section = Section(title="全文", level=1)
             section.content.append(ContentBlock(ContentBlock.TYPE_PARAGRAPH, text))
             doc.sections.append(section)
@@ -302,7 +474,7 @@ class DocumentParser:
             pdf_doc = fitz.open(stream=payload, filetype="pdf")
         except Exception as exc:
             logger.error("[parser] fitz 打开 PDF 失败: %s", exc)
-            text = payload.decode("utf-8", errors="ignore")
+            text = payload.decode("utf-8", errors="replace")
             section = Section(title="全文", level=1)
             section.content.append(ContentBlock(ContentBlock.TYPE_PARAGRAPH, text))
             doc.sections.append(section)
@@ -321,11 +493,25 @@ class DocumentParser:
             is_scan = (len(page_text) < 50 and len(images) > 0) or (len(page_text) < 20)
             is_mixed = len(page_text) < 200 and len(images) > 0
 
+            # 表格检测（对所有类型的页面都尝试）
+            page_tables = self._detect_tables_in_pdf_page(page)
+            
             if is_scan and self.ocr_client:
-                # 扫描页：渲染为图片后 OCR
+                # 有OCR：渲染为图片后 OCR
                 pix = page.get_pixmap(dpi=200)
                 img_bytes = pix.tobytes("png")
                 ocr_pages.append((img_bytes, page_num + 1))
+                if page_text:
+                    text_pages.append((page_text, page_num + 1))
+                if page_tables:
+                    text_pages.append(("", page_num + 1))
+            elif is_scan:
+                # 无OCR：使用已有文本，不足则标记
+                text = page_text or f"【第{page_num + 1}页为扫描页，无可用文本】"
+                text_pages.append((text, page_num + 1))
+                if page_tables:
+                    for t in page_tables:
+                        text_pages.append((t, page_num + 1))
             elif is_mixed and self.ocr_client:
                 # 混合页：文本 + OCR 补充
                 pix = page.get_pixmap(dpi=200)
@@ -335,7 +521,19 @@ class DocumentParser:
                     text_pages.append((page_text, page_num + 1))
             else:
                 # 纯文本页
-                text_pages.append((page_text, page_num + 1))
+                if page_tables:
+                    # 有表格时：用表格文本替换纯文本
+                    table_text_parts = []
+                    for t in page_tables:
+                        h = " | ".join(t.headers) if t.headers else ""
+                        rows = [" | ".join(r) for r in t.rows]
+                        table_text_parts.append(h + "\n" + "\n".join(rows))
+                    combined_table_text = "\n".join(table_text_parts)
+                    if page_text:
+                        combined_table_text = page_text + "\n" + combined_table_text
+                    text_pages.append((combined_table_text, page_num + 1))
+                else:
+                    text_pages.append((page_text, page_num + 1))
 
         pdf_doc.close()
 
@@ -377,6 +575,90 @@ class DocumentParser:
 
         combined = "\n".join(full_text)
         self._build_sections_from_text(combined, doc)
+
+
+    def _detect_table_in_text(self, text_block: str) -> "Optional[ContentBlock]":
+        """启发式检测文本中是否包含表格结构，尝试重建为 ContentBlock(type=table)。
+        
+        检测条件：
+        1. 连续 >=3 行，每行有相同的列数（按 3+空格 / | / \t 分割）
+        2. 首行可能为表头
+        
+        返回 ContentBlock(type=table) 或 None
+        """
+        if not text_block or not isinstance(text_block, str):
+            return None
+        
+        lines = [l.strip() for l in text_block.split("\n") if l.strip()]
+        if len(lines) < 3:
+            return None
+        
+        # 尝试多种分隔符
+        separators = [
+            lambda x: [c.strip() for c in re.split(r"\s{3,}", x) if c.strip()],  # 3+空格
+            lambda x: [c.strip() for c in x.split("\t") if c.strip()],           # tab
+            lambda x: [c.strip() for c in x.split("|") if c.strip()],             # pipe
+        ]
+        
+        for sep in separators:
+            split_lines = [sep(line) for line in lines]
+            col_counts = [len(sl) for sl in split_lines]
+            
+            # 检查是否有 >=3 行有相同的列数 >=2
+            from collections import Counter
+            count_counter = Counter(col_counts)
+            most_common_count, occurrences = count_counter.most_common(1)[0]
+            
+            if occurrences >= 3 and most_common_count >= 2:
+                # 判定为表格
+                table_lines = [sl for sl in split_lines if len(sl) == most_common_count]
+                if len(table_lines) < 3:
+                    continue
+                
+                block = ContentBlock(ContentBlock.TYPE_TABLE)
+                block.headers = table_lines[0]
+                block.rows = table_lines[1:]
+                return block
+        
+        return None
+
+    def _detect_tables_in_pdf_page(self, page) -> "list[ContentBlock]":
+        """用 fitz 内置表格检测提取 PDF 页面的表格。
+        
+        优先用 find_tables()（检测网格线），
+        失败则对页面文本用启发式检测。
+        """
+        tables = []
+        
+        # 方法1：fitz find_tables() - 检测有网格线的表格
+        try:
+            found = page.find_tables()
+            if found and found.tables:
+                for ft in found.tables:
+                    data = ft.extract()
+                    if not data or len(data) < 2:
+                        continue
+                    block = ContentBlock(ContentBlock.TYPE_TABLE)
+                    block.headers = [str(c).strip() for c in data[0]]
+                    block.rows = [[str(c).strip() for c in row] for row in data[1:]]
+                    tables.append(block)
+                if tables:
+                    return tables
+        except Exception as exc:
+            logger.debug("[parser] fitz 表格检测异常: %s", exc)
+        
+        # 方法2：启发式 - 从页面文本中检测
+        try:
+            page_text = page.get_text().strip()
+            if page_text:
+                block = self._detect_table_in_text(page_text)
+                if block:
+                    tables.append(block)
+        except Exception as exc:
+            logger.debug("[parser] 启发式表格检测异常: %s", exc)
+        
+        return tables
+
 
     def _parse_text_page(self, text: str) -> list:
         """从纯文本中提取内容块。"""
@@ -441,6 +723,93 @@ class DocumentParser:
         if re.match(r'^\d+\.\d+\.\d+\s', text):
             return 3
         return 0
+
+
+    def _detect_text_tables_in_text(self, text):
+        """从纯文本中检测表格，返回 ContentBlock(type=table) 列表。
+        
+        用于 PDF 文本页和扫描页 OCR 结果中的非原生表格文本。
+        """
+        tables = []
+        lines = text.split("\n")
+        current_table = []
+        in_table = False
+
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                if in_table and len(current_table) >= 3:
+                    table = self._parse_text_table(current_table)
+                    if table:
+                        tables.append(table)
+                current_table = []
+                in_table = False
+                continue
+
+            is_table_line = False
+            if "|" in stripped or "\u2502" in stripped:
+                is_table_line = True
+            elif "\t" in stripped:
+                is_table_line = True
+            elif stripped and stripped[0] in "\u250c\u2510\u2514\u2518\u251c\u2524\u252c\u2534\u253c\u2550\u2500\u2502\u2503\u2554\u2557\u255a\u255d\u2560\u2563\u2566\u2569\u256c":
+                is_table_line = True
+
+            if is_table_line:
+                if not all(c in "\u250c\u2510\u2514\u2518\u251c\u2524\u252c\u2534\u253c\u2550\u2500\u2502\u2503\u2554\u2557\u255a\u255d\u2560\u2563\u2566\u2569\u256c " for c in stripped):
+                    current_table.append(stripped)
+                    in_table = True
+            else:
+                if in_table and len(current_table) >= 3:
+                    table = self._parse_text_table(current_table)
+                    if table:
+                        tables.append(table)
+                current_table = []
+                in_table = False
+
+        if in_table and len(current_table) >= 3:
+            table = self._parse_text_table(current_table)
+            if table:
+                tables.append(table)
+
+        return tables
+
+    def _parse_text_table(self, lines):
+        """从文本表格行解析为 ContentBlock(type=table)。"""
+        if not lines:
+            return None
+
+        pipe_lines = [l for l in lines if "|" in l or "\u2502" in l]
+        if pipe_lines:
+            import re
+            data_lines = [l for l in pipe_lines if not re.match(r"^[\s\|\u2502\-\u2501\u2550\u2500\+]+$", l)]
+            if len(data_lines) < 2:
+                return None
+            parsed_rows = []
+            for line in data_lines:
+                cells = [c.strip() for c in re.split(r"[\||\u2502]", line) if c.strip()]
+                if cells:
+                    parsed_rows.append(cells)
+            if len(parsed_rows) >= 2:
+                block = ContentBlock(ContentBlock.TYPE_TABLE)
+                block.headers = parsed_rows[0]
+                block.rows = parsed_rows[1:]
+                return block
+
+        tab_lines = [l for l in lines if "\t" in l]
+        if tab_lines and len(tab_lines) >= 2:
+            parsed_rows = []
+            for line in tab_lines:
+                cells = [c.strip() for c in line.split("\t") if c.strip()]
+                if cells:
+                    parsed_rows.append(cells)
+            if len(parsed_rows) >= 2:
+                block = ContentBlock(ContentBlock.TYPE_TABLE)
+                block.headers = parsed_rows[0]
+                block.rows = parsed_rows[1:]
+                return block
+
+        return None
+
 
     # ========== 语义切片 ==========
 
@@ -551,14 +920,24 @@ class DocumentParser:
             )
             if result.returncode == 0 and result.stdout.strip():
                 text = result.stdout
+                # 尝试检测表格
+                table_block = self._detect_table_in_text(text)
+                if table_block:
+                    # 有表格：把表格信息嵌入文本后再建章节
+                    table_text = "表格内容：\n"
+                    if table_block.headers:
+                        table_text += " | ".join(table_block.headers) + "\n"
+                    for row in table_block.rows:
+                        table_text += " | ".join(row) + "\n"
+                    text = text + "\n" + table_text
                 self._build_sections_from_text(text, doc)
             else:
-                text = payload.decode("utf-8", errors="ignore")
+                text = payload.decode("utf-8", errors="replace")
                 section = Section(title="全文", level=1)
                 section.content.append(ContentBlock(ContentBlock.TYPE_PARAGRAPH, text))
                 doc.sections.append(section)
         except Exception as exc:
-            text = payload.decode("utf-8", errors="ignore")
+            text = payload.decode("utf-8", errors="replace")
             section = Section(title="全文", level=1)
             section.content.append(ContentBlock(ContentBlock.TYPE_PARAGRAPH, text))
             doc.sections.append(section)

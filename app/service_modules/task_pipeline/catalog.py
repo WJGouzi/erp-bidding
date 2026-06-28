@@ -5,7 +5,7 @@ import json
 from flask import current_app
 
 from ...core.extensions import db
-from ...domain import BiddingAnalysisResult, BiddingCatalog, BiddingSharedResource, BiddingTask, TemplateCatalog
+from ...domain import BiddingAnalysisResult, BiddingCatalog, BiddingCheckItem, BiddingSharedResource, BiddingTask, TemplateCatalog
 from ..common import log_operation
 from .helpers import _extract_analysis_context, _get_catalog_generation_profile, _normalize_catalog_generation_level
 
@@ -52,108 +52,424 @@ def _build_numbered_children(items):
     return children
 
 
-def _build_constrained_requirement_outline(task, analysis_result, generation_level=None):
-    """为 tab1 生成受招标文件约束的目录结构。"""
-    base = _build_dynamic_outline(task, analysis_result, variant="requirement", generation_level=generation_level)
-    outline = base.get("outline", [])
-    if not outline:
-        return base
 
+
+# ── 新增：包过滤、确认项分类、动态目录结构推断 ──
+
+def _get_filtered_analysis_data(analysis_result, selected_package_no):
+    """按 selected_package_no 过滤 analysis_data，只保留当前包的数据。"""
+    if not analysis_result:
+        return {}
+    analysis_data = analysis_result.safe_analysis_data()
+    if not analysis_data:
+        return {}
+    # 单包场景或未选择包号：不过滤
+    if not selected_package_no or not bool(analysis_data.get("has_package")):
+        return analysis_data
+    # 多包场景：只保留当前包
+    packages = analysis_data.get("packages", [])
+    if not isinstance(packages, list):
+        return analysis_data
+    filtered = [
+        p for p in packages
+        if isinstance(p, dict) and str(p.get("package_no")) == str(selected_package_no)
+    ]
+    analysis_data["packages"] = filtered
+    analysis_data["package_count"] = len(filtered)
+    return analysis_data
+
+
+def _classify_check_items(check_items):
+    """将 check_items 按前缀分类为 qualification / compliance / disqualification / scoring。"""
+    classified = {"qualification": [], "compliance": [], "disqualification": [], "scoring": []}
+    for item in (check_items or []):
+        key = item.check_key or ""
+        if key.startswith("qual_"):
+            classified["qualification"].append(item)
+        elif key.startswith("star_"):
+            classified["compliance"].append(item)
+        elif key.startswith("disq_"):
+            classified["disqualification"].append(item)
+        elif key.startswith("score_dim_"):
+            classified["scoring"].append(item)
+    return classified
+
+
+
+def _build_bid_letter_section(analysis_context):
+    """构建投标函章节。"""
+    return {
+        "title": "投标函",
+        "description": _build_catalog_description(
+            analysis_context.get("overview", ""),
+            "投标函及报价承诺",
+            max_length=80,
+        ),
+        "children": [],
+    }
+
+
+def _build_price_section(analysis_context, analysis_data):
+    """构建报价部分章节。"""
+    pkg_items = []
+    packages = analysis_data.get("packages", [])
+    for pkg in packages:
+        if not isinstance(pkg, dict):
+            continue
+        params = pkg.get("parameters") or {}
+        if not isinstance(params, dict):
+            continue
+        core_products = params.get("core_products", [])
+        if core_products:
+            pkg_items.extend(core_products)
+    has_items = len(pkg_items) > 0
+    children = [
+        {"title": "（一）报价一览表", "description": "项目总报价"},
+    ]
+    if has_items:
+        children.append({
+            "title": "（二）分项报价明细表",
+            "description": f"含{len(pkg_items)}项产品分项报价",
+        })
+    return {
+        "title": "报价部分",
+        "description": "报价一览表及分项报价明细",
+        "children": children,
+    }
+
+
+def _build_authorization_section():
+    """构建法定代表人授权书章节。"""
+    return {
+        "title": "法定代表人授权书",
+        "description": "法定代表人身份证明及授权委托书",
+        "children": [],
+    }
+
+
+def _build_qualification_section(classified_items, analysis_context, filtered_analysis_data=None):
+    """从确认的资格项构建资格证明文件章节。
+    
+    当 BiddingCheckItem.check_label 为空时，从 analysis_data.eligibility.qualifications
+    中按 check_key 匹配获取完整的要求文本。
+    """
+    quals = classified_items.get("qualification", [])
+    
+    # 从 analysis_data 构建资格要求查找表: stat_01 → "具有独立承担民事责任的能力..."
+    qual_lookup = {}
+    if filtered_analysis_data:
+        elig = filtered_analysis_data.get("eligibility", {})
+        if isinstance(elig, dict):
+            for q in elig.get("qualifications", []):
+                qid = q.get("id", "")
+                if qid:
+                    qual_lookup[qid] = q.get("requirement", "")
+    
+    children = []
+    sub_idx = 1
+    for item in quals:
+        key = item.check_key or ""
+        label = item.check_label or ""
+        value = item.check_value or ""
+        
+        # 如果 check_label 为空或是默认占位符，从 analysis_data 中按 check_key 匹配
+        if not label or label == "核对项":
+            for prefix in ("qual_", "star_", "disq_"):
+                if key.startswith(prefix):
+                    lookup_key = key[len(prefix):]
+                    if lookup_key in qual_lookup:
+                        label = qual_lookup[lookup_key]
+                    break
+        
+        # 如果 value 为空，用 label 代替
+        if not value:
+            value = label
+        
+        desc = (value[:60] if value else label[:60]) if (value or label) else "资格证明材料"
+        marker = "（待准备）" if not item.confirmed_flag else ""
+        sub_prefix = ["（一）", "（二）", "（三）", "（四）", "（五）", "（六）", "（七）", "（八）", "（九）", "（十）"]
+        prefix = sub_prefix[sub_idx - 1] if sub_idx <= len(sub_prefix) else f"（{sub_idx}）"
+        children.append({
+            "title": f"{prefix}{label}{marker}",
+            "description": desc[:100],
+        })
+        sub_idx += 1
+
+    return {
+        "title": "资格证明文件",
+        "description": "根据招标文件资格要求提供以下证明材料",
+        "children": children,
+    }
+
+
+def _build_compliance_section(classified_items):
+    """从确认的实质性要求项构建实质性要求响应章节。"""
+    items = classified_items.get("compliance", [])
+    children = []
+    for i, item in enumerate(items):
+        sub_prefix = ["（一）", "（二）", "（三）", "（四）", "（五）", "（六）", "（七）", "（八）"]
+        prefix = sub_prefix[i] if i < len(sub_prefix) else f"（{i + 1}）"
+        children.append({
+            "title": f"{prefix}{item.check_label}（★实质性要求）",
+            "description": (item.check_value or "")[:100],
+        })
+    return {
+        "title": "实质性要求响应",
+        "description": "以下为招标文件标注★的实质性要求，须完全响应",
+        "children": children,
+    }
+
+
+def _count_package_items(analysis_data):
+    """统计当前包内的产品/物料条目数。"""
+    packages = analysis_data.get("packages", [])
+    total = 0
+    for pkg in packages:
+        if not isinstance(pkg, dict):
+            continue
+        params = pkg.get("parameters") or {}
+        if not isinstance(params, dict):
+            continue
+        total += params.get("starred_count", 0) + params.get("important_count", 0) + params.get("general_count", 0)
+        core_products = params.get("core_products", [])
+        if core_products and total == 0:
+            total = len(core_products)
+    return total
+
+
+def _build_tech_section(analysis_context, analysis_data):
+    """构建技术参数响应章节，根据产品数量决定颗粒度。"""
+    item_count = _count_package_items(analysis_data)
+    children = []
+    if item_count > 5:
+        children = [
+            {"title": "（一）技术参数总偏离表", "description": "全部产品技术参数响应总表"},
+            {"title": "（二）产品详细技术响应", "description": f"逐项响应{_build_catalog_description(analysis_context.get('technical_requirements', ''), '', max_length=60)}"},
+            {"title": "（三）质量保证措施", "description": "产品质量控制及保障方案"},
+        ]
+    elif item_count > 0:
+        children = [
+            {"title": "（一）技术参数偏离表", "description": "技术参数响应及偏离说明"},
+        ]
+    else:
+        children = [
+            {"title": "（一）技术方案", "description": "技术路线及实施方案"},
+        ]
+    return {
+        "title": "技术参数响应",
+        "description": _build_catalog_description(
+            analysis_context.get("technical_requirements", ""),
+            "技术参数响应及偏离说明",
+            max_length=100,
+        ),
+        "children": children,
+    }
+
+
+def _build_business_section(analysis_context):
+    """构建商务要求响应章节。"""
+    return {
+        "title": "商务要求响应",
+        "description": _build_catalog_description(
+            analysis_context.get("business_requirements", ""),
+            "商务条款响应",
+            max_length=100,
+        ),
+        "children": [
+            {"title": "（一）商务条款偏离表", "description": "商务要求响应及偏离说明"},
+            {"title": "（二）交货及验收方案", "description": "交货时间、地点及验收方案"},
+            {"title": "（三）付款方式响应", "description": "付款条件及方式响应"},
+        ],
+    }
+
+
+def _build_scoring_section(analysis_data):
+    """从评分维度构建评分标准响应章节。"""
+    scoring = analysis_data.get("scoring", {})
+    dims = scoring.get("dimensions", []) if isinstance(scoring, dict) else []
+    children = []
+    for i, dim in enumerate(dims):
+        if not isinstance(dim, dict):
+            dim_name = str(dim)
+            dim_score = 0
+            dim_criteria = ""
+        else:
+            dim_name = dim.get("name", "") or ""
+            # 跳过"合计"类汇总维度
+            if "合计" in dim_name or "总计" in dim_name:
+                continue
+            dim_score = dim.get("score", 0)
+            dim_criteria = dim.get("criteria", "") or ""
+            # criteria 可能是 JSON 字符串，提取可读内容
+            if dim_criteria.startswith("["):
+                try:
+                    parsed = json.loads(dim_criteria)
+                    if isinstance(parsed, list):
+                        items = []
+                        for item in parsed[:3]:
+                            if isinstance(item, dict):
+                                items.append(f"{item.get('name','')}({item.get('score',0)}分)")
+                        if items:
+                            dim_criteria = "，".join(items)
+                except (json.JSONDecodeError, TypeError):
+                    dim_criteria = dim_criteria[:80]
+        sub_prefix = ["（一）", "（二）", "（三）", "（四）", "（五）", "（六）"]
+        prefix = sub_prefix[i] if i < len(sub_prefix) else f"（{i + 1}）"
+        desc = f"{dim_score}分" if dim_score else ""
+        if dim_criteria:
+            desc = desc + f" - {dim_criteria[:60]}" if desc else dim_criteria[:60]
+        children.append({
+            "title": f"{prefix}{dim_name}",
+            "description": desc,
+        })
+    return {
+        "title": "评分标准响应",
+        "description": "逐项响应评分标准各评审维度",
+        "children": children,
+    }
+
+
+def _build_service_section():
+    """构建售后服务/培训方案章节。"""
+    return {
+        "title": "售后服务及培训方案",
+        "description": "售后服务体系、技术培训及应急响应",
+        "children": [
+            {"title": "（一）售后服务体系", "description": "售后服务承诺及体系说明"},
+            {"title": "（二）技术培训方案", "description": "产品使用培训计划"},
+            {"title": "（三）应急响应及退换货承诺", "description": "应急响应机制、退换货及质保承诺"},
+        ],
+    }
+
+
+def _build_performance_section():
+    """构建类似项目业绩章节。"""
+    return {
+        "title": "类似项目业绩",
+        "description": "近三年类似项目业绩及证明材料",
+        "children": [],
+    }
+
+
+def _build_other_section():
+    """构建其他材料章节。"""
+    return {
+        "title": "其他材料",
+        "description": "供应商认为需要提交的其他材料",
+        "children": [],
+    }
+
+
+def _build_package_aware_outline(task, analysis_result, filtered_analysis_data, classified_items, generation_level=None):
+    """动态生成投标文件目录结构，根据包号、确认项、评分维度等因素动态决定章节。"""
     analysis_context = _extract_analysis_context(analysis_result)
-    bidder_notice = analysis_context.get("bidder_notice", {}) or {}
-    qualification_review = analysis_context.get("qualification_review", {}) or {}
-    effective_text = getattr(analysis_result, "effective_text", "") or getattr(analysis_result, "raw_text", "") or ""
+    sections = []
 
-    overview_children = _build_numbered_children(
-        [
-            {
-                "title": "项目概况",
-                "description": _build_catalog_description(
-                    bidder_notice.get("overview", ""),
-                    effective_text,
-                    max_length=80,
-                ),
-            },
-            {
-                "title": "项目基础信息",
-                "description": _build_catalog_description(
-                    "；".join(
-                        item
-                        for item in [
-                            f"标的名称：{bidder_notice.get('project_name', '').strip()}" if bidder_notice.get("project_name") else "",
-                            f"项目编号：{bidder_notice.get('project_no', '').strip()}" if bidder_notice.get("project_no") else "",
-                            f"包号：{bidder_notice.get('package_no', '').strip()}" if bidder_notice.get("package_no") else "",
-                        ]
-                        if item
-                    ),
-                    "",
-                    max_length=80,
-                ),
-            },
-        ]
+    # ── 收集所有章节（不带编号） ──
+    sections.append(_build_bid_letter_section(analysis_context))
+    sections.append(_build_price_section(analysis_context, filtered_analysis_data))
+    sections.append(_build_authorization_section())
+
+    has_quals = len(classified_items.get("qualification", [])) > 0
+    if has_quals:
+        sections.append(_build_qualification_section(classified_items, analysis_context, filtered_analysis_data))
+
+    has_compliance = len(classified_items.get("compliance", [])) > 0
+    if has_compliance:
+        sections.append(_build_compliance_section(classified_items))
+
+    sections.append(_build_tech_section(analysis_context, filtered_analysis_data))
+    sections.append(_build_business_section(analysis_context))
+
+    scoring = filtered_analysis_data.get("scoring", {})
+    dims = scoring.get("dimensions", []) if isinstance(scoring, dict) else []
+    has_scoring = len(dims) > 0
+    if has_scoring:
+        sections.append(_build_scoring_section(filtered_analysis_data))
+    else:
+        scoring_from_ctx = analysis_context.get("scoring_items", "")
+        if scoring_from_ctx:
+            parsed_dims = None
+            if scoring_from_ctx.startswith("["):
+                try:
+                    parsed = json.loads(scoring_from_ctx)
+                    if isinstance(parsed, list):
+                        parsed_dims = parsed
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            if parsed_dims:
+                filtered_analysis_data.setdefault("scoring", {})["dimensions"] = parsed_dims
+            else:
+                filtered_analysis_data.setdefault("scoring", {})["dimensions"] = [
+                    {"name": "综合评分", "score": 0, "criteria": scoring_from_ctx[:80]}
+                ]
+            sections.append(_build_scoring_section(filtered_analysis_data))
+
+    sections.append(_build_service_section())
+    sections.append(_build_performance_section())
+    sections.append(_build_other_section())
+
+    # ── 动态编号：按实际收集到的章节数依次编号 ──
+    chinese_nums = ["一", "二", "三", "四", "五", "六", "七", "八", "九", "十", "十一", "十二", "十三", "十四", "十五"]
+    for idx, section in enumerate(sections):
+        num = chinese_nums[idx] if idx < len(chinese_nums) else str(idx + 1)
+        title = section.get("title", "")
+        # 避免重复添加编号（title 应已不带编号）
+        section["title"] = f"{num}、{title}"
+
+    return sections
+
+
+def _should_fallback_to_legacy(task, analysis_result, selected_package_no, check_items):
+    """判断是否需要回退到旧的 3 章硬编码结构。"""
+    if not analysis_result:
+        return True
+    analysis_data = analysis_result.safe_analysis_data()
+    if not analysis_data:
+        return True
+    # 多包项目但未选择包号时回退
+    if bool(analysis_data.get("has_package")) and not selected_package_no:
+        return True
+    # check_items 为空且无 analysis_data 关键字段
+    if not check_items:
+        pass  # 仍然可以生成基础章节，不回退
+    return False
+
+
+def _build_constrained_requirement_outline(
+    task, analysis_result, generation_level=None,
+    selected_package_no=None, check_items=None,
+):
+    """为 tab1 生成受招标文件约束的目录结构。
+    
+    新增参数:
+        selected_package_no: 用户选择的包号，用于过滤多包数据
+        check_items: BiddingCheckItem 查询结果列表，用于展开确认项为章节
+    
+    当参数不足时自动回退到旧的 3 章硬编码结构。
+    """
+    # 判断是否需要回退
+    if _should_fallback_to_legacy(task, analysis_result, selected_package_no, check_items):
+        logger.info("[catalog] 回退到旧 3 章目录结构")
+        return _build_dynamic_outline(task, analysis_result, variant="requirement", generation_level=generation_level)
+
+    # 1. 按包过滤 analysis_data
+    filtered_analysis_data = _get_filtered_analysis_data(analysis_result, selected_package_no)
+    if not filtered_analysis_data:
+        logger.warning("[catalog] 过滤后 analysis_data 为空，回退到旧结构")
+        return _build_dynamic_outline(task, analysis_result, variant="requirement", generation_level=generation_level)
+
+    # 2. 解析确认项分类
+    classified_items = _classify_check_items(check_items)
+
+    # 3. 动态构建目录
+    outline = _build_package_aware_outline(
+        task=task,
+        analysis_result=analysis_result,
+        filtered_analysis_data=filtered_analysis_data,
+        classified_items=classified_items,
+        generation_level=generation_level,
     )
-
-    technical_children = _build_numbered_children(
-        [
-            {
-                "title": "技术要求响应",
-                "description": _build_catalog_description(
-                    analysis_context.get("technical_requirements", ""),
-                    "",
-                    max_length=100,
-                ),
-            },
-            {
-                "title": "招标要求原文对应项",
-                "description": _build_catalog_description(
-                    analysis_context.get("requirements", ""),
-                    analysis_context.get("technical_requirements", ""),
-                    max_length=100,
-                ),
-            },
-        ]
-    )
-
-    business_children = _build_numbered_children(
-        [
-            {
-                "title": "商务要求响应",
-                "description": _build_catalog_description(
-                    analysis_context.get("business_requirements", ""),
-                    "",
-                    max_length=100,
-                ),
-            },
-            {
-                "title": "资格性审查响应",
-                "description": _build_catalog_description(
-                    analysis_context.get("qualification_requirements", ""),
-                    qualification_review.get("qualification_check", ""),
-                    max_length=100,
-                ),
-            },
-            {
-                "title": "评分标准响应",
-                "description": _build_catalog_description(
-                    analysis_context.get("scoring_items", ""),
-                    "",
-                    max_length=100,
-                ),
-            },
-            {
-                "title": "废标项核查",
-                "description": _build_catalog_description(
-                    analysis_context.get("disqualification_items", ""),
-                    qualification_review.get("disqualification_items", ""),
-                    max_length=100,
-                ),
-            },
-        ]
-    )
-
-    children_groups = [overview_children, technical_children, business_children]
-    for index, item in enumerate(outline):
-        item["children"] = children_groups[index] if index < len(children_groups) else []
     return {"outline": outline}
 
 
@@ -182,7 +498,7 @@ def _build_dynamic_outline_with_llm(task, analysis_result, text):
     # 构建提示词上下文
     context_parts = []
     
-    # 从 analysis_data (v2) 中提取结构化字段
+    # 从 analysis_data (v3/v2) 中提取结构化字段
     analysis_data = None
     if hasattr(analysis_result, "analysis_data") and analysis_result.analysis_data:
         try:
@@ -190,13 +506,25 @@ def _build_dynamic_outline_with_llm(task, analysis_result, text):
         except (json.JSONDecodeError, TypeError):
             pass
     
-    if analysis_data and analysis_data.get("version") == "v2":
-        bn = analysis_data.get("bidder_notice", {})
+    meta = None
+    if analysis_data:
+        if analysis_data.get("version") in ("v2", "v3"):
+            meta = analysis_data.get("metadata") or analysis_data.get("bidder_notice", {})
+        else:
+            meta = analysis_data.get("metadata") or analysis_data.get("bidder_notice", {})
+    if meta:
         context_parts.append("=== 项目信息 ===")
-        if bn.get("project_name"): context_parts.append(f"项目名称：{bn['project_name']}")
-        if bn.get("project_no"): context_parts.append(f"项目编号：{bn['project_no']}")
-        if bn.get("budget"): context_parts.append(f"预算：{bn['budget']}")
-        if bn.get("overview"): context_parts.append(f"项目概况：{bn['overview']}")
+        if meta.get("project_name"): context_parts.append(f"项目名称：{meta['project_name']}")
+        if meta.get("project_code"): context_parts.append(f"项目编号：{meta['project_code']}")
+        if meta.get("budget"): context_parts.append(f"预算：{meta.get('budget', {}).get('total', 0)}")
+        if meta.get("overview"): context_parts.append(f"项目概况：{meta['overview']}")
+        # 注入选定的包号信息
+        selected_pkg_no = getattr(task, "selected_package_no", None)
+        if selected_pkg_no:
+            context_parts.append(f"当前包号：第{selected_pkg_no}包")
+            selected_pkg_name = getattr(task, "selected_package_name", None) or ""
+            if selected_pkg_name:
+                context_parts.append(f"当前包名称：{selected_pkg_name}")
         
         br = analysis_data.get("business_requirements", "")
         if br: context_parts.append(f"\n=== 商务要求 ===\n{br}")
@@ -383,7 +711,11 @@ def _build_auto_catalog_content(task, analysis_result, catalog_source_type, gene
 
     source_type = catalog_source_type or "FROM_TENDER_REQUIREMENT"
     if source_type == "FROM_TENDER_REQUIREMENT":
-        return _build_constrained_requirement_outline(task, analysis_result, generation_level=generation_level)
+        return _build_constrained_requirement_outline(
+            task, analysis_result, generation_level=generation_level,
+            selected_package_no=getattr(task, "selected_package_no", None),
+            check_items=None,
+        )
     variant = "template" if source_type == "FROM_TENDER_TEMPLATE" else "requirement"
     return _build_dynamic_outline(task, analysis_result, variant=variant, generation_level=generation_level)
 
@@ -422,7 +754,17 @@ def get_catalog_options(task_id):
     basis_text = analysis_result.effective_text or analysis_result.raw_text or ""
     preview = basis_text[:120]
     generation_level = _normalize_catalog_generation_level(task.catalog_generation_level)
-    basis_text = analysis_result.effective_text or analysis_result.raw_text or ""
+    
+    # ── 新增：读取包号和确认项，供目录生成使用 ──
+    selected_package_no = getattr(task, "selected_package_no", None)
+    check_items = BiddingCheckItem.query.filter_by(
+        shared_resource_id=task.shared_resource_id
+    ).order_by(BiddingCheckItem.sort_no.asc(), BiddingCheckItem.id.asc()).all()
+    
+    logger.info(
+        "[catalog] get_catalog_options: task=%s selected_package_no=%s check_items_count=%s",
+        task_id, selected_package_no, len(check_items),
+    )
     
     # Tab1: 按标书评分点生成 — 尝试从数据库读取缓存，没有再调 LLM
     existing = BiddingCatalog.query.filter_by(
@@ -434,8 +776,8 @@ def get_catalog_options(task_id):
         try:
             cached_content = json.loads(existing.catalog_content)
             outline = cached_content.get("outline", [])
-            # tab1 当前约束化目录至少应有 3 个顶级章节
-            if len(outline) < 3:
+            # 新动态目录至少应有 6 个顶级章节（旧 3 章缓存视为过期）
+            if len(outline) < 6:
                 logger.info("[catalog] 缓存目录章节数过少(%s)，重新生成: shared_resource=%s", len(outline), task.shared_resource_id)
                 outline = None
                 existing.confirmed_flag = False
@@ -453,6 +795,8 @@ def get_catalog_options(task_id):
             task,
             analysis_result,
             generation_level=generation_level,
+            selected_package_no=selected_package_no,
+            check_items=check_items,
         )["outline"]
         # 入库缓存
         catalog_record = BiddingCatalog(

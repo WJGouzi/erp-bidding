@@ -67,6 +67,8 @@ CREATE TABLE IF NOT EXISTS `bidding_task` (
   `generate_stage_code` VARCHAR(32) DEFAULT NULL COMMENT '生成阶段状态码',
   `generate_stage_message` VARCHAR(255) DEFAULT NULL COMMENT '生成阶段状态描述信息',
   `result_file_id` BIGINT DEFAULT NULL COMMENT '最终生成结果文件ID（关联 file_storage 表）',
+  `selected_package_no` VARCHAR(32) DEFAULT NULL COMMENT '选定投标的包号（分包项目用户选择投哪个包）',
+  `selected_package_name` VARCHAR(255) DEFAULT NULL COMMENT '选定投标的包名（冗余，方便展示）',
   `error_message` VARCHAR(1000) DEFAULT NULL COMMENT '错误信息（任务失败时记录详细原因）',
   `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
@@ -100,7 +102,10 @@ CREATE TABLE IF NOT EXISTS `bidding_analysis_result` (
   `technical_requirements` LONGTEXT COMMENT '技术要求（技术方案、工艺标准、验收标准等，JSON格式）',
   `scoring_items` LONGTEXT COMMENT '评分标准（评分项目、分值分布、评分细则，JSON格式）',
   `disqualification_items` LONGTEXT COMMENT '废标条款（可能导致废标的情况列表，JSON格式）',
-  `analysis_data` TEXT COMMENT '结构化分析数据JSON（投标人须知/资格审查/商务/技术/评分等结构化对象）',
+  `analysis_data` LONGTEXT COMMENT '结构化分析数据JSON（投标人须知/资格审查/商务/技术/评分等结构化对象）',
+  `packages_json` TEXT COMMENT '分包列表JSON（包号、包名、预算等信息）',
+  `document_type` VARCHAR(32) DEFAULT '' COMMENT '文档分类类型（TENDER/SELECTION/NEGOTIATION/INQUIRY）',
+  `package_count` INT NOT NULL DEFAULT 0 COMMENT '分包数量（0表示无分包）',
   `raw_text` LONGTEXT COMMENT '招标文件原始文本内容',
   `effective_text` LONGTEXT COMMENT '招标文件有效正文（去除杂音的纯净文本）',
   `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
@@ -295,8 +300,8 @@ CREATE TABLE IF NOT EXISTS `doc_chunks` (
   `id`           BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键ID',
   `file_id`      BIGINT NOT NULL COMMENT '所属文件ID',
   `chunk_index`  INT NOT NULL COMMENT '切片序号',
-  `content`      TEXT NOT NULL COMMENT '切片文本内容',
-  `section_path` VARCHAR(255) DEFAULT NULL COMMENT '章节路径（如：第一章>1.2）',
+  `content`      LONGTEXT NOT NULL COMMENT '切片文本内容',
+  `section_path` TEXT DEFAULT NULL COMMENT '章节路径（如：第一章>1.2）',
   `content_type` VARCHAR(32) NOT NULL DEFAULT 'paragraph' COMMENT '内容类型：heading/paragraph/table/mixed',
   `extra_metadata` JSON DEFAULT NULL COMMENT '扩展元数据',
   `chroma_id`    VARCHAR(128) DEFAULT NULL COMMENT 'ChromaDB中的ID',
@@ -306,3 +311,21 @@ CREATE TABLE IF NOT EXISTS `doc_chunks` (
   KEY `idx_chroma_id` (`chroma_id`),
   UNIQUE KEY `idx_file_chunk` (`file_id`, `chunk_index`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='文档切片数据表，支持FULLTEXT关键词检索';
+
+
+-- ============================================================
+-- Migration 001: 新增分包字段 + 文档分类 + task包选择 + analysis_data LONGTEXT
+-- 说明：已有数据库执行以下增量更新
+-- 适用：从旧版升级的数据库
+-- ============================================================
+ALTER TABLE bidding_analysis_result
+  ADD COLUMN IF NOT EXISTS `packages_json` TEXT COMMENT '分包列表JSON（包号、包名、预算等信息）' AFTER `analysis_data`,
+  ADD COLUMN IF NOT EXISTS `document_type` VARCHAR(32) DEFAULT '' COMMENT '文档分类类型（TENDER/SELECTION/NEGOTIATION/INQUIRY）' AFTER `packages_json`,
+  ADD COLUMN IF NOT EXISTS `package_count` INT NOT NULL DEFAULT 0 COMMENT '分包数量（0表示无分包）' AFTER `document_type`,
+  MODIFY COLUMN `analysis_data` LONGTEXT COMMENT '结构化分析数据JSON（投标人须知/资格审查/商务/技术/评分等结构化对象）';
+
+ALTER TABLE bidding_task
+  ADD COLUMN IF NOT EXISTS `selected_package_no` VARCHAR(32) DEFAULT NULL COMMENT '选定投标的包号（分包项目用户选择投哪个包）' AFTER `result_file_id`,
+  ADD COLUMN IF NOT EXISTS `selected_package_name` VARCHAR(255) DEFAULT NULL COMMENT '选定投标的包名（冗余，方便展示）' AFTER `selected_package_no`;
+
+ALTER TABLE doc_chunks MODIFY COLUMN section_path TEXT DEFAULT NULL COMMENT '章节路径（如：第一章>1.2）';

@@ -1,5 +1,17 @@
+import json
 from ..core.extensions import db
 from ..core.time_utils import utc_now
+
+
+
+def _safe_json_load(val):
+    """安全解析 JSON，字符串→dict，出错返回 None。"""
+    if not val:
+        return None
+    try:
+        return json.loads(val) if isinstance(val, str) else val
+    except (json.JSONDecodeError, TypeError):
+        return None
 
 
 class FileStorage(db.Model):
@@ -33,6 +45,16 @@ class FileStorage(db.Model):
     # 通用状态字段。
     deleted_flag = db.Column(db.Boolean, nullable=False, default=False)
     created_at = db.Column(db.DateTime, nullable=False, default=utc_now)
+
+    @staticmethod
+    def _safe_json_load(val):
+        import json as _j
+        if not val:
+            return None
+        try:
+            return _j.loads(val) if isinstance(val, str) else val
+        except (_j.JSONDecodeError, TypeError):
+            return None
 
     def to_dict(self):
         """将文件存储记录转换为接口可直接返回的字典。"""
@@ -159,6 +181,8 @@ class BiddingTask(db.Model):
     generate_stage_code = db.Column(db.String(32), nullable=True)
     generate_stage_message = db.Column(db.String(255), nullable=True)
     result_file_id = db.Column(db.Integer, nullable=True)
+    selected_package_no = db.Column(db.String(32), nullable=True, default=None)
+    selected_package_name = db.Column(db.String(255), nullable=True, default=None)
     error_message = db.Column(db.String(1000), nullable=True)
 
     # 通用时间与逻辑删除字段。
@@ -217,6 +241,11 @@ class BiddingAnalysisResult(db.Model):
     # 结构化分析数据（新版本：投标人须知/资格审查/商务/技术/评分等结构化对象）。
     analysis_data = db.Column(db.Text, nullable=True)
 
+    # 分包列表 JSON（从 analysis_data 中提取的包信息，便于单独查询）。
+    packages_json = db.Column(db.Text, nullable=True)
+    document_type = db.Column(db.String(32), nullable=True, default='')
+    package_count = db.Column(db.Integer, nullable=False, default=0)
+
     # 原始全文与按包号裁剪后的有效文本。
     raw_text = db.Column(db.Text, nullable=True)
     effective_text = db.Column(db.Text, nullable=True)
@@ -224,6 +253,17 @@ class BiddingAnalysisResult(db.Model):
     # 时间戳。
     created_at = db.Column(db.DateTime, nullable=False, default=utc_now)
     updated_at = db.Column(db.DateTime, nullable=False, default=utc_now, onupdate=utc_now)
+
+    def safe_analysis_data(self):
+        """安全解析 analysis_data JSON 字段，解析失败返回空 dict。"""
+        import json
+        if not self.analysis_data:
+            return {}
+        try:
+            parsed = json.loads(self.analysis_data)
+            return parsed if isinstance(parsed, dict) else {}
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return {}
 
     def to_dict(self):
         """将分析结果转换为接口返回结构。
@@ -237,13 +277,23 @@ class BiddingAnalysisResult(db.Model):
         if self.analysis_data:
             try:
                 parsed = json.loads(self.analysis_data)
-                if isinstance(parsed, dict) and parsed.get("version") == "v2":
+                if isinstance(parsed, dict) and parsed.get("version") == "v3":
                     return {
                         "id": self.id,
                         "shared_resource_id": self.shared_resource_id,
                         "raw_text": self.raw_text or "",
                         "effective_text": self.effective_text or "",
                         "analysis_data": parsed,
+                        "overview": self.overview or "",
+                        "requirements": self.requirements or "",
+                        "business_requirements": self.business_requirements or "",
+                        "qualification_requirements": self.qualification_requirements or "",
+                        "technical_requirements": self.technical_requirements or "",
+                        "scoring_items": _safe_json_load(self.scoring_items) if self.scoring_items else [],
+                        "disqualification_items": _safe_json_load(self.disqualification_items) if self.disqualification_items else [],
+                        "packages_json": _safe_json_load(self.packages_json) if self.packages_json else None,
+                        "document_type": self.document_type or "",
+                        "package_count": self.package_count or 0,
                         "created_at": self.created_at.isoformat() if self.created_at else None,
                         "updated_at": self.updated_at.isoformat() if self.updated_at else None,
                     }
@@ -259,8 +309,11 @@ class BiddingAnalysisResult(db.Model):
             "business_requirements": self.business_requirements or "",
             "qualification_requirements": self.qualification_requirements or "",
             "technical_requirements": self.technical_requirements or "",
-            "scoring_items": self.scoring_items or "",
-            "disqualification_items": self.disqualification_items or "",
+            "scoring_items": _safe_json_load(self.scoring_items) if self.scoring_items else [],
+            "disqualification_items": _safe_json_load(self.disqualification_items) if self.disqualification_items else [],
+            "packages_json": _safe_json_load(self.packages_json) if self.packages_json else None,
+            "document_type": self.document_type or "",
+            "package_count": self.package_count or 0,
             "raw_text": self.raw_text or "",
             "effective_text": self.effective_text or "",
             "created_at": self.created_at.isoformat() if self.created_at else None,

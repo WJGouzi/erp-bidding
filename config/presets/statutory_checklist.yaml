@@ -1,0 +1,67 @@
+# ==============================================================
+#  法规固定检查清单 — 所有政府采购标书都需满足的法律要求
+#  基于《中华人民共和国政府采购法》第二十二条及通用法规
+#  此文件独立于标书类型（bid_type/doc_type），所有标书共用
+#  修改此文件需要法律合规审核
+# ==============================================================
+
+statutory_items:
+  - id: "stat_01"
+    category: "通用资格"
+    requirement: "具有独立承担民事责任的能力（营业执照/法人证书/执业许可证）"
+    law_ref: "政府采购法第二十二条第一款"
+    severity: "fatal"
+
+  - id: "stat_02"
+    category: "财务状况"
+    requirement: "具有良好的商业信誉和健全的财务会计制度（财务报告/审计报告/财务报表）"
+    law_ref: "政府采购法第二十二条第二款"
+    severity: "fatal"
+
+  - id: "stat_03"
+    category: "财务状况"
+    requirement: "具有依法缴纳税收的良好记录（纳税证明/完税凭证）"
+    law_ref: "政府采购法第二十二条第四款"
+    severity: "fatal"
+
+  - id: "stat_04"
+    category: "纳税社保"
+    requirement: "具有依法缴纳社会保障资金的良好记录（社保缴纳证明）"
+    law_ref: "政府采购法第二十二条第四款"
+    severity: "fatal"
+
+  - id: "stat_05"
+    category: "信用记录"
+    requirement: "参加政府采购活动前三年内，在经营活动中没有重大违法记录"
+    law_ref: "政府采购法第二十二条第五款"
+    severity: "fatal"
+
+  - id: "stat_06"
+    category: "信用记录"
+    requirement: "未被列入'信用中国'网站失信被执行人、重大税收违法案件当事人名单"
+    law_ref: "财库[2016]125号"
+    severity: "fatal"
+
+  - id: "stat_07"
+    category: "信用记录"
+    requirement: "未被列入'中国政府采购网'政府采购严重违法失信行为记录名单"
+    law_ref: "财库[2016]125号"
+    severity: "fatal"
+
+  - id: "stat_08"
+    category: "通用资格"
+    requirement: "具有履行合同所必需的设备和专业技术能力"
+    law_ref: "政府采购法第二十二条第三款"
+    severity: "fatal"
+
+  - id: "stat_09"
+    category: "通用资格"
+    requirement: "法定代表人授权书（如法定代表人委托他人参与采购活动）"
+    law_ref: "通用格式要求"
+    severity: "normal"
+
+  - id: "stat_10"
+    category: "通用资格"
+    requirement: "供应商单位及其现任法定代表人/主要负责人无行贿犯罪记录"
+    law_ref: "通用要求"
+    severity: "fatal"

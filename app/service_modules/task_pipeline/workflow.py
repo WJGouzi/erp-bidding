@@ -27,7 +27,7 @@ from ..storage import StorageService
 from ..common import log_operation
 from .analysis import (
     _complete_analysis,
-    confirm_check_items,
+    save_review,
     get_analysis_result,
     get_check_items,
     get_packages,
@@ -632,7 +632,7 @@ __all__ = [
     "delete_task",
     "delete_tender_attachment",
     "confirm_catalog",
-    "confirm_check_items",
+    "save_review",
     "create_derived_task",
     "create_original_task",
     "download_result_file",

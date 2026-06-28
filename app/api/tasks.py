@@ -47,23 +47,10 @@ package_select_model = task_ns.model(
     {"package_no": fields.String(required=True, description="选择的包号")},
 )
 
-check_confirm_model = task_ns.model(
-    "CheckConfirmRequest",
+save_review_model = task_ns.model(
+    "SaveReviewRequest",
     {
-        "items": fields.List(
-            fields.Nested(
-                task_ns.model(
-                    "CheckConfirmItem",
-                    {
-                        "check_key": fields.String(required=True, description="核对项标识"),
-                        "check_value": fields.String(required=False, description="核对值"),
-                        "confirmed_flag": fields.Boolean(required=True, description="是否确认"),
-                    },
-                )
-            ),
-            required=True,
-            description="核对项列表",
-        )
+        "data": fields.Raw(required=True, description='完整 data 结构。前端将 GET /check-items 返回的 data 字段整体传入：{"data": {"task_id": 6, "bidding_info": {...}, "business": {...}, ...}}'),
     },
 )
 
@@ -300,16 +287,35 @@ class TaskCheckItemResource(Resource):
         return success(BiddingTaskService.get_check_items(task_id))
 
 
-@task_ns.route("/<int:task_id>/check-items/confirm")
+@task_ns.route("/check-items/confirm")
 class TaskCheckConfirmResource(Resource):
     """提交核对项确认结果。"""
 
-    @task_ns.expect(check_confirm_model)
-    def post(self, task_id):
-        """保存人工确认后的核对项状态。"""
+    @task_ns.expect(save_review_model, validate=False)
+    def post(self):
+        """保存审核面板数据（用户审核/编辑后的全部内容）。
 
+        前端将 GET /check-items 返回的 data 字段整体传入，仅支持一种格式：
+           { "data": { "task_id": 6, "bidding_info": {...}, "business": {...}, ... } }
+
+        此接口可反复调用，每次保存都会覆盖更新各章节数据。
+        第一次调用会将任务从 ANALYZED 推进到 CHECKED。
+        """
         payload = task_ns.payload or {}
-        return success(BiddingTaskService.confirm_check_items(task_id, payload.get("items")), message="核对完成")
+
+        # 仅支持 data 包装格式
+        data_content = payload.get("data", {})
+        if not isinstance(data_content, dict):
+            return {"code": 1, "message": "请求体必须包含 data 字段"}, 400
+
+        task_id = data_content.pop("task_id", None)
+        if not task_id:
+            return {"code": 1, "message": "data 中缺少 task_id"}, 400
+
+        return success(
+            BiddingTaskService.save_review(task_id, data_content),
+            message="审核面板保存完成",
+        )
 
 
 @task_ns.route("/<int:task_id>/catalog-options")
