@@ -174,6 +174,30 @@ class ContentBlock:
         return cb
 
 
+# ── 通用标题前置符剥离 ──
+_HEADING_PREFIX_RE = __import__('re').compile(r'^[^\w一-鿿\d]+')
+
+
+def strip_heading_prefix(text: str) -> str:
+    """剥离标题前导装饰字符，保留标题实质内容。
+    
+    招标文件中标题经常带特殊符号标记，如 ★◆●■▲➢※ 等，
+    这些符号会阻塞标题正则检测，导致整个章节被当作普通段落。
+    
+    剥离规则：去掉开头的连续非中文、非英文、非数字字符。
+    
+    示例:
+      "★二、商务要求"  → "二、商务要求"
+      "●1.技术要求"     → "1.技术要求"
+      "【重要】三、须知"  → "三、须知"
+      "◆ 四、资格要求"   -> " 四、资格要求"
+      "比选邀请"        → "比选邀请"  (无前缀，保持不变)
+    """
+    if not text:
+        return text
+    return _HEADING_PREFIX_RE.sub('', text)
+
+
 class DocumentParser:
     """版面感知的文档解析器。"""
 
@@ -282,8 +306,10 @@ class DocumentParser:
             else:
                 # 文本内容级标题检测（当样式为 Normal 但内容像标题时）
                 text_heading = 0
+                # 剥离前导装饰字符后再匹配（如 ★二、商务要求 → 二、商务要求）
+                text_for_heading = strip_heading_prefix(text) if text else text
                 for level, pattern in text_heading_patterns:
-                    if re.match(pattern, text):
+                    if re.match(pattern, text_for_heading):
                         text_heading = level
                         break
                 

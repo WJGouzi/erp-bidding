@@ -69,16 +69,16 @@ def merge_llm_into_metadata(rule_meta, llm_meta):
     meta = dict(rule_meta) if rule_meta else {}
 
     # 项目名称（LLM 补充规则未覆盖的封面独立行格式）
-    if not meta.get("project_name"):
+    if not meta.get("project_name", {}).get("value"):
         llm_pn = llm_meta.get("project_name")
         if llm_pn and len(str(llm_pn).strip()) > 4 and str(llm_pn).strip().lower() not in ("null", "none"):
-            meta["project_name"] = str(llm_pn).strip()
+            meta["project_name"]["value"] = str(llm_pn).strip()
 
     # 项目编号
-    if not meta.get("project_code"):
+    if not meta.get("project_code", {}).get("value"):
         llm_pc = llm_meta.get("project_code")
         if llm_pc and str(llm_pc).strip().lower() not in ("null", "none", ""):
-            meta["project_code"] = str(llm_pc).strip()
+            meta["project_code"]["value"] = str(llm_pc).strip()
 
     # 购买人名称
     if not meta.get("purchaser", {}).get("name"):

@@ -37,7 +37,7 @@ def _parse_requirements_list(text: str) -> list:
 
 def assemble_business(result, analysis: dict) -> dict:
     """组装商务要求。"""
-    biz_text = result.business_requirements
+    biz_text = getattr(result, "computed_business_requirements", None) or result.business_requirements or ""
     if not biz_text or not biz_text.strip():
         return {"items": [], "raw": ""}
 

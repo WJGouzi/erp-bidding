@@ -75,7 +75,7 @@ def assemble_packages(result, analysis: dict) -> dict:
             meta = json.loads(meta)
         except Exception:
             meta = {}
-    project_name = meta.get("project_name", "")
+    project_name = meta.get("project_name", {}).get("value", "") if isinstance(meta.get("project_name"), dict) else (meta.get("project_name") or "")
 
     # 清理每个包的名称
     cleaned = []

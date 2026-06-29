@@ -67,10 +67,22 @@ def call_llm_json(prompt, max_tokens=500, temperature=0.1):
     if not raw:
         return None
 
-    # 尝试提取 JSON（可能被 markdown 包裹）
+    # 尝试提取 JSON（可能被 markdown 包裹或尾部有多余内容）
+    # 第一步：去掉 markdown 代码块包裹
     json_match = re.search(r'```(?:json)?\s*([\s\S]*?)```', raw)
     if json_match:
         raw = json_match.group(1).strip()
+    
+    # 第二步：提取 {} 之间的内容（即使有前后缀文本也能提取）
+    brace_start = raw.find("{")
+    brace_end = raw.rfind("}")
+    if brace_start >= 0 and brace_end > brace_start:
+        raw = raw[brace_start:brace_end + 1]
+    
+    # 第三步：清洗（控制字符、trailing comma）
+    raw = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", raw)
+    raw = re.sub(r",\s*}", "}", raw)
+    raw = re.sub(r",\s*]", "]", raw)
 
     try:
         result = json.loads(raw)
@@ -94,7 +106,7 @@ def extract_metadata(doc_text, table_kv=None):
                "purchaser_name": ..., "agent_name": ..., 
                "purchaser_contact": ..., "agent_contact": ...}
     """
-    excerpt = doc_text[:3000] if doc_text else ""
+    excerpt = doc_text[:6000] if doc_text else ""
     if not excerpt:
         return {}
 

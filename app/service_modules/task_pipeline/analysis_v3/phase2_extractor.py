@@ -133,6 +133,7 @@ def _verify_statutory_items(sections, statutory_items):
 
     策略：对每项 statutory_item，提取关键词在文档中搜索。
     只要有一个关键词命中，就认为该条款已被文档提及。
+    命中时摘录原文上下文作为 material 字段。
     """
     full_text = _get_full_text(sections)
 
@@ -143,7 +144,64 @@ def _verify_statutory_items(sections, statutory_items):
         # 再加上 requirement 自身作为兜底
         keywords.insert(0, item["requirement"][:20])
 
-        found = any(kw in full_text for kw in keywords if kw)
+        # 找出匹配的关键词和位置
+        found = False
+        material = ""
+        matched_pos = -1
+        for kw in keywords:
+            if not kw:
+                continue
+            pos = full_text.find(kw)
+            if pos >= 0:
+                found = True
+                matched_pos = pos
+                break
+
+        if found and matched_pos >= 0:
+            # 从匹配位置向前找到行首
+            start = matched_pos
+            while start > 0 and full_text[start - 1] != '\n':
+                start -= 1
+
+            # 判断当前行是否是独立编号项（如"1." "（1）"等）
+            current_line = full_text[start:matched_pos].strip()
+            current_is_numbered = False
+            if current_line:
+                if current_line[0] in "（((":
+                    current_is_numbered = True
+                elif len(current_line) > 1 and current_line[0].isdigit() and current_line[1] in ".．、)）":
+                    current_is_numbered = True
+
+            # 仅当前行不是独立编号项时，才包含上一行（处理续行场景）
+            if not current_is_numbered and start > 1:
+                prev_line_start = full_text.rfind('\n', 0, start - 1) + 1
+                prev_line = full_text[prev_line_start:start - 1].strip()
+                if prev_line:
+                    fc = prev_line[0]
+                    is_numbered = len(prev_line) > 1 and prev_line[0].isdigit() and prev_line[1] in ".．、)）"
+                    if fc in "（((" or is_numbered:
+                        start = prev_line_start
+
+            # 从匹配位置向后找到句尾或下一个编号项
+            end = matched_pos + len(kw)
+            max_end = min(end + 500, len(full_text))
+            while end < max_end:
+                if end + 1 < len(full_text) and full_text[end] == '\n':
+                    # 检查下一个非空行是否是编号项
+                    next_line_start = end + 1
+                    while next_line_start < len(full_text) and full_text[next_line_start] in ('\n', '\r'):
+                        next_line_start += 1
+                    if next_line_start < len(full_text):
+                        next_line = full_text[next_line_start:next_line_start + 20]
+                        fc2 = next_line[0]
+                        is_numbered2 = len(next_line) > 1 and next_line[0].isdigit() and next_line[1] in ".．、)）"
+                        if fc2 in "（((" or is_numbered2 or next_line.startswith('★') or next_line.startswith('注'):
+                            break
+                    # 连续两个换行 → 段落结束
+                    if end + 2 <= len(full_text) and full_text[end:end+2] == '\n\n':
+                        break
+                end += 1
+            material = full_text[start:end].strip()
 
         results.append({
             "id": item["id"],
@@ -151,6 +209,7 @@ def _verify_statutory_items(sections, statutory_items):
             "requirement": item["requirement"],
             "law_ref": item.get("law_ref", ""),
             "found": found,
+            "material": material,
             "status": "passed" if found else "attention",
             "severity": item.get("severity", "normal"),
         })
@@ -382,6 +441,7 @@ def _extract_requirements_from_sections(qual_sections, signals):
 
         entry = {
             "requirement": line[:300],
+            "material": line,
             "category": category,
             "severity": _detect_severity(line, category),
         }

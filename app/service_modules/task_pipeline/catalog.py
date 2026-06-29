@@ -2,6 +2,7 @@
 
 import logging; logger = logging.getLogger(__name__)
 import json
+import re
 from flask import current_app
 
 from ...core.extensions import db
@@ -94,6 +95,437 @@ def _classify_check_items(check_items):
             classified["scoring"].append(item)
     return classified
 
+
+# ═══════════════════════════════════════════════════════════════════
+# 目录合并引擎（替代旧的 _build_package_aware_outline）
+# ═══════════════════════════════════════════════════════════════════
+
+def _parse_format_tree(required_sections):
+    """阶段1：解析 format_requirements.required_sections 为目录树。
+    
+    检测规则：
+    - 标题以 一、二、三... 开头 → 父级节点
+    - 其他标题 → 归属于最近父级的子项
+    """
+    if not required_sections:
+        return []
+    cn_pat = re.compile(r'^[一二三四五六七八九十]+、')
+    parent_indices = [i for i, s in enumerate(required_sections) if cn_pat.match(s.get("title", ""))]
+    if not parent_indices:
+        return []
+    tree = []
+    for idx, p_idx in enumerate(parent_indices):
+        parent = required_sections[p_idx]
+        next_p = parent_indices[idx + 1] if idx + 1 < len(parent_indices) else len(required_sections)
+        children = required_sections[p_idx + 1:next_p]
+        tree.append({
+            "source": "format_requirements",
+            "title": parent.get("title", ""),
+            "has_template": parent.get("has_template", False),
+            "template_tables": parent.get("template_tables", []),
+            "children": [
+                {"source": "format_requirements", "title": c.get("title", "")}
+                for c in children
+            ],
+            "description": "",
+        })
+    return tree
+
+
+def _infer_skeleton_fallback(analysis_data):
+    """降级路径：无 format_requirements 时，从文档章节推断骨架。"""
+    chapters = analysis_data.get("document_chapters", [])
+    if not chapters:
+        return []
+    chapter_section_map = [
+        ("报价|报价格", "报价函"),
+        ("资格|资质", "资格证明文件"),
+        ("技术|参数|采购需求", "技术响应"),
+        ("商务|合同", "商务响应"),
+        ("评分|评选|评审", "评分响应"),
+    ]
+    seen = set()
+    skeleton = []
+    for ch in chapters:
+        for pattern, section_name in chapter_section_map:
+            if re.search(pattern, ch) and section_name not in seen:
+                skeleton.append({
+                    "source": "inferred",
+                    "title": section_name,
+                    "description": "",
+                    "children": [],
+                })
+                seen.add(section_name)
+    return skeleton
+
+
+def build_base_skeleton(analysis_data):
+    """阶段1主入口：构建基础骨架。"""
+    fmt = analysis_data.get("format_requirements", {})
+    if fmt and fmt.get("required_sections"):
+        tree = _parse_format_tree(fmt["required_sections"])
+        if tree:
+            return tree
+    return _infer_skeleton_fallback(analysis_data)
+
+
+def _get_dimensions_compat(scoring):
+    """兼容 analyze 格式（dimensions）和 check-items 格式（business/technical）。"""
+    dims = scoring.get("dimensions", [])
+    if dims:
+        return dims
+    dims = []
+    for group in ("business", "technical"):
+        for item in scoring.get(group, []):
+            dims.append({
+                "name": item.get("name", ""),
+                "score": item.get("score", 0),
+                "type": item.get("type", "objective"),
+            })
+    return [d for d in dims if "合计" not in d.get("name", "") and "总计" not in d.get("name", "")]
+
+
+def _is_covered(skeleton, dim_name):
+    """判断评分维度是否已被骨架章节覆盖。"""
+    explicit_map = {
+        "报价": ["报价一览表", "报价表", "报价部分"],
+        "供应商业绩": ["类似项目业绩", "业绩一览表", "业绩"],
+        "业绩": ["类似项目业绩", "业绩一览表"],
+    }
+    expected_sections = explicit_map.get(dim_name, [dim_name])
+    for node in skeleton:
+        node_title = node.get("title", "")
+        for expected in expected_sections:
+            if expected in node_title:
+                return True, node
+        if dim_name in node_title:
+            return True, node
+    return False, None
+
+
+def _find_insert_position(skeleton, dim_name):
+    """确定新增评分驱动章节的插入位置。"""
+    keywords = [dim_name[:2], dim_name[:3]]
+    candidates = []
+    for i, node in enumerate(skeleton):
+        node_title = node.get("title", "")
+        for kw in keywords:
+            if kw and kw in node_title:
+                candidates.append(i + 1)
+    if candidates:
+        return min(candidates)
+    for i, node in enumerate(skeleton):
+        if "其他" in node.get("title", ""):
+            return i
+    return len(skeleton)
+
+
+def merge_scoring_sections(skeleton, scoring):
+    """阶段2：将评分维度合并到骨架中。
+    
+    - objective + 已覆盖 → 无操作
+    - subjective + 未覆盖 → 新增章节
+    - 合计/总计行 → 跳过
+    """
+    dims = _get_dimensions_compat(scoring)
+    if not dims:
+        return skeleton
+    
+    new_sections = []
+    for dim in dims:
+        name = dim.get("name", "")
+        score = dim.get("score", 0)
+        dim_type = dim.get("type", "")
+        if "合计" in name or "总计" in name:
+            continue
+        covered, _ = _is_covered(skeleton, name)
+        if covered:
+            continue
+        if dim_type == "subjective":
+            section = {
+                "source": "scoring",
+                "title": name,
+                "description": f"根据本项目采购需求，编制{name}",
+                "children": [],
+                "score": score,
+            }
+            pos = _find_insert_position(skeleton, name)
+            new_sections.append((pos, section))
+        else:
+            logger.info("[catalog] 客观评分项 '%s'(%s分) 未覆盖", name, score)
+    
+    # 从后往前插入，避免位置偏移
+    new_sections.sort(key=lambda x: -x[0])
+    for pos, section in new_sections:
+        skeleton.insert(pos, section)
+    return skeleton
+
+
+def _fill_business_children(skeleton, business_items):
+    """从 business.items 动态生成商务偏离表子项（已去重）。"""
+    if not business_items:
+        return
+    keyword_section_map = [
+        # 更具体的模式排在前面，避免"售后"误匹配"报价方式"中的"售后"
+        ("报价方式", "报价方式说明"),
+        ("付款", "付款方式响应"),
+        ("交付地点", "交货地点"),
+        ("交付要求|交货时间", "交货时间"),
+        ("验收", "验收方案"),
+        ("售后服务", "售后服务承诺"),
+        ("质保", "质保期承诺"),
+    ]
+    seen_titles = set()
+    children = []
+    for item in business_items:
+        content = item.get("content", "")
+        for pattern, title in keyword_section_map:
+            if re.search(pattern, content) and title not in seen_titles:
+                seen_titles.add(title)
+                children.append({
+                    "source": "business_items",
+                    "title": title,
+                    "description": content[:80],
+                })
+                break
+    for node in skeleton:
+        if "商务" in node.get("title", "") and "偏离" in node.get("title", ""):
+            node["children"] = children
+            break
+
+
+def _fill_tech_description(skeleton, technical_items, packages):
+    """统计产品数量，填充技术偏离表描述。"""
+    product_count = 0
+    if packages:
+        for pkg in packages:
+            if not isinstance(pkg, dict):
+                continue
+            table_items = (pkg.get("parameters") or {}).get("table_items", [])
+            for item in table_items:
+                if item.get("采购产品名称", ""):
+                    product_count += 1
+    if product_count == 0 and technical_items:
+        product_count = len(technical_items)
+    for node in skeleton:
+        if "技术" in node.get("title", "") and "偏离" in node.get("title", ""):
+            if product_count > 0:
+                node["description"] = f"共{product_count}种产品，逐项响应技术参数要求"
+            break
+
+
+def _fill_qualification(skeleton, classified_items):
+    """资格项去重后填充到资格证明文件章节。"""
+    qual_items = classified_items.get("qualification", [])
+    if not qual_items:
+        return
+    
+    def _get_val(item, key):
+        """兼容 ORM 对象和 dict。
+
+        ORM 对象 (BiddingCheckItem) 属性: check_key, check_label, check_value
+        dict 对象字段: requirement, material, check_label, check_value
+        """
+        if isinstance(item, dict):
+            return item.get(key, "") or ""
+        _m = {"requirement": "check_label", "material": "check_value",
+              "check_label": "check_label", "check_value": "check_value"}
+        return getattr(item, _m.get(key, key), "") or ""
+    seen = set()
+    deduped = []
+    for item in qual_items:
+        req = _get_val(item, "requirement") or _get_val(item, "check_label") or ""
+        key = req[:20]
+        if key and key not in seen:
+            seen.add(key)
+            deduped.append(item)
+    
+    qual_node = None
+    for node in skeleton:
+        if "资格" in node.get("title", ""):
+            qual_node = node
+            break
+    if qual_node:
+        qual_node["children"] = [
+            {
+                "source": "qualification",
+                "title": _get_val(item, "requirement") or _get_val(item, "check_label"),
+                "description": (_get_val(item, "material") or "")[:100],
+            }
+            for item in deduped
+        ]
+
+
+def _fill_compliance(skeleton, classified_items):
+    """实质性/符合性要求填充。"""
+    comp_items = classified_items.get("compliance", [])
+    if not comp_items:
+        return
+    
+    def _get_val(item, key):
+        if isinstance(item, dict):
+            return item.get(key, "") or ""
+        _m = {"requirement": "check_label", "material": "check_value",
+              "check_label": "check_label", "check_value": "check_value"}
+        return getattr(item, _m.get(key, key), "") or ""
+    
+    comp_node = None
+    for node in skeleton:
+        if "实质性" in node.get("title", ""):
+            comp_node = node
+            break
+    if comp_node:
+        comp_node["children"] = [
+            {
+                "source": "compliance",
+                "title": _get_val(item, "check_label") or _get_val(item, "requirement"),
+                "description": (_get_val(item, "check_value") or "")[:80],
+            }
+            for item in comp_items
+        ]
+
+
+def enrich_section_details(skeleton, analysis_data, classified_items):
+    """阶段3：用各数据源填充章节详情。"""
+    # 3.1 商务偏离表子项
+    business_items = analysis_data.get("business", {}).get("items", []) if isinstance(analysis_data.get("business"), dict) else []
+    if business_items:
+        _fill_business_children(skeleton, business_items)
+    
+    # 3.2 技术偏离表描述
+    technical_items = analysis_data.get("technical", {}).get("items", []) if isinstance(analysis_data.get("technical"), dict) else []
+    packages = analysis_data.get("packages", [])
+    if technical_items or packages:
+        _fill_tech_description(skeleton, technical_items, packages)
+    
+    # 3.3 资格项填充：如果骨架无资格节点但文档有资格章节+资格项，新增
+    _fill_qualification(skeleton, classified_items)
+    qual_items = classified_items.get("qualification", [])
+    chapters = analysis_data.get("document_chapters", [])
+    has_qual_chapter = any("资格" in ch for ch in chapters)
+    has_qual_node = any("资格" in n.get("title", "") for n in skeleton)
+    if qual_items and has_qual_chapter and not has_qual_node:
+        # 插入资格节点（比选函之后，即 index 1）
+        def _gv(item, key):
+            if isinstance(item, dict):
+                return item.get(key, "") or ""
+            _m = {"requirement": "check_label", "material": "check_value",
+                  "check_label": "check_label", "check_value": "check_value"}
+            return getattr(item, _m.get(key, key), "") or ""
+        # 去重后再插入
+        _seen_titles = set()
+        _deduped_qual = []
+        for item in qual_items:
+            _t = _gv(item, "requirement") or _gv(item, "check_label")
+            if _t[:20] not in _seen_titles:
+                _seen_titles.add(_t[:20])
+                _deduped_qual.append(item)
+        skeleton.insert(1, {
+            "source": "qualification",
+            "title": "资格证明文件",
+            "description": "根据招标文件要求提供以下资格证明材料",
+            "children": [
+                {
+                    "source": "qualification",
+                    "title": (_gv(item, "requirement") or _gv(item, "check_label"))[:60],
+                    "description": (_gv(item, "material") or "")[:100],
+                }
+                for item in _deduped_qual
+            ],
+        })
+    
+    # 3.4 实质性要求填充
+    _fill_compliance(skeleton, classified_items)
+
+
+def validate_completeness(outline, document_chapters):
+    """阶段4：验证目录是否覆盖源文档所有章节。"""
+    if not document_chapters:
+        return []
+    chapter_section_map = [
+        ("比选邀请", ["比选函"]),
+        ("须知", ["比选函"]),
+        ("申请文件格式", []),
+        ("资格证明", ["资格证明"]),
+        ("比选项目及要求", ["报价一览表", "商务", "技术", "偏离表"]),
+        ("评选办法", ["服务方案", "售后保障", "评分"]),
+        ("合同", []),
+    ]
+    warnings = []
+    for ch in document_chapters:
+        ch_stripped = ch.strip()
+        if ch_stripped in ("目录", "比选编号"):
+            continue
+        matched = False
+        for keyword, expected_sections in chapter_section_map:
+            if keyword in ch_stripped:
+                if not expected_sections:
+                    matched = True
+                    break
+                for node in outline:
+                    node_title = node.get("title", "")
+                    for expected in expected_sections:
+                        if expected in node_title:
+                            matched = True
+                            break
+                    if matched:
+                        break
+                break
+        if not matched:
+            warnings.append(f"章节 '{ch_stripped}' 在目录中无明确对应")
+    return warnings
+
+
+def _assign_numbers(skeleton):
+    """给骨架节点分配统一编号（一、二、三...）。"""
+    # 先清除所有已有的中文编号前缀
+    cn_prefix = re.compile(r'^[一二三四五六七八九十]+、')
+    for node in skeleton:
+        title = node.get("title", "")
+        node["title"] = cn_prefix.sub("", title).strip()
+    
+    chinese_nums = ["一", "二", "三", "四", "五", "六", "七", "八", "九", "十",
+                    "十一", "十二", "十三", "十四", "十五", "十六", "十七", "十八"]
+    for idx, node in enumerate(skeleton):
+        num = chinese_nums[idx] if idx < len(chinese_nums) else str(idx + 1)
+        node["title"] = f"{num}、{node['title']}"
+    
+    last_num = chinese_nums[len(skeleton)] if len(skeleton) < len(chinese_nums) else str(len(skeleton) + 1)
+    skeleton.append({
+        "source": "catch_all",
+        "title": f"{last_num}、其他材料",
+        "description": "供应商认为需要提交的其他材料",
+        "children": [],
+    })
+    return skeleton
+
+
+def build_catalog(analysis_data, classified_items):
+    """目录合并引擎主入口。"""
+    # 阶段1：基础骨架
+    skeleton = build_base_skeleton(analysis_data)
+    if not skeleton:
+        logger.warning("[catalog] 骨架为空，返回空目录")
+        return []
+    
+    # 阶段2：合并评分维度
+    scoring = analysis_data.get("scoring", {})
+    if isinstance(scoring, dict):
+        skeleton = merge_scoring_sections(skeleton, scoring)
+    
+    # 阶段3：填充详情
+    enrich_section_details(skeleton, analysis_data, classified_items)
+    
+    # 阶段4：编号
+    outline = _assign_numbers(skeleton)
+    
+    # 验证
+    chapters = analysis_data.get("document_chapters", [])
+    warnings = validate_completeness(outline, chapters)
+    if warnings:
+        logger.info("[catalog] 覆盖验证警告: %s", warnings)
+    
+    return outline
 
 
 def _build_bid_letter_section(analysis_context):
@@ -359,65 +791,32 @@ def _build_other_section():
         "children": [],
     }
 
+def _has_chapter_keyword(chapter_titles, keywords):
+    """检查文档章节标题中是否包含目标关键词。"""
+    if not chapter_titles:
+        return None  # 未知，不做判断
+    for title in chapter_titles:
+        title_lower = title.lower()
+        for kw in keywords:
+            if kw in title_lower or kw in title:
+                return True
+    return False
+
+
+def _get_format_requirement_titles(analysis_data):
+    """从 analysis_data 中提取格式要求的章节标题列表。"""
+    fmt = analysis_data.get("format_requirements")
+    if not fmt or not isinstance(fmt, dict):
+        return []
+    sections = fmt.get("required_sections", [])
+    return [s.get("title", "") for s in sections if s.get("title")]
+
+
 
 def _build_package_aware_outline(task, analysis_result, filtered_analysis_data, classified_items, generation_level=None):
-    """动态生成投标文件目录结构，根据包号、确认项、评分维度等因素动态决定章节。"""
-    analysis_context = _extract_analysis_context(analysis_result)
-    sections = []
+    """替换为新的合并引擎。"""
+    return build_catalog(filtered_analysis_data, classified_items)
 
-    # ── 收集所有章节（不带编号） ──
-    sections.append(_build_bid_letter_section(analysis_context))
-    sections.append(_build_price_section(analysis_context, filtered_analysis_data))
-    sections.append(_build_authorization_section())
-
-    has_quals = len(classified_items.get("qualification", [])) > 0
-    if has_quals:
-        sections.append(_build_qualification_section(classified_items, analysis_context, filtered_analysis_data))
-
-    has_compliance = len(classified_items.get("compliance", [])) > 0
-    if has_compliance:
-        sections.append(_build_compliance_section(classified_items))
-
-    sections.append(_build_tech_section(analysis_context, filtered_analysis_data))
-    sections.append(_build_business_section(analysis_context))
-
-    scoring = filtered_analysis_data.get("scoring", {})
-    dims = scoring.get("dimensions", []) if isinstance(scoring, dict) else []
-    has_scoring = len(dims) > 0
-    if has_scoring:
-        sections.append(_build_scoring_section(filtered_analysis_data))
-    else:
-        scoring_from_ctx = analysis_context.get("scoring_items", "")
-        if scoring_from_ctx:
-            parsed_dims = None
-            if scoring_from_ctx.startswith("["):
-                try:
-                    parsed = json.loads(scoring_from_ctx)
-                    if isinstance(parsed, list):
-                        parsed_dims = parsed
-                except (json.JSONDecodeError, TypeError):
-                    pass
-            if parsed_dims:
-                filtered_analysis_data.setdefault("scoring", {})["dimensions"] = parsed_dims
-            else:
-                filtered_analysis_data.setdefault("scoring", {})["dimensions"] = [
-                    {"name": "综合评分", "score": 0, "criteria": scoring_from_ctx[:80]}
-                ]
-            sections.append(_build_scoring_section(filtered_analysis_data))
-
-    sections.append(_build_service_section())
-    sections.append(_build_performance_section())
-    sections.append(_build_other_section())
-
-    # ── 动态编号：按实际收集到的章节数依次编号 ──
-    chinese_nums = ["一", "二", "三", "四", "五", "六", "七", "八", "九", "十", "十一", "十二", "十三", "十四", "十五"]
-    for idx, section in enumerate(sections):
-        num = chinese_nums[idx] if idx < len(chinese_nums) else str(idx + 1)
-        title = section.get("title", "")
-        # 避免重复添加编号（title 应已不带编号）
-        section["title"] = f"{num}、{title}"
-
-    return sections
 
 
 def _should_fallback_to_legacy(task, analysis_result, selected_package_no, check_items):
@@ -427,8 +826,9 @@ def _should_fallback_to_legacy(task, analysis_result, selected_package_no, check
     analysis_data = analysis_result.safe_analysis_data()
     if not analysis_data:
         return True
-    # 多包项目但未选择包号时回退
-    if bool(analysis_data.get("has_package")) and not selected_package_no:
+    # 多包项目（>1包）但未选择包号时回退
+    package_count = analysis_data.get("package_count", 0) or len(analysis_data.get("packages", []) or [])
+    if bool(analysis_data.get("has_package")) and package_count > 1 and not selected_package_no:
         return True
     # check_items 为空且无 analysis_data 关键字段
     if not check_items:
@@ -514,8 +914,8 @@ def _build_dynamic_outline_with_llm(task, analysis_result, text):
             meta = analysis_data.get("metadata") or analysis_data.get("bidder_notice", {})
     if meta:
         context_parts.append("=== 项目信息 ===")
-        if meta.get("project_name"): context_parts.append(f"项目名称：{meta['project_name']}")
-        if meta.get("project_code"): context_parts.append(f"项目编号：{meta['project_code']}")
+        if meta.get("project_name", {}).get("value"): context_parts.append(f"项目名称：{meta['project_name']['value']}")
+        if meta.get("project_code", {}).get("value"): context_parts.append(f"项目编号：{meta['project_code']['value']}")
         if meta.get("budget"): context_parts.append(f"预算：{meta.get('budget', {}).get('total', 0)}")
         if meta.get("overview"): context_parts.append(f"项目概况：{meta['overview']}")
         # 注入选定的包号信息

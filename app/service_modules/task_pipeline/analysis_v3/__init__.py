@@ -22,6 +22,7 @@ import logging
 import re
 
 from .schemas import assemble_v3_analysis_data, analysis_data_to_json
+from ....domain.analysis_schema import AnalysisSchema, ValidationGate
 from .llm_extractor import (
     extract_metadata as llm_extract_metadata,
     extract_budget as llm_extract_budget,
@@ -29,9 +30,11 @@ from .llm_extractor import (
     extract_business as llm_extract_business,
     extract_technical as llm_extract_technical,
 )
+from ....infrastructure.document_parser import strip_heading_prefix as _strip_heading_prefix
 from .llm_validator import merge_llm_into_metadata
 from .phase1_metadata import extract_metadata, classify_document
 from .phase2_eligibility import scan_eligibility
+from .phase1_5_format import extract_format_requirements
 from .phase2_extractor import scan_eligibility_v2
 from .phase3_scoring import extract_scoring, extract_packages, cross_package_analysis
 from .check_items import generate_check_items, assemble_check_items
@@ -215,6 +218,161 @@ def _build_strategy_from_phases(metadata, eligibility, scoring, packages):
         "writing_focus": writing_focus,
     }
 
+# ── 商务/技术要求通用字段正则模式 ──
+_BIZ_FIELD_PATTERNS = {
+    "payment_terms": [r"付款[^\n。]{5,200}", r"付款方式[^\n。]{5,200}"],
+    "delivery_location": [r"履约地点[^\n。]{5,200}", r"交货地点[^\n。]{5,200}"],
+    "delivery_terms": [r"服务时间[^\n。]{5,200}", r"交货时间[^\n。]{5,200}"],
+    "acceptance_standard": [r"验收[^\n。]{5,300}"],
+    "warranty_period": [r"质保期[^\n。]{5,200}", r"到货有效期[^\n。]{5,200}"],
+    "pricing_rule": [r"报价[^\n。]{5,200}", r"报价要求[^\n。]{5,200}"],
+    "after_sale_service": [r"售后[^\n。]{5,200}"],
+    "submission_location": [r"递交地点[^\n。]{5,100}"],
+}
+
+_TECH_FIELD_PATTERNS = {
+    "specifications": [r"规格参数[^\n。]{10,500}"],
+    "quality_standard": [r"质量标准[^\n。]{10,200}", r"技术标准[^\n。]{10,200}"],
+}
+
+
+def _extract_section_text(raw_text: str, start_markers: list, end_markers: list) -> str:
+    """从 raw_text 中定位章节并提取原文（精确边界）。"""
+    for marker in start_markers:
+        idx = raw_text.find(marker)
+        if idx >= 0:
+            rest = raw_text[idx:]
+            end = len(rest)
+            for sep in end_markers:
+                pos = rest.find(sep, 5)
+                if 5 < pos < end:
+                    end = pos
+            text = rest[:end].strip()
+            if len(text) > 50:
+                return text
+    return ""
+
+
+def _rule_extract_business(section_text: str) -> dict:
+    """从商务章节文本中用规则提取已知字段。"""
+    result = {}
+    for field, patterns in _BIZ_FIELD_PATTERNS.items():
+        for p in patterns:
+            m = __import__("re").search(p, section_text)
+            if m:
+                result[field] = m.group(0)
+                break
+    return result
+
+
+def _rule_extract_technical(section_text: str) -> list:
+    """从技术章节文本中用规则提取要点。"""
+    result = []
+    for field, patterns in _TECH_FIELD_PATTERNS.items():
+        for p in patterns:
+            m = __import__("re").search(p, section_text)
+            if m:
+                result.append(f"{field}: {m.group(0)[:200]}")
+    return result
+
+
+def _find_business_section_text(sections, raw_text="", max_chars=0) -> str:
+    """定位商务章节并提取原文（规则优先，LLM 兜底）。
+    
+    策略:
+      1. 精确搜索 ★二、商务要求 定位章节边界 → 截取原文
+      2. 用规则从截取的原文中提取已知字段（付款方式、交货时间等）
+      3. 只有规则提取不到时才返回原文给 LLM（此时传小段即可）
+    
+    Returns:
+        规则提取成功 → 空字符串（数据已存入 metadata.extra）
+        规则提取失败 → 小段原文（给 LLM 兜底用，最多 1000 字符）
+    """
+    if not raw_text:
+        return ""
+    
+    section_text = _extract_section_text(
+        raw_text,
+        start_markers=["★二、商务要求", "★2、商务要求", "商务要求", "商务条款"],
+        end_markers=["\n★", "\n第", "\n四、", "\n五、", "\n六、", "\n七、"],
+    )
+    if not section_text:
+        return ""
+    
+    # 规则优先：从截取的章节文本中提取字段
+    rule_result = _rule_extract_business(section_text)
+    if rule_result:
+        # 规则提取成功，直接存入全局 metadata（通过 side effect 传递）
+        _biz_rule_cache.clear()
+        _biz_rule_cache.update(rule_result)
+        logger.info("[analysis_v3] 规则提取商务要求完成: %d fields %s", len(rule_result), list(rule_result.keys()))
+        return ""  # 不需要 LLM 了
+    
+    # 规则提取失败，返回小段原文给 LLM 兜底（最多 1000 字符）
+    logger.info("[analysis_v3] 规则未提取到商务字段，返回原文给 LLM (len=%d)", len(section_text))
+    return section_text[:1000]
+
+
+# 全局缓存：规则提取结果传给调用方
+_biz_rule_cache = {}
+_tech_rule_cache = {}
+
+def _get_biz_rule_cache():
+    global _biz_rule_cache
+    result = dict(_biz_rule_cache)
+    _biz_rule_cache = {}
+    return result
+
+
+def _find_technical_section_text(sections, raw_text="", max_chars=0) -> str:
+    """定位技术章节并提取原文（规则优先，LLM 兜底）。"""
+    if not raw_text:
+        return ""
+    
+    section_text = _extract_section_text(
+        raw_text,
+        start_markers=["三、技术、服务要求", "技术、服务要求", "★三、技术", "技术要求", "技术参数"],
+        end_markers=["\n★", "\n第", "\n四、", "\n五、", "\n六、", "\n七、", "\n八、", "\n第六章", "\n第七章"],
+    )
+    if not section_text:
+        return ""
+    
+    # 规则优先
+    rule_result = _rule_extract_technical(section_text)
+    if rule_result:
+        _tech_rule_cache.clear()
+        _tech_rule_cache["items"] = rule_result
+        logger.info("[analysis_v3] 规则提取技术要求完成: %d items", len(rule_result))
+        return ""
+    
+    return section_text[:1000]
+
+
+
+
+def _section_to_text(section) -> str:
+    """提取章节的纯文本内容（段落 + 子章节）。"""
+    parts = []
+    for block in getattr(section, "content", []):
+        if getattr(block, "type", "") in ("paragraph", "heading", "list"):
+            text = getattr(block, "text", "") or ""
+            if text:
+                parts.append(text)
+        elif getattr(block, "type", "") == "table":
+            headers = getattr(block, "headers", []) or []
+            rows = getattr(block, "rows", []) or []
+            if headers:
+                parts.append(" | ".join(headers))
+            for row in rows:
+                parts.append(" | ".join(row))
+    for child in getattr(section, "children", []):
+        child_text = _section_to_text(child)
+        if child_text:
+            parts.append(child_text)
+    return "\n".join(parts)
+
+
+
 
 def start_analyze_v3(task, source_texts, adapter=None):
     """三层分析管线总入口 — 零LLM依赖。
@@ -322,7 +480,7 @@ def start_analyze_v3(task, source_texts, adapter=None):
 
     # ── LLM 增强：补全规则无法提取的元数据 ──
     try:
-        llm_meta = llm_extract_metadata(raw_text[:5000])
+        llm_meta = llm_extract_metadata(raw_text[:8000])
         if llm_meta:
             # LLM提取预算
             table_kv_text = ''
@@ -356,6 +514,85 @@ def start_analyze_v3(task, source_texts, adapter=None):
         temp_section.content.append(ContentBlock(ContentBlock.TYPE_PARAGRAPH, raw_text[:50000]))
         sections = [temp_section]
         logger.info("[analysis_v3] sections 为空，使用 raw_text 构建临时章节")
+
+    # ════════════════════════════════════════════
+    #  第1.5层：格式要求提取（比选申请文件格式等）
+    # ════════════════════════════════════════════
+
+    # ── LLM 增强：商务要求（规则未提取到时补充） ──
+    try:
+        extra = metadata.get("extra", {}) if isinstance(metadata, dict) else {}
+        # 检查规则是否提取到商务字段
+        biz_field_keys = ["payment_terms", "delivery_location", "service_period", 
+                          "acceptance_standard", "after_sale_service", "warranty_period",
+                          "business_terms_raw"]
+        has_rule_biz = any(extra.get(k) for k in biz_field_keys)
+        
+        if not has_rule_biz:
+            biz_section_text = _find_business_section_text(sections, raw_text)
+            # 先检查规则提取缓存（_find_business_section_text 内部已尝试规则）
+            rule_biz = _get_biz_rule_cache()
+            if rule_biz:
+                # 规则提取成功，写入 metadata.extra
+                if isinstance(metadata, dict):
+                    if "extra" not in metadata:
+                        metadata["extra"] = {}
+                    metadata["extra"].update(rule_biz)
+                    biz_texts = [f"{k}: {v}" for k, v in rule_biz.items()]
+                    metadata["extra"]["business_terms_raw"] = "\n".join(biz_texts)
+                logger.info("[analysis_v3] 规则提取商务要求完成: %d fields", len(rule_biz))
+            elif biz_section_text:
+                # 规则提取失败，启用 LLM 兜底（仅传小段文本）
+                logger.info("[analysis_v3] 规则未提取到商务要求，启用 LLM 兜底 (text_len=%d)", len(biz_section_text))
+                llm_biz = llm_extract_business(biz_section_text)
+                if llm_biz and isinstance(llm_biz, list) and len(llm_biz) > 0:
+                    biz_texts = []
+                    for item in llm_biz:
+                        name = item.get("name", "")
+                        requirement = item.get("requirement", "")
+                        if name and requirement:
+                            biz_texts.append(f"{name}: {requirement}")
+                    if biz_texts:
+                        if isinstance(metadata, dict):
+                            if "extra" not in metadata:
+                                metadata["extra"] = {}
+                            metadata["extra"]["llm_business_raw"] = "\n".join(biz_texts)
+                            metadata["extra"]["business_terms_raw"] = "\n".join(biz_texts)
+                        logger.info("[analysis_v3] LLM商务提取完成: %d items", len(llm_biz))
+    except Exception as exc:
+        logger.warning("[analysis_v3] LLM商务增强异常(非阻断): %s", exc)
+
+    # ── LLM 增强：技术要求（规则未提取到时补充） ──
+    try:
+        if not has_rule_biz or True:  # 技术要求一直尝试 LLM 补充
+            tech_section_text = _find_technical_section_text(sections, raw_text)
+            if tech_section_text:
+                logger.info("[analysis_v3] 尝试 LLM 技术要求提取 (text_len=%d)", len(tech_section_text))
+                llm_tech = llm_extract_technical(tech_section_text)
+                if llm_tech and isinstance(llm_tech, list) and len(llm_tech) > 0:
+                    tech_texts = []
+                    for item in llm_tech:
+                        name = item.get("name", "")
+                        requirement = item.get("requirement", "")
+                        if name and requirement:
+                            tech_texts.append(f"{name}: {requirement}")
+                    if tech_texts and isinstance(metadata, dict):
+                        if "extra" not in metadata:
+                            metadata["extra"] = {}
+                        metadata["extra"]["llm_technical_raw"] = "\n".join(tech_texts)
+                        logger.info("[analysis_v3] LLM技术提取完成: %d items", len(llm_tech))
+    except Exception as exc:
+        logger.warning("[analysis_v3] LLM技术增强异常(非阻断): %s", exc)
+
+    format_requirements = None
+    try:
+        format_requirements = extract_format_requirements(sections)
+        if format_requirements:
+            logger.info("[analysis_v3] 格式要求提取完成: chapter='%s', %d sections",
+                        format_requirements["chapter_title"],
+                        len(format_requirements.get("required_sections", [])))
+    except Exception as exc:
+        logger.warning("[analysis_v3] 格式要求提取异常(非阻断): %s", exc)
 
     # Phase 2: 专家级生死线扫描（零bid_type/doc_type依赖）
     # 使用新的章节定位v2：评分机制 + 法规固定清单 + 动态提取
@@ -417,6 +654,18 @@ def start_analyze_v3(task, source_texts, adapter=None):
     if table_results and isinstance(table_results, dict):
         table_classification = table_results.get("_classification")
     
+    # ── 收集文档章节标题（用于后续目录生成） ──
+    chapter_titles = []
+    seen_titles = set()
+    for sec in sections:
+        title = _strip_heading_prefix(getattr(sec, "title", "") or "")
+        # 只收集一级章节（第一章、一、等）
+        if title and len(title) < 50 and title not in seen_titles:
+            level = getattr(sec, "level", 0)
+            if level <= 2:  # 一级或二级标题
+                chapter_titles.append(getattr(sec, "title", "") or "")  # 保留原文
+                seen_titles.add(title)
+    
     analysis_data = assemble_v3_analysis_data(
         metadata=metadata,
         eligibility=eligibility,
@@ -425,6 +674,21 @@ def start_analyze_v3(task, source_texts, adapter=None):
         strategy=strategy,
         table_classification=table_classification,
     )
+    # 注入章节标题到 analysis_data
+    analysis_data["document_chapters"] = chapter_titles
+
+    # ── Validation Gate：校验数据质量（非阻断，仅日志） ──
+    try:
+        schema = AnalysisSchema.from_analysis_data(analysis_data)
+        gate = ValidationGate()
+        issues = gate.validate(schema)
+        if issues:
+            logger.warning("[analysis_v3] 数据校验发现 %d 个问题:", len(issues))
+            for issue in issues:
+                logger.warning("  [validation] %s", issue)
+        analysis_data["_validation"] = {"issues": issues, "passed": len(issues) == 0}
+    except Exception as exc:
+        logger.warning("[analysis_v3] 数据校验异常(非阻断): %s", exc)
 
     # 生成核对项
     check_items = generate_check_items(eligibility, scoring, packages)
@@ -444,6 +708,7 @@ def start_analyze_v3(task, source_texts, adapter=None):
         "analysis_data": analysis_data,
         "analysis_data_json": analysis_data_to_json(analysis_data),
         "check_items": check_items,
+        "format_requirements": format_requirements,
         "effective_text": source_texts.get("effective_text", "") or _text_from_all_sections(doc)[:50000],
     }
 

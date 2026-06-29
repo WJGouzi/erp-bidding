@@ -9,8 +9,23 @@
 """
 
 import logging
+import re
 
 logger = logging.getLogger(__name__)
+
+
+# ── 通用标题前置符剥离（与 document_parser.py 保持一致） ──
+_HEADING_PREFIX_RE = re.compile(r'^[^\w\u4e00-\u9fff\d]+')
+
+
+def _strip_heading_prefix(text: str) -> str:
+    """剥离标题前导装饰字符，保留标题实质内容。
+    
+    示例: "★二、商务要求" → "二、商务要求"
+    """
+    if not text:
+        return text
+    return _HEADING_PREFIX_RE.sub('', text)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -57,7 +72,9 @@ def find_section_by_title(sections, keyword):
         nonlocal best, best_score
         for section in section_list:
             title = getattr(section, "title", "") or ""
-            if keyword in title:
+            # 先剥离前导装饰符再匹配（★二、商务要求 → 二、商务要求）
+            stripped = _strip_heading_prefix(title)
+            if keyword in title or keyword in stripped:
                 # 评分：标题长度越短（关键词占比越高），得分越高
                 score = len(keyword) / max(len(title), 1) * 10
                 # 以关键词结尾加分

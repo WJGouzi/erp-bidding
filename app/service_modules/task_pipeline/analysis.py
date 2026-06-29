@@ -180,8 +180,8 @@ def _complete_analysis(task_id, execution_id=None):
             result.analysis_data = json.dumps(v3_data, ensure_ascii=False)
             # 回填旧版本兼容字段（供前端旧接口使用）
             meta = v3_data.get("metadata", {})
-            project_name = meta.get("project_name", "")
-            project_code = meta.get("project_code", "")
+            project_name = meta.get("project_name", {}).get("value", "") if isinstance(meta.get("project_name"), dict) else (meta.get("project_name") or "")
+            project_code = meta.get("project_code", {}).get("value", "") if isinstance(meta.get("project_code"), dict) else (meta.get("project_code") or "")
             pur_raw = meta.get("purchaser", "")
             if isinstance(pur_raw, dict):
                 purchaser_name = pur_raw.get("name", "")
@@ -208,7 +208,11 @@ def _complete_analysis(task_id, execution_id=None):
             
             result.overview = f"项目: {project_name} (编号: {project_code})"
             if budget_total:
-                result.overview += f" | 预算: {budget_total/10000:.0f}万元"
+                
+                if budget_total % 10000 == 0:
+                    result.overview += f" | 预算: {budget_total//10000}万元"
+                else:
+                    result.overview += f" | 预算: {budget_total/10000:.2f}万元"
             if pkg_count:
                 result.overview += f" | 共{pkg_count}包"
             if deadline:
@@ -234,21 +238,40 @@ def _complete_analysis(task_id, execution_id=None):
             biz_parts = []
             meta = v3_data.get("metadata", {})
             extra = meta.get("extra", {})
-            if extra.get("payment_terms"):
-                biz_parts.append(f"付款方式：{extra['payment_terms']}")
-            if extra.get("service_period"):
-                unit = "年" if isinstance(extra['service_period'], int) and extra['service_period'] < 10 else ""
-                biz_parts.append(f"服务期限：{extra['service_period']}{unit}")
-            if extra.get("delivery_location"):
-                biz_parts.append(f"交付地点：{extra['delivery_location']}")
-            if extra.get("acceptance_standard"):
-                biz_parts.append(f"验收标准：{extra['acceptance_standard']}")
-            if extra.get("pricing_rule"):
-                biz_parts.append(f"报价方式：{extra['pricing_rule']}")
-            if extra.get("special_declaration"):
-                biz_parts.append(f"特别说明：{extra['special_declaration']}")
-            if extra.get("agency_fee"):
-                biz_parts.append(f"代理服务费：{extra['agency_fee']}元")
+            # 全部 extra 字段到中文标签的映射（按展示顺序）
+            _EXTRA_LABELS = [
+                ("payment_terms", "付款方式"),
+                ("service_period", "服务期限"),
+                ("delivery_location", "交付地点"),
+                ("acceptance_standard", "验收标准"),
+                ("pricing_rule", "报价方式"),
+                ("after_sale_service", "售后服务"),
+                ("warranty_period", "质保期"),
+                ("packaging_transport", "包装运输"),
+                ("insurance", "保险要求"),
+                ("delivery_terms", "交付要求"),
+                ("special_declaration", "特别说明"),
+                ("agency_fee", "代理服务费"),
+                ("submission_location", "递交地点"),
+                ("winner_count", "成交数量"),
+                ("submission_copies", "份数要求"),
+                ("submission_docs", "递交资料"),
+            ]
+            for field_key, field_label in _EXTRA_LABELS:
+                val = extra.get(field_key)
+                if val:
+                    if field_key == "agency_fee":
+                        biz_parts.append(f"{field_label}：{val}元")
+                    elif field_key == "service_period" and isinstance(val, (int, float)) and val < 100:
+                        biz_parts.append(f"{field_label}：{val}天")
+                    else:
+                        biz_parts.append(f"{field_label}：{val}")
+            # 如果 section extractor 有扁平原文，也追加
+            if extra.get("business_terms_raw") and not biz_parts:
+                biz_parts.append(extra["business_terms_raw"])
+            # LLM 兜底：规则提取为空时使用 LLM 结果
+            if not biz_parts and extra.get("llm_business_raw"):
+                biz_parts.append(extra["llm_business_raw"])
             result.business_requirements = "\n".join(biz_parts) if biz_parts else "暂未提取到商务要求。"
 
             # 回填技术要求（从包参数 + ★条款提取）
@@ -268,6 +291,9 @@ def _complete_analysis(task_id, execution_id=None):
                     tech_parts.append(f"{pname}：技术参数 {'/'.join(counts)}")
                 if params.get("core_products"):
                     tech_parts.append(f"{pname}核心产品：{'、'.join(params['core_products'][:5])}")
+            # LLM 兜底：包参数提取为空时使用 LLM 结果
+            if not tech_parts and extra.get("llm_technical_raw"):
+                tech_parts.append(extra["llm_technical_raw"])
             result.technical_requirements = "\n".join(tech_parts) if tech_parts else "暂未提取到技术要求。"
             
             # 从表格分类结果补充技术/商务要求（政府采购一体化平台格式）
@@ -282,8 +308,26 @@ def _complete_analysis(task_id, execution_id=None):
                             params = item.get("技术参数与性能指标", "")
                             if name and params:
                                 tech_table_parts.append(f"  {name}: {params[:100]}")
+                    # 从 product_lists 补充产品规格（兼容★前缀的列名）
+                    for pl in tc.get("product_lists", []):
+                        items = pl.get("items", [])
+                        for item in items:
+                            # ★ 前缀兼容：同时搜带★和不带★的 key
+                            name = item.get("采购产品名称", "") or item.get("产品名称", "")
+                            spec = (item.get("★规格参数", "") or item.get("技术参数与性能指标", "") 
+                                    or item.get("规格参数", "") or item.get("规格", ""))
+                            if name:
+                                if spec:
+                                    tech_table_parts.append(f"  {name}: {spec[:150]}")
+                                else:
+                                    unit = item.get("★计量单位", "") or item.get("计量单位", "")
+                                    max_price = item.get("★单价最高限价", "") or item.get("单价最高限价", "")
+                                    if unit or max_price:
+                                        tech_table_parts.append(f"  {name} (单位: {unit}, 限价: {max_price})")
+                                    else:
+                                        tech_table_parts.append(f"  {name}")
                     if tech_table_parts:
-                        result.technical_requirements = "技术参数要求:\n" + "\n".join(tech_table_parts[:20])
+                        result.technical_requirements = "技术参数要求:\n" + "\n".join(tech_table_parts[:30])
                 
                 # 商务要求表（含交货时间、交货地点、付款方式等）
                 biz_table_parts = []
@@ -343,6 +387,17 @@ def _complete_analysis(task_id, execution_id=None):
             if v3_result.get("effective_text"):
                 result.effective_text = v3_result["effective_text"]
             
+            # 存储格式要求到 analysis_data
+            if v3_result.get("format_requirements"):
+                try:
+                    import json as _json
+                    ad = _json.loads(result.analysis_data) if isinstance(result.analysis_data, str) else (result.analysis_data or {})
+                    if isinstance(ad, dict):
+                        ad["format_requirements"] = v3_result["format_requirements"]
+                        result.analysis_data = _json.dumps(ad, ensure_ascii=False)
+                except Exception as exc:
+                    logger.warning("[analysis] 格式要求存储异常: %s", exc)
+            
             logger.info("[analysis] v3 分析完成 task=%s", task_id)
         else:
             logger.error("[analysis] v3 分析返回空结果 task=%s", task_id)
@@ -359,6 +414,9 @@ def _complete_analysis(task_id, execution_id=None):
         pass
     merged_payload = merged_payload if isinstance(merged_payload, dict) else {}
     has_package = merged_payload.get("has_package", False)
+    # 单包（唯一包）视为无分包，自动选中包1，跳过包选择步骤
+    if has_package and merged_payload.get("package_count", 0) <= 1:
+        has_package = False
     # 确定 has_package 后，无分包时写入有效文本（用于后续核对项提取）
     if not has_package and source_texts.get("effective_text"):
         result.effective_text = source_texts["effective_text"]
@@ -398,7 +456,15 @@ def start_analyze(task_id):
     task = BiddingTask.query.filter_by(id=task_id, deleted_flag=False).first()
     if not task:
         raise LookupError("标书任务不存在")
-    if task.status not in {"UPLOADED", "FAILED"} or task.current_step != "analyze":
+    # 允许重新分析的情况：未上传、失败、或已完成分析但后续步骤未开始
+    allowed_statuses = {"UPLOADED", "FAILED", "ANALYZED", "CHECKED"}
+    if task.status == "ANALYZED":
+        # 重新分析：清理旧数据
+        _clean_analysis_data(task.shared_resource_id)
+    elif task.status == "CHECKED":
+        # 已确认核对项但未生成目录：清理后重新分析
+        _clean_analysis_data(task.shared_resource_id)
+    elif task.status not in {"UPLOADED", "FAILED"}:
         raise ValueError("当前任务状态不允许启动分析")
 
     task.status = "ANALYZING"
@@ -435,6 +501,28 @@ def start_analyze(task_id):
     )
     db.session.commit()
     return _complete_analysis(task.id)
+
+
+
+def _clean_analysis_data(shared_resource_id):
+    """清理共享资源的旧分析数据，允许重新分析。"""
+    from app.domain.models import BiddingAnalysisResult, BiddingCheckItem, BiddingCatalog, BiddingSharedResource
+    if not shared_resource_id:
+        return
+    
+    # 删除旧的分析结果
+    BiddingAnalysisResult.query.filter_by(shared_resource_id=shared_resource_id).delete()
+    # 删除旧的核对项
+    BiddingCheckItem.query.filter_by(shared_resource_id=shared_resource_id).delete()
+    # 删除旧的目录
+    BiddingCatalog.query.filter_by(shared_resource_id=shared_resource_id).delete()
+    # 重置共享资源状态
+    BiddingSharedResource.query.filter_by(id=shared_resource_id).update({
+        "analysis_status": False,
+        "has_package": False,
+        "selected_package_no": None,
+    })
+    logger.info("[analysis] 清理旧分析数据完成 shared_resource=%s", shared_resource_id)
 
 
 def get_analysis_result(task_id):
@@ -613,7 +701,14 @@ def save_review(task_id, data):
     section_fields = ["bidding_info", "business", "technical", "qualification", "scoring", "packages"]
     for field in section_fields:
         if field in data and data[field] is not None:
+            # 修复：scoring 覆盖时保留原 dimensions（check-items 格式无 dimensions 字段）
+            if field == "scoring":
+                original_dims = analysis.get("scoring", {}).get("dimensions", []) if isinstance(analysis.get("scoring"), dict) else []
             analysis[field] = data[field]
+            # 覆盖后恢复 dimensions
+            if field == "scoring" and original_dims and not data[field].get("dimensions"):
+                if isinstance(analysis[field], dict):
+                    analysis[field]["dimensions"] = original_dims
 
     result.analysis_data = json.dumps(analysis, ensure_ascii=False)
 

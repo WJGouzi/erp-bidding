@@ -194,9 +194,10 @@ def _rule_extract(text):
         text: 纯文本（文档前 N 字符）
 
     Returns:
-        dict: {field_key: value}
+        dict: {field_key: value, "_confidence": {field_key: {"confidence": float, "source": str}}}
     """
     result = {}
+    confidence_info = {}  # field_key -> {"confidence": float, "source": str}
     seen_fields = {}  # field_key -> priority
 
     for field_key, pattern, priority, processor in RULES:
@@ -220,12 +221,19 @@ def _rule_extract(text):
             if value is not None and (isinstance(value, str) and len(value) >= 2 or not isinstance(value, str)):
                 result[field_key] = value
                 seen_fields[field_key] = priority
+                # 记录置信度
+                base_conf = {1: 0.90, 2: 0.85, 3: 0.75, 4: 0.70}.get(priority, 0.7)
+                confidence_info[field_key] = {
+                    "confidence": base_conf,
+                    "source": f"regex:rule_{field_key}_p{priority}",
+                }
 
+    result["_confidence"] = confidence_info
     return result
 
 
 def _build_metadata(rule_result):
-    """将规则提取结果组装为 metadata dict。
+    """将规则提取结果组装为 metadata dict。（含 _confidence 键）
 
     Args:
         rule_result: dict from _rule_extract()
@@ -233,9 +241,10 @@ def _build_metadata(rule_result):
     Returns:
         metadata dict（标准结构）
     """
+    confidence_info = rule_result.pop("_confidence", {})
     metadata = {
-        "project_name": "",
-        "project_code": "",
+        "project_name": {"value": ""},
+        "project_code": {"value": ""},
         "purchaser": {"name": "", "alias": "", "contact": ""},
         "agent": {"name": "", "contact": ""},
         "budget": {"total": 0, "note": "", "packages": {}},
@@ -285,10 +294,23 @@ def _build_metadata(rule_result):
                     break
             if isinstance(target, dict):
                 target[field] = value
+                # 传播置信度信息
+                if key in confidence_info:
+                    ci = confidence_info[key]
+                    if isinstance(target, dict):
+                        target["_confidence"] = ci["confidence"]
+                        target["_source"] = ci["source"]
+                    elif isinstance(target.get(field), dict):
+                        target[field]["_confidence"] = ci["confidence"]
+                        target[field]["_source"] = ci["source"]
 
     # 处理 bundle 字段
     if "package_budget" in rule_result:
         metadata["budget"]["packages"] = rule_result.get("package_budget", {})
+
+    # 文档类型分类结果（优先级高于默认值）
+    if "_document_type" in rule_result:
+        metadata["document_type"] = rule_result["_document_type"]
 
     return metadata
 

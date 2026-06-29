@@ -103,15 +103,15 @@ def assemble_bidding_info(result, analysis: dict) -> dict:
     pkg_info = _get_current_package_info(result)
 
     return {
-        "project_name": meta.get("project_name", ""),
-        "project_code": meta.get("project_code", ""),
+        "project_name": meta.get("project_name", {}).get("value", "") if isinstance(meta.get("project_name"), dict) else (meta.get("project_name") or ""),
+        "project_code": meta.get("project_code", {}).get("value", "") if isinstance(meta.get("project_code"), dict) else (meta.get("project_code") or ""),
         "package_no": pkg_info["package_no"],
         "package_name": pkg_info["package_name"],
         "budget": _extract_budget(meta),
         "purchaser": _extract_name(meta.get("purchaser", "")),
         "agency": _extract_name(meta.get("agent", "")),
         "domain": meta.get("domain", ""),
-        "summary": (result.overview or ""),
+        "summary": getattr(result, "computed_overview", None) or result.overview or "",
         "sme_only": meta.get("sme_only", False),
         "dark_bid": meta.get("dark_bid", False),
         "bid_deadline": meta.get("bid_deadline", ""),

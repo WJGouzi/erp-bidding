@@ -18,17 +18,17 @@ class TestMetadataRuleExtract(unittest.TestCase):
     def test_extract_project_code(self):
         text = "项目编号：ZY20260016ZC-ZJ-A"
         meta = extract_metadata(text)
-        self.assertEqual(meta.get("project_code"), "ZY20260016ZC-ZJ-A")
+        self.assertEqual(meta["project_code"]["value"], "ZY20260016ZC-ZJ-A")
 
     def test_extract_project_code_colon(self):
         text = "项目编号:ZY20260016ZC-ZJ-A"
         meta = extract_metadata(text)
-        self.assertEqual(meta.get("project_code"), "ZY20260016ZC-ZJ-A")
+        self.assertEqual(meta["project_code"]["value"], "ZY20260016ZC-ZJ-A")
 
     def test_extract_project_name(self):
         text = "项目名称：2026年试剂耗材采购项目"
         meta = extract_metadata(text)
-        self.assertIn("试剂", meta.get("project_name", ""))
+        self.assertIn("试剂", meta["project_name"]["value"])
 
     def test_extract_budget(self):
         text = "采购预算：1015万元，其中：第一包：274万元"
@@ -82,19 +82,19 @@ class TestMetadataRuleExtract(unittest.TestCase):
 
     def test_empty_text(self):
         meta = extract_metadata("")
-        self.assertEqual(meta["project_code"], "")
+        self.assertEqual(meta["project_code"]["value"], "")
         self.assertEqual(meta["budget"]["total"], 0)
         self.assertEqual(meta["package_count"], 0)
 
     def test_no_match(self):
         meta = extract_metadata("这是一段没有任何元数据的文本")
-        self.assertEqual(meta["project_code"], "")
+        self.assertEqual(meta["project_code"]["value"], "")
 
     def test_multi_rule_same_field(self):
         """同一字段有多条规则，取第一条匹配的。"""
         text = "项目编号：ABC12345678\n项目编号:XYZ98765432"
         meta = extract_metadata(text)
-        self.assertIn(meta["project_code"], ["ABC12345678", "XYZ98765432"])
+        self.assertIn(meta["project_code"]["value"], ["ABC12345678", "XYZ98765432"])
 
     def test_full_extraction(self):
         """完整的元数据提取"""
@@ -109,7 +109,7 @@ class TestMetadataRuleExtract(unittest.TestCase):
             本项目共计9个包
         """
         meta = extract_metadata(text)
-        self.assertEqual(meta["project_code"], "ZY20260016ZC-ZJ-A")
+        self.assertEqual(meta["project_code"]["value"], "ZY20260016ZC-ZJ-A")
         self.assertIn("试剂", meta["project_name"])
         self.assertIn("成都海关", meta["purchaser"]["name"])
         self.assertEqual(meta["budget"]["total"], 10150000.0)
@@ -121,8 +121,8 @@ class TestMetadataRuleExtract(unittest.TestCase):
         """验证不依赖 LLM，纯规则可用。"""
         text = "项目编号：TEST20260001\n项目名称：测试项目"
         meta = extract_metadata(text)
-        self.assertEqual(meta["project_code"], "TEST20260001")
-        self.assertEqual(meta["project_name"], "测试项目")
+        self.assertEqual(meta["project_code"]["value"], "TEST20260001")
+        self.assertEqual(meta["project_name"]["value"], "测试项目")
 
 
 if __name__ == "__main__":

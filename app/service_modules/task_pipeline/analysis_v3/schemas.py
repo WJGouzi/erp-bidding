@@ -72,8 +72,8 @@ def safe_json_loads(text: str, default=None, logger=logger) -> dict:
 
 # Phase 1 schema
 NULL_METADATA = {
-    "project_name": "",
-    "project_code": "",
+    "project_name": {"value": ""},
+    "project_code": {"value": ""},
     "purchaser": {"name": "", "alias": "", "contact": ""},
     "agent": {"name": "", "contact": ""},
     "budget": {"total": 0, "packages": {}},

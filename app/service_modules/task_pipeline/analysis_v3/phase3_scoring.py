@@ -14,6 +14,16 @@ import json
 import logging
 import re
 
+
+# ── 通用标题前置符剥离 ──
+_HEADING_PREFIX_RE = re.compile(r'^[^\w\u4e00-\u9fff\d]+')
+
+
+def _strip_heading_prefix(text: str) -> str:
+    """剥离标题前导装饰字符，保留标题实质内容。"""
+    if not text:
+        return text
+    return _HEADING_PREFIX_RE.sub('', text)
 logger = logging.getLogger(__name__)
 
 
@@ -61,14 +71,15 @@ def _find_scoring_section(sections):
         """计算一个章节树的评分相关分值。"""
         score = 0
         title = getattr(node, "title", "") or ""
+        stripped = _strip_heading_prefix(title)
         
-        # 标题匹配加分
+        # 标题匹配加分（剥离前缀后匹配）
         for t in targets:
-            if t in title:
+            if t in title or t in stripped:
                 score += 10
         # 标题含目录关键词减分
         for t in toc_keywords:
-            if t in title:
+            if t in title or t in stripped:
                 score -= 5
         
         # 内容匹配加分
@@ -211,18 +222,20 @@ def _find_tech_section(sections):
     Phase 1: 标题匹配（现有逻辑）
     Phase 2: 内容表格探测（新增 fallback）
     """
-    targets = ["技术要求", "技术参数", "技术规格", "技术标准", "采购需求", "需求一览表", "采购项目技术"]
+    targets = ["技术要求", "技术参数", "技术规格", "技术标准", "采购需求", "需求一览表", "采购项目技术", "比选项目及要求", "项目及要求", "采购项目"]
     
-    # Phase 1: 标题匹配
+    # Phase 1: 标题匹配（剥离前缀后匹配 ★◆● 等标记）
     for section in sections:
         title = getattr(section, "title", "") or ""
+        stripped = _strip_heading_prefix(title)
         for t in targets:
-            if t in title:
+            if t in title or t in stripped:
                 return section
         for child in getattr(section, "children", []):
             child_title = getattr(child, "title", "") or ""
+            child_stripped = _strip_heading_prefix(child_title)
             for t in targets:
-                if t in child_title:
+                if t in child_title or t in child_stripped:
                     return child
     
     # Phase 2: 内容表格探测（标题未匹配时检测表格内容）
@@ -250,7 +263,8 @@ def _find_package_sections(source_sections, package_nos):
 
     def _find_by_title(node, title_keyword):
         title = getattr(node, "title", "") or ""
-        if title_keyword in title:
+        # 剥离前缀后匹配（★第1包 → 第1包）
+        if title_keyword in title or title_keyword in _strip_heading_prefix(title):
             return node
         for child in getattr(node, "children", []):
             result = _find_by_title(child, title_keyword)
@@ -697,8 +711,10 @@ def extract_packages(sections, package_nos, metadata_budget=None, pkg_name_map=N
     pkg_section_map = _find_package_sections(source_sections, package_nos)
 
     budget_per_pkg = {}
+    budget_total = 0
     if metadata_budget and isinstance(metadata_budget, dict):
         budget_per_pkg = metadata_budget.get("packages", {})
+        budget_total = metadata_budget.get("total", 0) or 0
 
     packages = []
     for pkg_no in package_nos:
@@ -711,7 +727,7 @@ def extract_packages(sections, package_nos, metadata_budget=None, pkg_name_map=N
                 pkg_entry = {
                     "package_no": pkg_no,
                     "name": pkg_fallback,
-                    "budget": budget_per_pkg.get(str(pkg_no), 0),
+                    "budget": budget_per_pkg.get(str(pkg_no), budget_total) if budget_per_pkg else budget_total,
                     "parameters": None,
                 }
                 pkg_entry["strategy"] = analyze_package_strategy(pkg_entry)
@@ -722,7 +738,20 @@ def extract_packages(sections, package_nos, metadata_budget=None, pkg_name_map=N
             logger.info("[phase3] 单包场景，使用 source_section 作为包 %s 的章节: %s",
                         pkg_no, getattr(section, 'title', '') or '全文')
 
-        pkg_name = getattr(section, "title", "") or (pkg_name_map or {}).get(pkg_no, "") or f"第{pkg_no}包"
+        # 包名优先级：pkg_name_map（从原文提取）> 章节标题 > 兜底名
+        # 包名优先级：pkg_name_map（从原文提取） > 仅用于单包且有意义的章节标题 > 兜底名
+        pkg_name = (pkg_name_map or {}).get(pkg_no, "") or f"第{pkg_no}包"
+        # 单包场景：明确提取到有意义的章节标题才作为包名
+        if not (pkg_name_map or {}).get(pkg_no):
+            section_title = getattr(section, "title", "") or ""
+            # 4个条件同时满足才使用章节标题：单包、标题短、不含"第X章"、不含"第X部分"
+            if (len(package_nos) == 1 and 
+                section_title and len(section_title) < 20 and
+                not re.match(r'^第[一二三四五六七八九十零〇百千万亿]+', section_title) and
+                not re.match(r'^第\d+[章节部篇]', section_title)):
+                pkg_name = section_title
+            else:
+                pkg_name = ""
         pkg_text = _section_to_text(section)
         starred, important, general = _count_pkg_params(pkg_text)
         core_products = _detect_core_products(pkg_text)
@@ -736,7 +765,7 @@ def extract_packages(sections, package_nos, metadata_budget=None, pkg_name_map=N
         pkg_entry = {
             "package_no": pkg_no,
             "name": pkg_name,
-            "budget": budget_per_pkg.get(str(pkg_no), 0),
+            "budget": budget_per_pkg.get(str(pkg_no), budget_total) if budget_per_pkg else budget_total,
             "parameters": params,
         }
         # 融合表格分类结果中的产品清单数据

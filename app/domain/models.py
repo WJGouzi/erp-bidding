@@ -265,6 +265,39 @@ class BiddingAnalysisResult(db.Model):
         except (json.JSONDecodeError, TypeError, ValueError):
             return {}
 
+    # ── 以下为实时计算的属性视图，替代手写 legacy 字段 ──
+
+    @property
+    def computed_overview(self) -> str:
+        """从 analysis_data 实时计算 overview。"""
+        try:
+            from .analysis_schema import MetadataSchema, build_overview
+            data = self.safe_analysis_data()
+            meta_dict = data.get("metadata", {})
+            # 兼容：metadata 可能是旧格式字符串
+            if isinstance(meta_dict, str):
+                import json as _json
+                meta_dict = _json.loads(meta_dict) if meta_dict else {}
+            meta = MetadataSchema.from_dict(meta_dict)
+            return build_overview(meta)
+        except Exception:
+            return self.overview or ""
+
+    @property
+    def computed_business_requirements(self) -> str:
+        """从 analysis_data 实时计算商务要求。"""
+        try:
+            from .analysis_schema import MetadataSchema, build_business_requirements
+            data = self.safe_analysis_data()
+            meta_dict = data.get("metadata", {})
+            if isinstance(meta_dict, str):
+                import json as _json
+                meta_dict = _json.loads(meta_dict) if meta_dict else {}
+            meta = MetadataSchema.from_dict(meta_dict)
+            return build_business_requirements(meta)
+        except Exception:
+            return self.business_requirements or "暂未提取到商务要求。"
+
     def to_dict(self):
         """将分析结果转换为接口返回结构。
         
