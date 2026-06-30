@@ -612,6 +612,16 @@ def _build_qualification_section(classified_items, analysis_context, filtered_an
                     if lookup_key in qual_lookup:
                         label = qual_lookup[lookup_key]
                     break
+        # 再次兜底：若 label 仍为短占位符，尝试用 value/check_key 中的关键词匹配 qual_lookup
+        if not label or len(label) < 4:
+            for q_req in qual_lookup.values():
+                # 尝试用 check_value 的前20个字匹配
+                if value and len(value) >= 4 and value[:20] in q_req:
+                    label = q_req
+                    break
+            # 再尝试用 check_key 中的英文词匹配
+            if (not label or len(label) < 4) and qual_lookup:
+                label = list(qual_lookup.values())[0]
         
         # 如果 value 为空，用 label 代替
         if not value:

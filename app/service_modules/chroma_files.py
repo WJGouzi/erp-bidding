@@ -103,6 +103,42 @@ def _save_doc_chunks(file_id: int, chunks: list[dict], chroma_ids: list[str]):
     db.session.flush()
 
 
+def _ensure_chroma_collection(tenant: str, database: str, collection: str):
+    """确保 ChromaDB 集合存在，不存在则创建。"""
+    from flask import current_app
+    try:
+        client = ChromaDBClient(
+            host=current_app.config.get("CHROMA_HOST", "116.63.183.113"),
+            port=current_app.config.get("CHROMA_PORT", 18080),
+            default_tenant=tenant,
+            default_database=database,
+            max_retries=1,
+            auto_provision=True,
+        )
+        info = client.create_collection(collection, tenant, database, get_or_create=True)
+        cid = info.get("id") if isinstance(info, dict) else None
+        if cid:
+            logger.info("[chroma] 集合已就绪: collection=%s, id=%s", collection, cid)
+        else:
+            logger.info("[chroma] 集合已就绪: collection=%s", collection)
+    except Exception as exc:
+        logger.warning("[chroma] 集合预检异常（后续 upsert 会重试）: collection=%s, %s", collection, exc)
+
+
+def _is_binary_text(text: str) -> bool:
+    """检测文本是否为二进制乱码（含 null 字节或大量控制字符）。"""
+    if not text:
+        return True
+    # 含 null 字节 → 二进制数据
+    if chr(0) in text:
+        return True
+    # 控制字符占比过高（换行/制表符除外）
+    control_chars = sum(1 for c in text if ord(c) < 32 and c not in (chr(10) + chr(13) + chr(9)))
+    if len(text) > 0 and control_chars / len(text) > 0.3:
+        return True
+    return False
+
+
 def ingest_file_to_chroma(
     file_record: FileStorage,
     filename: str,
@@ -135,6 +171,9 @@ def ingest_file_to_chroma(
     tenant = chroma_tenant or current_app.config.get("CHROMA_TENANT", "erp")
     database = chroma_database or current_app.config.get("CHROMA_DATABASE", "bidding")
     collection = chroma_collection or current_app.config.get("CHROMA_COLLECTION", "tender")
+
+    # 显式检测并创建 ChromaDB 集合（确保集合存在，避免后续 upsert 因集合不存在而失败）
+    _ensure_chroma_collection(tenant, database, collection)
 
     # 计算 SHA256
     file_sha256 = _compute_sha256(payload)
@@ -189,16 +228,24 @@ def ingest_file_to_chroma(
         logger.warning("[chroma] Embedding 客户端未配置，跳过: file=%s", filename)
         return None
 
-    texts = [chunk["text"] for chunk in chunks]
+    # 过滤空白/过短/二进制乱码片段（Embedding API 要求输入长度 [1, 33000]）
+    raw_texts = [(chunk.get("text") or "").strip() for chunk in chunks]
+    filtered = [(i, t) for i, t in enumerate(raw_texts) if len(t) >= 5 and not _is_binary_text(t)]
+    if not filtered:
+        logger.warning("[chroma] 无有效文本切片，跳过入库: file=%s", filename)
+        return None
+    non_empty_indices = [i for i, t in filtered]
+    texts = [t for i, t in filtered]
     try:
         embeddings = embed_client.embed_texts(texts)
         logger.info("[chroma] Embedding 完成: file=%s, vectors=%s", filename, len(embeddings))
     except Exception as exc:
-        logger.error("[chroma] Embedding 失败: %s", exc)
+        logger.warning("[chroma] Embedding 失败，跳过入库: file=%s, texts=%s, error=%s", filename, [t[:50] for t in texts[:5]], exc)
         return None
 
-    # 生成 ChromaDB IDs
-    chroma_ids = [f"{chunk_id_prefix}_{file_record.id}_{i}" for i in range(len(chunks))]
+    # 生成 ChromaDB IDs（只保留有效切片对应的 ID）
+    chroma_ids = [f"{chunk_id_prefix}_{file_record.id}_{i}" for i in non_empty_indices]
+    metadatas = [metadatas[i] for i in non_empty_indices]
 
     # 写入 ChromaDB
     try:
@@ -217,10 +264,10 @@ def ingest_file_to_chroma(
         logger.error("[chroma] ChromaDB 写入失败: %s", exc)
         return None
 
-    # 写入 MySQL doc_chunks
+    # 写入 MySQL doc_chunks（只保留有效切片）
     if file_record.id:
         try:
-            _save_doc_chunks(file_record.id, chunks, chroma_ids)
+            _save_doc_chunks(file_record.id, [chunks[i] for i in non_empty_indices], chroma_ids)
             # 更新缓存中的切片数
             cached = DocParseCache.query.filter_by(file_id=file_record.id).first()
             if cached:

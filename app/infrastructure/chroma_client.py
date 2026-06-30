@@ -269,7 +269,11 @@ class ChromaDBClient:
     ) -> dict:
         """向量相似度检索。"""
         tenant, database, collection = self._norm_ctx(tenant, database, collection)
-        cid = self._collection_id(collection, tenant, database)
+        # 使用 get_or_create 确保集合存在（避免集合不存在时的 500 错误）
+        col_info = self.create_collection(collection, tenant, database, get_or_create=True)
+        cid = col_info.get("id") if isinstance(col_info, dict) else None
+        if not cid:
+            cid = self._collection_id(collection, tenant, database)
         payload: dict[str, Any] = {
             "query_embeddings": query_embeddings,
             "n_results": n_results,

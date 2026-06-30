@@ -193,7 +193,7 @@ class MultiRecallEngine:
                     file_name=meta.get("file_name", "") if isinstance(meta, dict) else "",
                     section_path=meta.get("section_path", "") if isinstance(meta, dict) else "",
                     content_type=meta.get("content_type", "paragraph") if isinstance(meta, dict) else "paragraph",
-                    chroma_id=result.get("ids", [None])[j] if isinstance(result.get("ids"), list) else "",
+                    chroma_id=result.get("ids", [[]])[i][j] if isinstance(result.get("ids"), list) and i < len(result["ids"]) and isinstance(result["ids"][i], list) and j < len(result["ids"][i]) else "",
                     metadata=meta if isinstance(meta, dict) else {},
                 ))
         return items
@@ -211,7 +211,8 @@ class MultiRecallEngine:
         if not bool_terms:
             return []
 
-        sql = """
+        from sqlalchemy import text as _sa_text
+        sql_str = """
             SELECT id, file_id, content, section_path, content_type, chroma_id,
                    MATCH(content) AGAINST(:terms IN BOOLEAN MODE) AS score
             FROM doc_chunks
@@ -220,14 +221,14 @@ class MultiRecallEngine:
         params = {"terms": bool_terms}
 
         if file_id is not None:
-            sql += " AND file_id = :file_id"
+            sql_str += " AND file_id = :file_id"
             params["file_id"] = file_id
 
-        sql += " ORDER BY score DESC LIMIT :limit"
+        sql_str += " ORDER BY score DESC LIMIT :limit"
         params["limit"] = top_k
 
         try:
-            rows = db.session.execute(sql, params).fetchall()
+            rows = db.session.execute(_sa_text(sql_str), params).fetchall()
         except Exception as exc:
             logger.warning("[recall] MySQL FULLTEXT 查询失败: %s", exc)
             return []

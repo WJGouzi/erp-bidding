@@ -328,8 +328,12 @@ def start_generate(task_id):
     task = BiddingTask.query.filter_by(id=task_id, deleted_flag=False).first()
     if not task:
         raise LookupError("标书任务不存在")
-    if task.status != "CATALOG_CONFIRMED":
+    if task.status not in {"CATALOG_CONFIRMED", "GENERATED", "FAILED", "CANCELLED"}:
         raise ValueError("当前任务状态不允许启动生成")
+    if task.status != "CATALOG_CONFIRMED":
+        logger.info("[task] 重新执行生成，重置任务状态: task=%s, previous_status=%s", task_id, task.status)
+        task.result_file_id = None
+        task.error_message = None
     _validate_generate_prerequisites(task)
     catalog_record = _get_confirmed_catalog_record(task)
 
