@@ -1,68 +1,70 @@
-# 标书内容质量管理 — 设计
+# 标书内容质量管理 — 架构设计
 
-> 本文档描述了从"一把梭给 LLM"到"四路分流"的架构升级方案。
-> 基于 10 份真实招标文件的模式分析。
-
----
-
-## 真实招标文件模式分析
-
-分析 10 份招标文件（含政府采购、比选、海关采购等），第三章"比选申请文件格式"呈现规律：
-
-| 模板类别 | 出现频率 | 示例 | 处理方式 |
-|---------|---------|------|---------|
-| 文本填空 | 100% | 承诺函、授权书、声明函 | 填空引擎 |
-| 表格填写 | 90% | 报价一览表、偏离表、业绩表 | 表格引擎 |
-| 资格证明清单 | 100% | 第四章 | 资料插入 |
-| 自由方案 | 100% | 技术方案、实施计划 | LLM 写作 |
-
-占位符模式多样性：
-```
-XXX（比选申请人名称）              ← 标准
-XXX（法定代表人姓名、职务）         ← 复合字段
-XXX（比选编号：XXX）               ← 嵌套
-XXX                   （...）      ← 不规则空格
-____元（大写：________________）   ← 下划线
-比选日期：  年   月   日             ← 隐式空白
-```
+> 更新日期: 2026-07-02 | 基于原则讨论重构
 
 ---
 
-## 改造后：四路分流架构
+## 核心原则
+
+| 原则 | 描述 |
+|------|------|
+| **主体优先** | 主体信息表已有数据直接使用，不做置信度校验 |
+| **三级递进** | 主体→知识库→留白一页，逐级查找 |
+| **表格原样** | 招标文件的表格完整复制到生成文档，再填充 |
+| **纯LLM识别** | 占位符识别只用LLM，不用正则兜底 |
+| **固定格式不降级** | 承诺函等固定模板填不了就留空，不走LLM改写 |
+| **全量表格内容** | 报价一览表完整复制，产品信息匹配填充 |
+
+---
+
+## 架构总览
 
 ```
-                        ┌──────────────────────────────┐
-                        │        章节分类器              │
-                        │  _classify_chapter_type()      │
-                        │                                │
-                        │  TEMPLATE_TEXT  ← 承诺函/声明函等│
-                        │  TEMPLATE_TABLE ← 报价表/应答表等│
-                        │  QUALIFICATION ← 资格证明文件   │
-                        │  FREE_WRITE    ← 技术方案/描述  │
-                        └──────────┬───────────────────┘
-                                   │
-          ┌────────────────────────┼────────────────────┐
-          ▼                        ▼                     ▼
-┌──────────────────┐   ┌──────────────────┐   ┌──────────────────┐
-│   填空引擎        │   │   表格填充引擎    │   │   资格证明插入    │
-│                  │   │                  │   │                  │
-│ LLM识别占位符     │   │ 检测表头列结构    │   │ 提取要求清单      │
-│ → 确定性替换      │   │ → docx `<w:tbl>` │   │ → 匹配主体资料    │
-│ → diff 校验      │   │ → 数据填充       │   │ → 插扫描件/图片   │
-│ → 保留原文       │   │                  │   │ → 标记缺失       │
-└──────────────────┘   └──────────────────┘   └──────────────────┘
-                                                            │
-                                                            ▼
-                                                  ┌──────────────────┐
-                                                  │   LLM 写作引擎   │
-                                                  │  （保留现有逻辑） │
-                                                  │  知识库+置信度门控│
-                                                  └──────────────────┘
+招标文件 (.docx)
+      │
+      ▼
+┌─────────────────────────────────────────────────────────────┐
+│                      分析阶段                                │
+│  analysis_v3 pipeline                                       │
+│  → analysis_data (JSON)                                     │
+│     ├─ metadata (项目信息)                                   │
+│     ├─ eligibility (资格要求)                                │
+│     ├─ table_classification (表格分类 + 产品清单)             │
+│     ├─ scoring (评分)                                        │
+│     └─ packages (分包)                                       │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│                      生成阶段                                │
+│                                                              │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │                章节分类器                            │    │
+│  │  _classify_chapter_type()                           │    │
+│  │  ① TEMPLATE_TEXT → 填空 (承诺函/声明函)              │    │
+│  │  ② TEMPLATE_TABLE → 表格复制+填充 (报价一览表)       │    │
+│  │  ③ QUALIFICATION → 三级递进 (主体→知识库→留白)      │    │
+│  │  ④ FREE_WRITE → LLM 写作 (技术方案/描述)             │    │
+│  └─────────────────────────────────────────────────────┘    │
+│                                                              │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│                    DOCX 组装                                 │
+│  _build_docx_bytes()                                        │
+│  → 封面 (bidder_notice 数据)                                │
+│  → 目录                                                    │
+│  → 正文 (分章节)                                            │
+│  → 表格 (原样复制)                                          │
+│  → 分页 (留白章节)                                          │
+│  → 字体 (仿宋小四/宋体二号/宋体四号)                        │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 路径 A：填空引擎（LLM 识别 + 确定性替换）
+## 路径A：填空引擎 (TEMPLATE_TEXT)
 
 ### 流程
 
@@ -72,194 +74,203 @@ ____元（大写：________________）   ← 下划线
 
          │
          ▼
-Step 1: LLM 识别占位符
-         Prompt: "找出下面文本中所有需要填写的空白位置，
-                  返回JSON数组，每个元素包含raw_text和field_hint"
-         → [{"raw": "XXX（比选申请人名称）", "hint": "公司名称"},
-            {"raw": "XXX（项目名称）", "hint": "项目名称"}]
+Step 1: LLM 识别占位符 (纯LLM，无正则兜底)
+         Prompt: 泛化识别所有占位符格式
+         → [{"raw": "XXX（比选申请人名称）", "start": 3, "end": 16, "hint": "公司名称"},
+            {"raw": "XXX（项目名称）", "start": 19, "end": 28, "hint": "项目名称"}]
          │
          ▼
-Step 2: 字段映射
-         hint: "公司名称" → SubjectCompany.company_name = "成都智能科技有限公司"
-         hint: "项目名称" → analysis_result.project_name = "2024年智能采购系统建设项目"
+Step 2: 字段映射 (field_map → _TEMPLATE_FIELD_MAP)
+         "公司名称" → subject.company_name
+         "项目名称" → bidder_notice.project_name
          │
          ▼
-Step 3: 确定性替换（从右向左，避免偏移）
+Step 3: 确定性替换 (从右向左)
          "本单位成都智能科技有限公司参加2024年智能采购系统建设项目的比选活动"
          │
          ▼
-Step 4: 原文锁定校验
-         只变了"XXX（比选申请人名称）"→"成都智能科技有限公司"
-         和"XXX（项目名称）"→"2024年智能采购系统建设项目"
-         其他字符逐位对比一致 → ✅
+Step 4: 原文锁定校验 (仅占位符被替换，原文不变)
+         ✅ → 返回填充文本
+         ❌ → 日志告警 + 返回填充后的文本 (保留未填充占位符)
+             不降级到 LLM 生成 (防止改写固定格式)
 ```
 
-### LLM 识别 prompt 设计
+### 关键规则
+
+- **不可降级**：承诺函/声明函等固定格式，填不了就保留 `______`
+- **字段映射表**：hint 关键词 → 数据源 → 取值方法
+- **数据源优先级**：主体表直接读取 > 分析结果 > 计算值（如日期）
+
+---
+
+## 路径B：表格引擎 (TEMPLATE_TABLE)
+
+### 流程
 
 ```
-你是一个占位符识别助手。你的任务是从招标文件模板中找出所有需要填写的空白位置。
+Step 1: 从分析阶段提取原始表格结构
+         读取: analysis_data.table_classification.product_lists[].items[]
+         字段名统一通过 PRODUCT_COLUMN_MAP 映射
+         
+Step 2: 在 docx 中重建表格
+         - 表头行: 保持原标题和列数
+         - 数据行: 完整复制招标文件的每一行
+         
+Step 3: 从产品库匹配填充
+         对每个 product.name 检索产品库:
+         - Chroma product_library 集合
+         - LLM embedding 匹配
+         - 取 score 最高的匹配结果
+         
+Step 4: 填充匹配到的字段到对应列空白
+         匹配不到 → 保持空白
+```
+
+### 统一字段映射表
+
+```python
+PRODUCT_COLUMN_MAP = {
+    "name": ["品名", "名称", "产品名称", "试剂名称", "货物名称",
+             "商品名", "采购产品名称", "标的名称", "产品名"],
+    "spec": ["规格", "规格型号", "型号", "技术规格", "参数",
+             "★规格参数", "技术参数与性能指标", "规格参数"],
+    "brand": ["品牌", "生产厂家", "厂家", "制造商"],
+    "qty": ["数量", "需求量", "预估数量", "采购量", "★数量"],
+    "unit": ["单位", "计量单位", "★计量单位"],
+    "unit_price": ["单价", "预算单价", "最高限价", "★单价最高限价",
+                   "单价最高限价"],
+    "total_price": ["总价", "金额", "合计"],
+    "产地": ["产地", "来源"],
+    "备注": ["备注", "说明"],
+}
+```
+
+---
+
+## 路径C：资格证明文件插入引擎 (QUALIFICATION)
+
+### 三级递进查找
+
+```
+对每个资格要求项:
+  (如 "具有独立承担民事责任的能力（营业执照/法人证书/执业许可证）")
+  
+  Level 1 ─── 主体材料匹配 ──────────┐
+    SubjectMaterialFile:              │
+    type=BUSINESS_LICENSE             │
+    → 有: 插入文档                     │  ← 找到即返回
+    → 无: ↓                          │
+                                      │
+  Level 2 ─── 知识库检索 ────────────┤
+    ChromaDB:                         │
+    query="营业执照 法人证书"          │
+    → 有: 插入文档                     │
+    → 无: ↓                          │
+                                      │
+  Level 3 ─── 留白一页 ─────────────┤
+    → 插入分页符                      │
+    → 章节标题 + "本节无内容"         │
+    → 日志记录缺失                    │
+                                     │
+  每个等级找到后即返回，不继续下级查找
+```
+
+### 分页符实现
+
+```python
+_EMPTY_PAGE_MARKER = "[[EMPTY_PAGE]]"
+
+# _build_docx_bytes() 中的处理:
+if content.strip() == _EMPTY_PAGE_MARKER:
+    doc.add_page_break()
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = p.add_run("（本节无内容）")
+    run.font.color.rgb = RGBColor(180, 180, 180)
+    run.font.size = Pt(14)
+    doc.add_page_break()  # 下个章节从下一页开始
+```
+
+---
+
+## 路径D：LLM 写作引擎 (FREE_WRITE)
+
+保留现有逻辑，增强点：
+
+- **置信度门控仅应用于知识库召回片段**，不应用于主体数据
+- `_build_subject_material_context()` 不做置信度过滤
+- `_filter_low_confidence_subject_materials()` 仅打标签，不清除文本
+
+---
+
+## 占位符识别 (纯LLM模式)
+
+### 不再使用
+
+| 组件 | 原因 | 替代方案 |
+|------|------|---------|
+| `_fallback_extract_placeholders()` | 正则无法穷尽占位符格式 | LLM 泛化识别 |
+| `_FALLBACK_PLACEHOLDER_PATTERNS` | 同上 | 同上 |
+
+### LLM Prompt 设计
+
+```
+你是一个占位符识别助手。
+找出下面文本中所有需要填写的空白位置。
 
 规则：
 1. 只识别，不填充，不改写原文
 2. 返回 JSON 数组格式
-3. 每个元素包含：
-   - "raw": 占位符原文
-   - "start": 起始字符位置
-   - "end": 结束字符位置
-   - "hint": 推测的字段含义
+3. 每个元素包含：raw(占位符原文), start(起始字符位置), end(结束位置), hint(推测字段含义)
 
-示例输入：
-"本单位XXX（比选申请人名称）参加XXX（项目名称）的比选活动"
-示例输出：
-[{"raw": "XXX（比选申请人名称）", "start": 3, "end": 15, "hint": "公司名称"},
- {"raw": "XXX（项目名称）", "start": 17, "end": 27, "hint": "项目名称"}]
-
-注意：如果无法推断 hint，用 "unknown"。
-如果文本中没有占位符，返回空数组 []。
+识别所有格式的占位符：
+- XXX（字段名）格式：XXX（比选申请人名称）
+- 下划线格式：______
+- 混合格式：法定代表人：__________
+- 隐式空白：比选日期：  年   月   日
+- 方括号格式：【】
+- 任何看起来需要填写的空白位置
 ```
 
-### 字段映射注册表
-
-| field_hint | 数据源 | 取值方法 |
-|-----------|--------|---------|
-| 公司名称、申请人名称、单位名称等 | SubjectCompany | company_name |
-| 统一社会信用代码 | SubjectCompany | credit_code |
-| 法定代表人姓名 | SubjectCompany/材料 | company_name 或材料中提取 |
-| 联系电话 | SubjectCompany | contact_phone |
-| 联系地址 | SubjectCompany | address |
-| 项目名称 | BiddingAnalysisResult | project_name |
-| 项目编号 | BiddingAnalysisResult | project_no |
-| 招标人、采购人 | BiddingAnalysisResult | bidder_name |
-| 代理机构 | BiddingAnalysisResult | agent_name |
-| 预算金额 | BiddingAnalysisResult | budget_amount |
-| 日期 | 计算 | 当前日期 |
-
----
-
-## 路径 B：表格填充引擎
-
-### 检测
-
-表格模板特征：
-- 章节标题含：报价一览表、偏离表、应答表、业绩表、人员情况表、基本情况表
-- 正文含表头列名（如 "序号、名称、数量、单价、总价"）
-
-### 处理
-
-```
-识别为表格模板
-  │
-  ├── 从招标分析结果中提取数据
-  │    ├── 报价表 → 从 technical_requirements 中提取产品清单
-  │    └── 偏离表 → 提取技术要求条目 + 生成响应情况
-  │
-  └── 生成 docx 表格
-       ├── `<w:tbl>` + Table Grid 样式
-       ├── 表头行（加粗）
-       └── 数据行
-```
-
----
-
-## 路径 C：资格证明文件插入引擎
-
-### 提取要求清单
-
-从分析结果的 `qualification_requirements` 和 `qualification_review` 中提取：
-- "需提供法定代表人或主要负责人授权委托书"
-- "需提供营业执照复印件"
-- "需提供纳税证明材料"
-
-### 匹配主体资料
-
-```
-提取的要求关键词                   主体资料类型
-─────────────────────────────────────────
-营业执照、法人证书                → BUSINESS_LICENSE
-法定代表人身份证明                → LEGAL_PERSON_STATEMENT
-授权委托书                       → AUTHORIZATION_LETTER
-被授权人身份证                    → AUTHORIZED_PERSON_ID_CARD
-纳税证明、社保                   → FINANCIAL_STATEMENT
-资质声明函                       → QUALIFICATION_DECLARATION
-廉洁承诺书                       → INTEGRITY_COMMITMENT
-```
-
-### 处理
-
-```
-已上传 → 在 docx 对应位置插入：
-         章节标题 + 说明文字 + 扫描件图片/文本摘录
-
-未上传 → 记录到"待人工补齐清单"：
-         "法定代表人身份证明：缺少，请上传"
-```
-
----
-
-## 路径 D：LLM 写作引擎（保留现有逻辑）
-
-见 `_generate_chapter_content` 现有实现：
-- system_prompt + user_prompt 构造
-- 知识库上下文注入
-- 主体资料上下文注入
-- 约束注入（质量保证模块）
-
-后续增强：置信度门控
-- OCR 文本置信度 < 0.7 → 不入 prompt
-- 召回相关性 RRF score < 0.3 → 丢弃
-- LLM 输出一致性校验 → 生成"可疑内容清单"
-
----
-
-## 章节分类器设计
+### 保留的正则用途
 
 ```python
-def _classify_chapter_type(chapter_title, chapter_desc, tender_text):
-    """分类章节类型，决定走哪条处理路径。"""
-
-    combined = f"{chapter_title} {chapter_desc}"
-
-    # 1. 文本模板检测
-    TEXT_KEYWORDS = ["承诺函","声明函","授权书","廉洁承诺",
-                     "响应函","资格证明","身份证明","授权委托"]
-    if any(kw in combined for kw in TEXT_KEYWORDS):
-        return "TEMPLATE_TEXT"
-
-    # 2. 表格模板检测
-    TABLE_KEYWORDS = ["报价一览表","报价表","偏离表","应答表",
-                      "业绩一览表","人员情况表","基本情况表"]
-    if any(kw in combined for kw in TABLE_KEYWORDS):
-        return "TEMPLATE_TABLE"
-
-    # 3. 资格证明检测
-    QUAL_KEYWORDS = ["资格证明","资格审查","资质证明"]
-    if any(kw in combined for kw in QUAL_KEYWORDS):
-        return "QUALIFICATION"
-
-    # 4. 其他 → LLM 写作
-    return "FREE_WRITE"
+# 仅用于修正 LLM 返回的位置偏移量
+def _correct_placeholder_positions(text, placeholders):
+    """用正则重算 start/end，确保位置准确。"""
+    for ph in placeholders:
+        raw = ph.get("raw", "")
+        # 在原文中查找 raw 的实际位置
+        idx = text.find(raw, ph.get("start", 0))
+        if idx >= 0:
+            ph["start"] = idx
+            ph["end"] = idx + len(raw)
+    return placeholders
 ```
 
-## 数据完整流
+---
+
+## 数据完整性检查
+
+### 分析阶段 → 生成阶段数据传递
 
 ```
-招标文件上传 → 分析（v3 pipeline）
-  → 提取 analysis_data.effective_text
-  → 提取 qualification_requirements
-  → 提取 technical_requirements, business_requirements
-      │
-      ▼
-目录生成
-  → 每章调用 _classify_chapter_type()
-      │
-      ├── TEMPLATE_TEXT:    填空引擎 → 直接返回填充后文本
-      ├── TEMPLATE_TABLE:   表格引擎 → 生成 docx 表格段
-      ├── QUALIFICATION:  资格证明 → 返回资料占位指令
-      └── FREE_WRITE:      LLM 写作 → _generate_chapter_content()
-      │
-      ▼
-_docx_assembly 阶段
-  ├── 普通文本 → _write_formatted_content()
-  ├── 表格段   → _write_table_from_data()
-  └── 资格证明 → _insert_qualification_documents()
+analysis_data JSON
+  ├── bidder_notice.project_name     → 封面标的名称
+  ├── bidder_notice.project_no       → 封面项目编号
+  ├── eligibility.qualifications[]   → 资格项清单
+  ├── table_classification.product_lists[].items[]
+  │                                   → 报价表数据
+  ├── format_requirements            → 目录骨架
+  └── scoring.dimensions[]           → 评分维度
+
+每个字段必须在 _extract_analysis_context() 中被正确提取，
+并在对应的生成路径中被使用。
 ```
+
+### 覆盖检查修正
+
+对 QUALIFICATION 类型的章节，`_build_generation_coverage_snapshot()` 不应检查正文内容是否覆盖，而应检查：
+1. 对应主体材料是否已上传
+2. 知识库是否有匹配片段
+3. 留白标记是否正确插入

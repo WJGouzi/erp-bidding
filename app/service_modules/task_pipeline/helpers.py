@@ -71,6 +71,64 @@ def _strip_xml_control_chars(text: str) -> str:
     return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
 
 
+
+# ========== 全局产品列名映射表 ==========
+# 统一所有表格解析系统使用的字段映射，确保 _extract_table_data_from_analysis()
+# table_parser.py, table_classifier.py 共用同一套映射规则
+PRODUCT_COLUMN_MAP = {
+    "name": ["品名", "名称", "产品名称", "试剂名称", "货物名称",
+             "商品名", "采购产品名称", "标的名称", "产品名",
+             "采购产品名称", "产品（设备）名称"],
+    "spec": ["规格", "规格型号", "型号", "技术规格", "参数",
+             "★规格参数", "技术参数与性能指标", "规格参数",
+             "技术规格参数"],
+    "brand": ["品牌", "生产厂家", "厂家", "制造商"],
+    "qty": ["数量", "需求量", "预估数量", "采购量", "★数量"],
+    "unit": ["单位", "计量单位", "★计量单位"],
+    "unit_price": ["单价", "预算单价", "最高限价", "★单价最高限价",
+                   "单价最高限价"],
+    "total_price": ["总价", "金额", "合计"],
+    "产地": ["产地", "来源"],
+    "备注": ["备注", "说明"],
+}
+
+
+# 产品库 API 字段名 → 中标文件表格列名映射
+# 用于将 _fetch_product_data() 返回的结构化字段填充到表格空格中
+PRODUCT_FIELD_TO_COLUMN = {
+    "brand": ["品牌", "生产厂家", "厂家", "制造商", "★品牌"],
+    "specAndModel": ["规格", "规格型号", "型号", "技术规格", "规格参数",
+                     "★规格参数", "技术参数与性能指标"],
+    "manufacturer": ["生产厂家", "厂家", "制造商"],
+    "unit": ["单位", "计量单位", "★计量单位"],
+    "articleNo": ["货号", "商品编号", "产品编号"],
+    "serialNo": ["序列号", "批号"],
+    "descOfFunc": ["功能描述", "产品描述", "描述", "主要功能"],
+    "detectionOfSpec": ["检测标准", "检测规范"],
+    "storageCondition": ["储存条件", "存储条件", "存放条件", "保存条件"],
+    "concentration": ["浓度"],
+    "registrationCertificateNo": ["注册证号", "注册号", "医疗器械注册证", "注册证"],
+    "qualityPeriod": ["保质期", "有效期", "质量保证期"],
+}
+
+
+def _map_product_headers_unified(headers):
+    """统一的表头→标准字段映射，供所有表格解析模块共用。
+    
+    Returns:
+        dict: {standard_field: col_index}
+    """
+    mapping = {}
+    for i, h in enumerate(headers):
+        h_clean = h.strip()
+        for std_field, candidates in PRODUCT_COLUMN_MAP.items():
+            if any(c in h_clean for c in candidates):
+                if std_field not in mapping:
+                    mapping[std_field] = i
+                break
+    return mapping
+
+
 _FIELD_UNSET = object()
 _EMPTY_PAGE_MARKER = "[[EMPTY_PAGE]]"
 _TABLE_MARKER_PREFIX = "[[TABLE:"
@@ -271,12 +329,26 @@ def _extract_analysis_context(analysis_result):
                     bidder_notice["project_no"] = val
                     break        # 提取 product_lists 供表格填充引擎使用
         product_lists = []
+        # 同时保留原始表格结构（headers + rows）用于原样复制
+        raw_tables = []
         tc = payload.get("table_classification", {}) if isinstance(payload, dict) else {}
         if tc:
             for pl in tc.get("product_lists", []):
                 for item in pl.get("items", []):
                     product_lists.append(item)
+                # 保留原始表格结构用于原样复制
+                if pl.get("headers") and pl.get("rows"):
+                    raw_tables.append({
+                        "headers": pl["headers"],
+                        "rows": pl["rows"][:100],
+                    })
         context["_raw_product_lists"] = product_lists
+        context["_raw_product_tables"] = raw_tables
+        context["_eligibility"] = payload.get("eligibility", {}) if isinstance(payload, dict) else {}
+        context["_table_classification"] = payload.get("table_classification", {}) if isinstance(payload, dict) else {}
+        context["_format_requirements"] = payload.get("format_requirements", {}) if isinstance(payload, dict) else {}
+        context["_scoring"] = payload.get("scoring", {}) if isinstance(payload, dict) else {}
+        context["_packages"] = payload.get("packages", []) if isinstance(payload, dict) else []
 
     
     else:
@@ -732,6 +804,197 @@ def _build_product_context(task):
         return {"snippets": [], "matched_products": [], "product_terms": terms}
 
 
+def _match_products_from_library(product_items, top_k=3):
+    """从产品库检索匹配产品信息，填充到产品列表的空白字段。
+
+    对每个产品名称做 LLM embedding 检索，从 Chroma product_library 中
+    找到最相似的产品，提取其规格参数、品牌、单价等信息。
+
+    Args:
+        product_items: list[dict] - 产品列表，每个 item 至少包含 name
+        top_k: 每个产品返回的最多匹配数
+
+    Returns:
+        dict: {product_name: {matched_text: "...", spec: "...", score: float}}
+    """
+    if not product_items:
+        return {}
+
+    try:
+        chroma_tenant = current_app.config.get("CHROMA_TENANT")
+        chroma_database = current_app.config.get("CHROMA_DATABASE")
+        engine = MultiRecallEngine()
+        results = {}
+
+        for item in product_items:
+            name = item.get("name", "") or item.get("采购产品名称", "") or ""
+            if not name or len(name) < 2:
+                continue
+
+            recall_results = engine.recall(
+                query=name,
+                collection="product_library",
+                top_k=top_k,
+                tenant=chroma_tenant,
+                database=chroma_database,
+            )
+
+            best_match = None
+            best_score = 0.0
+            for rr in recall_results:
+                score = rr.get("score", 0) or 0
+                if score > best_score and rr.get("text") and len(rr["text"].strip()) > 10:
+                    best_score = score
+                    best_match = rr["text"].strip()
+
+            if best_match:
+                results[name] = {
+                    "matched_text": best_match,
+                    "score": best_score,
+                }
+
+        return results
+    except Exception as exc:
+        logger.warning("[product] 产品库匹配异常: %s", exc)
+        return {}
+
+
+def _fetch_product_data(product_names, adapter=None):
+    """从产品库批量查询产品信息，返回结构化数据。
+
+    使用 ChromaAdapter（业务服务端口 28712）的 /objects/query 接口，
+    直接返回 object_json 中的结构化字段，无需 LLM 解析。
+
+    Args:
+        product_names: list[str] - 产品名称列表
+        adapter: ChromaAdapter 实例（可选，自动创建）
+
+    Returns:
+        dict: {product_name: {brand, specAndModel, manufacturer, unit, ...}}
+    """
+    if not product_names:
+        return {}
+
+    if adapter is None:
+        adapter = ChromaAdapter(
+            host=current_app.config.get("CHROMA_HOST"),
+            tenant=current_app.config.get("PRODUCT_CHROMA_TENANT", "erp"),
+            database=current_app.config.get("PRODUCT_CHROMA_DATABASE", "erp"),
+        )
+
+    collection = current_app.config.get("PRODUCT_CHROMA_COLLECTION", "product")
+    result = {}
+
+    for name in product_names:
+        pname = (name or "").strip()
+        if not pname or len(pname) < 2:
+            continue
+        try:
+            data = adapter.query_objects(collection, query_text=pname, top_k=1)
+            matches = (data or {}).get("matches", []) or []
+            if matches:
+                best = matches[0]
+                obj_str = best.get("object_json", "") or ""
+                if obj_str:
+                    obj = json.loads(obj_str)
+                    info = {}
+                    for field in ["productName", "brand", "specAndModel", "manufacturer",
+                                   "unit", "articleNo", "serialNo", "descOfFunc",
+                                   "detectionOfSpec", "storageCondition", "concentration",
+                                   "qualityPeriod", "qualityPeriodUnit", "registrationCertificateNo"]:
+                        val = obj.get(field)
+                        if val is not None and str(val).strip() not in ("", "-"):
+                            info[field] = str(val)
+                    if info:
+                        result[pname] = info
+        except Exception as exc:
+            logger.warning("[product] 产品库查询失败 name=%s: %s", pname, exc)
+
+    return result
+
+def _fill_table_from_original(original_headers, original_rows):
+    """从产品库填充原始表格的空白单元格。
+
+    策略：
+    1. 保留原始表格的完整框架（表头+行）
+    2. 用 PRODUCT_COLUMN_MAP 定位产品名列
+    3. 收集全部产品名，批量查询产品库
+    4. 用 PRODUCT_FIELD_TO_COLUMN 匹配哪些列可填充
+    5. 只填充空单元格，已有内容的单元格不动
+
+    Args:
+        original_headers: list[str] - 原始表头
+        original_rows: list[list[str]] - 原始数据行
+
+    Returns:
+        list[list[str]]: 填充后的数据行
+    """
+    if not original_headers or not original_rows:
+        return original_rows or []
+
+    # 1. 定位产品名列索引
+    name_col_idx = -1
+    for i, h in enumerate(original_headers):
+        for candidate in PRODUCT_COLUMN_MAP.get("name", []):
+            if candidate in h:
+                name_col_idx = i
+                break
+        if name_col_idx >= 0:
+            break
+
+    if name_col_idx < 0:
+        return original_rows
+
+    # 2. 收集产品名
+    product_names = []
+    for row in original_rows:
+        name = (row[name_col_idx] or "").strip() if name_col_idx < len(row) else ""
+        if name and len(name) >= 2:
+            product_names.append(name)
+
+    if not product_names:
+        return original_rows
+
+    # 3. 批量查询产品库
+    product_data = _fetch_product_data(product_names)
+
+    if not product_data:
+        return original_rows
+
+    # 4. 建立 表头→产品字段 的映射
+    header_to_product_field = {}
+    for col_idx, h in enumerate(original_headers):
+        h_clean = h.strip()
+        for product_field, col_candidates in PRODUCT_FIELD_TO_COLUMN.items():
+            if any(c in h_clean for c in col_candidates):
+                header_to_product_field[col_idx] = product_field
+                break
+
+    # 5. 填充每行的空白单元格
+    filled_rows = []
+    for row in original_rows:
+        new_row = list(row)
+        while len(new_row) < len(original_headers):
+            new_row.append("")
+
+        product_name = (new_row[name_col_idx] or "").strip() if name_col_idx < len(new_row) else ""
+        product_info = product_data.get(product_name, {})
+
+        if product_info:
+            for col_idx in range(len(original_headers)):
+                cell_val = (new_row[col_idx] or "").strip()
+                if not cell_val:
+                    product_field = header_to_product_field.get(col_idx)
+                    if product_field and product_field in product_info:
+                        fill_val = product_info[product_field]
+                        new_row[col_idx] = fill_val[:100]
+
+        new_row = [str(c)[:100] if c else "" for c in new_row]
+        filled_rows.append(new_row)
+
+    return filled_rows
+
+
 def _extract_product_terms(text):
     """从当前有效分析文本中抽取产品项关键词。"""
     if not text:
@@ -789,12 +1052,8 @@ def _build_subject_material_context(subject_id):
                 text_excerpt = (_read_file_text(file_record) or "")[:800]
             except Exception as exc:
                 logger.warning("[subject] 读取主体资料文本失败 material=%s file=%s: %s", m.id, m.file_id, exc)
-        # 置信度评估
-        conf = _compute_text_confidence(text_excerpt, source="ocr")
-        if conf < 0.5:
-            logger.info("[confidence] 主体资料置信度偏低 material=%s type=%s conf=%.2f, 内容已过滤", m.id, m.material_type, conf)
-            text_excerpt = ""  # 低置信度 OCR 文本不入库
-
+        # 注意：主体资料是用户上传的正式文件，不做置信度过滤
+        # 置信度标记由下游 _filter_low_confidence_subject_materials() 处理
         items.append(
             {
                 "id": m.id,
@@ -805,22 +1064,21 @@ def _build_subject_material_context(subject_id):
                 "file_ext": (file_record.file_ext or "") if file_record else "",
                 "storage_provider": (file_record.storage_provider or "") if file_record else "",
                 "text_excerpt": text_excerpt,
-                "_confidence": round(conf, 2),
             }
         )
     # 字段格式校验
     company_name = subject.company_name or ""
     credit_code = subject.credit_code or ""
-    cc_valid, cc_msg = _validate_field_format("credit_code", credit_code) if credit_code else (True, "")
-    if credit_code and not cc_valid:
-        logger.warning("[confidence] 主体信用代码格式异常: %s (%s)", credit_code[:10], cc_msg)
+    # 主体数据由用户管理，不做格式校验
 
     return {
         "company_name": company_name,
         "credit_code": credit_code,
-        "_validations": {
-            "credit_code": {"valid": cc_valid, "message": cc_msg} if credit_code else {},
-        },
+        "address": subject.address or "",
+        "contact_person": subject.contact_person or "",
+        "contact_phone": subject.contact_phone or "",
+        "legal_person": "",  # SubjectCompany 表无法人字段，需从材料 OCR 提取
+        "_validations": {},
         "materials": items,
     }
 
@@ -940,6 +1198,7 @@ def _build_leaf_response_bindings(chapter, analysis_context, subject_context, kn
                 if text:
                     evidence.append(_truncate_binding_text(text))
         if any(keyword in combined_text for keyword in ("商务", "履约", "交货", "售后")):
+
             if analysis_context.get("business_requirements"):
                 evidence.append(_truncate_binding_text(analysis_context.get("business_requirements", "")))
         if any(keyword in combined_text for keyword in ("资格", "资质", "授权", "证明", "审查")):
@@ -1065,12 +1324,25 @@ def _build_generation_coverage_snapshot(
             for binding in bindings:
                 body = _extract_binding_body_from_content(chapter_content, binding["title"])
                 covered = bool(body and body != _EMPTY_PAGE_MARKER)
+                # 对资格证明类型特殊处理：检验父章节标题，而非子项标题
+                # 资格证明文件章节的各子项不需要在正文中展开写
+                # 只要 chapter_content 包含 _QUALIFICATION_MARKER，说明已由
+                # _generate_qualification_content() 通过 chapter.children 处理
+                # 所有子项都应视为已覆盖，不依赖正文文本匹配
+                is_qual_chapter = any(kw in chapter_title for kw in ["资格证明", "资格审查", "资质证明", "资格性"])
+                if is_qual_chapter:
+                    # 如果章节内容包含 QUALIFICATION_MARKER → 所有子项已处理
+                    if _QUALIFICATION_MARKER in chapter_content:
+                        covered = True
+                    else:
+                        # 兜底：检查是否有 evidence（来自主体材料或分析数据）
+                        covered = bool(binding.get("evidence")) or covered
                 requirement_items.append(
                     {
                         "chapter_title": chapter_title,
                         "target_title": binding["title"],
                         "requirement": binding.get("requirement", ""),
-                        "status": "MISSING" if binding.get("require_blank") else ("COVERED" if covered else "PENDING"),
+                        "status": "COVERED" if covered else ("MISSING" if (binding.get("require_blank") and not binding.get("evidence")) else "PENDING"),
                         "has_evidence": bool(binding.get("evidence")),
                         "source_reference": source_reference,
                         "requirement_level": plan_lookup.get((chapter_title, binding["title"]), {}).get("requirement_level", "NORMAL"),
@@ -1908,21 +2180,29 @@ def _identify_placeholders_via_llm(template_text, adapter=None):
         return []
 
     # 尝试 LLM 识别
+    llm_placeholders = []
     if adapter and adapter.is_available():
         try:
             prompt = (
                 "你是一个占位符识别助手。找出下面文本中所有需要填写的空白位置。\n"
                 "规则：\n"
                 "1. 只识别，不填充，不改写原文\n"
-                "2. 返回 JSON 数组格式\n"
+                "2. 返回 JSON 数组格式，不要包含任何解释或其他文字\n"
                 "3. 每个元素包含：raw(占位符原文), start(起始字符位置), end(结束位置), hint(推测字段含义)\n\n"
-                "示例输入：\n"
+                "识别所有格式的占位符：\n"
+                "- XXX（字段名）格式：XXX（比选申请人名称）\n"
+                "- 下划线格式：______\n"
+                "- 字段名+下划线格式：法定代表人：__________\n"
+                "- 隐式空白：比选日期：  年   月   日\n"
+                "- 方括号格式：【待填写】\n"
+                "- 任何看起来需要填写的空白位置\n\n"
+                "示例：\n"
                 "本单位XXX（比选申请人名称）参加XXX（项目名称）的比选活动\n"
-                "示例输出：\n"
-                '[{"raw": "XXX（比选申请人名称）", "start": 3, "end": 16, "hint": "公司名称"},\n'
+                '输出：[{"raw": "XXX（比选申请人名称）", "start": 3, "end": 16, "hint": "公司名称"},\n'
                 ' {"raw": "XXX（项目名称）", "start": 19, "end": 28, "hint": "项目名称"}]\n\n'
                 "文本：\n"
                 f"{template_text[:2000]}\n\n"
+                "如果文本中没有占位符，返回空数组 []。"
                 "只返回 JSON 数组："
             )
             raw = adapter.generate_text(
@@ -1936,16 +2216,47 @@ def _identify_placeholders_via_llm(template_text, adapter=None):
             # 从返回中提取 JSON 数组
             json_match = re.search(r'\[.*?\]', raw.strip(), re.DOTALL)
             if json_match:
-                placeholders = _json.loads(json_match.group(0))
-                if isinstance(placeholders, list):
-                    logger.info("[template] LLM 识别占位符 %s 个", len(placeholders))
-                    return placeholders
+                llm_placeholders = _json.loads(json_match.group(0))
+                if not isinstance(llm_placeholders, list):
+                    llm_placeholders = []
+                else:
+                    logger.info("[template] LLM 识别占位符 %s 个", len(llm_placeholders))
         except Exception as exc:
-            logger.warning("[template] LLM 占位符识别失败，降级到正则: %s", exc)
+            logger.warning("[template] LLM 占位符识别失败: %s", exc)
 
-    # 降级：正则兜底
-    logger.info("[template] 使用正则兜底识别占位符")
-    return _fallback_extract_placeholders(template_text)
+    # 正则仅做位置修正（不做兜底提取）
+    regex_placeholders = _fallback_extract_placeholders(template_text)
+    
+    # 纯 LLM 模式：LLM 识别不到就返回空，不降级到正则
+    if not llm_placeholders:
+        logger.info("[template] LLM 未识别到占位符，保留原文")
+        return []
+    
+    # 仅用正则修正 LLM 返回的位置偏移量
+    seen_starts = {ph.get("start", -1) for ph in llm_placeholders}
+    # 只在 LLM 已有结果时，用正则重算位置
+    if regex_placeholders:
+        # 为每个 LLM 识别的占位符找到原文中的准确位置
+        corrected = []
+        for ph in llm_placeholders:
+            raw = ph.get("raw", "")
+            hint = ph.get("hint", "")
+            # 在原文中查找 raw 的实际位置
+            start = template_text.find(raw)
+            if start >= 0:
+                corrected.append({
+                    "raw": raw,
+                    "start": start,
+                    "end": start + len(raw),
+                    "hint": hint,
+                })
+            else:
+                # 如果 LLM 返回的 raw 在原文中找不到，尝试用 LLM 的 start 位置
+                corrected.append(ph)
+        return corrected
+    
+    logger.info("[template] LLM 识别占位符 %s 个", len(llm_placeholders))
+    return llm_placeholders
 
 
 def _fill_template(template_text, placeholders, field_map):
@@ -1987,6 +2298,16 @@ def _fill_template(template_text, placeholders, field_map):
             unfilled.append({"raw": raw, "hint": hint, "start": start})
 
     filled = "".join(result)
+    
+    # 替换后验证：检查是否还有未替换的占位符
+    remaining_xxx = re.findall(r'XXX[（(]?', filled)
+    remaining_ul = re.findall(r'_{4,}', filled)
+    if remaining_xxx or remaining_ul:
+        remaining_count = len(remaining_xxx) + len(remaining_ul)
+        # 记录但不断流
+        logger.info("[template] 填充后仍有 %s 个占位符未替换（XXX=%s, 下划线=%s）", 
+                    remaining_count, len(remaining_xxx), len(remaining_ul))
+    
     return filled, unfilled
 
 
@@ -2151,15 +2472,71 @@ def _extract_table_data_from_analysis(table_type, analysis_context, subject_cont
     bidder_notice = analysis_context.get("bidder_notice", {}) or {}
 
     if "报价" in table_type or "报价一览表" in table_type:
-        # 从 technical_requirements 中提取产品/标的列表
-        lines = requirements_text.split("\n")
-        for line in lines:
-            stripped = line.strip()
-            if re.match(r'^\d+[.、]', stripped) and len(stripped) > 5:
-                clean = re.sub(r'^\d+[.、]\s*', '', stripped)
-                rows.append([str(len(rows) + 1), clean[:40], "", "1", "", "", ""])
+        # 优先使用原始表格结构（招标文件的原表复制）
+        raw_tables = analysis_context.get("_raw_product_tables", [])
+        if raw_tables:
+            for rt in raw_tables:
+                original_rows = rt.get("rows", [])
+                original_headers = rt.get("headers", [])
+                if not original_rows:
+                    continue
+                # 建立列名→标准字段映射，用于后续产品库填充
+                header_to_std = {}
+                for i, h in enumerate(original_headers):
+                    for std_field, candidates in PRODUCT_COLUMN_MAP.items():
+                        if any(c in h for c in candidates):
+                            header_to_std[i] = std_field
+                            break
+                # 直接使用原始行数据（保留全部原始内容）
+                for row_idx, row in enumerate(original_rows):
+                    # 序号从 1 开始
+                    new_row = list(row)
+                    # 确保有足够的列
+                    while len(new_row) < len(original_headers):
+                        new_row.append("")
+                    # 限制每列长度
+                    new_row = [str(c)[:40] if c else "" for c in new_row]
+                    rows.append(new_row)
+            if rows:
+                return rows
+        
+        # 降级：从 _raw_product_lists（结构化提取数据）获取产品数据
+        product_data = analysis_context.get("_raw_product_lists", [])
+        if product_data and isinstance(product_data[0], dict):
+            for item in product_data:
+                mapped = {}
+                for std_field in PRODUCT_COLUMN_MAP:
+                    candidates = PRODUCT_COLUMN_MAP[std_field]
+                    matched_val = ""
+                    for candidate in candidates:
+                        val = item.get(candidate, "")
+                        if val:
+                            matched_val = val
+                            break
+                    mapped[std_field] = matched_val
+                name = mapped.get("name", "") or ""
+                spec = mapped.get("spec", "")
+                unit = mapped.get("unit", "")
+                qty = mapped.get("qty", "") or ""
+                unit_price = mapped.get("unit_price", "")
+                total_price = mapped.get("total_price", "")
+                rows.append([str(len(rows) + 1),
+                             name[:40] if name else "",
+                             spec[:30] if spec else "",
+                             qty,
+                             unit_price,
+                             total_price,
+                             unit])
         if not rows:
-            rows.append(["1", "详见技术参数要求", "", "1", "", "", ""])
+            # 兜底：从 technical_requirements 中提取
+            lines = requirements_text.split("\n")
+            for line in lines:
+                stripped = line.strip()
+                if re.match(r'^\d+[.、]', stripped) and len(stripped) > 5:
+                    clean = re.sub(r'^\d+[.、]\s*', '', stripped)
+                    rows.append([str(len(rows) + 1), clean[:40], "", "", "", "", ""])
+        if not rows:
+            rows.append(["1", "", "", "", "", "", ""])
         return rows
 
     if "偏离" in table_type or "应答" in table_type:
@@ -2201,19 +2578,41 @@ def _extract_table_data_from_analysis(table_type, analysis_context, subject_cont
 def _generate_table_content(chapter_title, chapter_desc, analysis_context, subject_context):
     """生成表格模板的填充内容（tab 分隔的文本格式）。
 
+    策略变更：对报价/产品类表格，优先使用原始表格框架（招标文件原表复制），
+    只从产品库填充空白单元格。没有原始表时降级到硬编码逻辑。
+
     返回:
         str: 包含表格数据的文本（_table_marker 开头）
     """
-    columns, found = _detect_table_columns(chapter_title, chapter_desc)
     table_type = chapter_title
 
+    # ========== 新路径：原始表复用+填空（报价/产品类） ==========
+    if "报价" in table_type or "报价一览表" in table_type:
+        raw_tables = analysis_context.get("_raw_product_tables", [])
+        if raw_tables:
+            rt = raw_tables[0]
+            original_headers = rt.get("headers", [])
+            original_rows = rt.get("rows", [])
+            if original_headers and original_rows:
+                # 用原始表头作为表头
+                columns = list(original_headers)
+                # 填充空白单元格
+                filled_rows = _fill_table_from_original(original_headers, original_rows)
+                lines = []
+                lines.append("\t".join(columns))
+                for row in filled_rows:
+                    padded = row + [""] * (len(columns) - len(row))
+                    lines.append("\t".join(padded[:len(columns)]))
+                marker = f"{_TABLE_MARKER_PREFIX}{table_type}]]"
+                return marker + "\n" + "\n".join(lines)
+
+    # ========== 旧路径：硬编码表格（非产品类原有逻辑） ==========
+    columns, found = _detect_table_columns(chapter_title, chapter_desc)
     data_rows = _extract_table_data_from_analysis(table_type, analysis_context, subject_context)
 
-    # 构建 tab 分隔的表格文本
     lines = []
-    lines.append("\t".join(columns))  # 表头
+    lines.append("\t".join(columns))
     for row in data_rows:
-        # 确保每行列数与表头一致
         padded = row + [""] * (len(columns) - len(row))
         lines.append("\t".join(padded[:len(columns)]))
 
@@ -2266,12 +2665,18 @@ def _extract_qualification_requirements(analysis_context):
 
     combined = f"{qual_text}\n{qual_check}\n{conformity_check}"
 
-    # 按行切分，提取含"提供"、"提交"、"证明"的句子
+    # 按行切分，提取资格要求（包括提供类关键词和法定合规性要求）
     for line in combined.split("\n"):
         stripped = line.strip()
         if not stripped:
             continue
-        if any(kw in stripped for kw in ["提供", "提交", "证明", "出具", "递交"]):
+        # 匹配两类要求：
+        # 1. 提供/提交类（文档证明材料）
+        # 2. 法定合规类（具有、无行贿、依法等声明性要求）
+        is_action_req = any(kw in stripped for kw in ["提供", "提交", "证明", "出具", "递交"])
+        is_compliance_req = any(kw in stripped for kw in ["具有", "无行贿", "无重大违法", "依法", "良好", "独立承担民事责任"])
+        
+        if is_action_req or is_compliance_req:
             for keyword, material_type in _QUALIFICATION_MATERIAL_MAP:
                 if keyword in stripped:
                     requirements.append({
@@ -2280,6 +2685,14 @@ def _extract_qualification_requirements(analysis_context):
                         "material_type": material_type,
                     })
                     break
+            else:
+                # 匹配到合规要求但未匹配到材料类型时，标记为通用资质文件
+                if is_compliance_req:
+                    requirements.append({
+                        "requirement": stripped[:120],
+                        "keyword": "",
+                        "material_type": "QUALIFICATION_FILE",
+                    })
 
     # 去重（按 material_type）
     seen_types = set()
@@ -2292,24 +2705,38 @@ def _extract_qualification_requirements(analysis_context):
     return unique_requirements
 
 
-def _check_qualification_material_status(requirements, subject_context):
+def _check_qualification_material_status(requirements, subject_context, knowledge_contexts=None):
     """检查每项资格要求对应的主体资料是否已上传。
+
+    三级递进查找：
+    1. 主体材料中匹配 → UPLOADED
+    2. 知识库中检索 → KB_FOUND
+    3. 都没有 → MISSING
+
+    Args:
+        requirements: 资格要求清单
+        subject_context: 主体资料上下文
+        knowledge_contexts: 知识库上下文（可选）
 
     返回:
         list[dict]: [{"requirement": "...", "material_type": "...",
-                       "status": "UPLOADED|MISSING", "material": {...}}]
+                       "status": "UPLOADED|KB_FOUND|MISSING",
+                       "material": {...}, "kb_excerpt": "..."}]
     """
-    if not subject_context:
-        return [{"requirement": r["requirement"],
-                 "material_type": r["material_type"],
-                 "status": "MISSING",
-                 "material": None} for r in requirements]
+    if not requirements:
+        return []
 
-    materials = subject_context.get("materials", []) or []
+    materials = (subject_context or {}).get("materials", []) or []
     result = []
 
     for req in requirements:
         mt = req["material_type"]
+        keyword = req.get("keyword", "")
+        # 确保 requirement 文本不含 XML 控制字符
+        if req.get("requirement"):
+            req["requirement"] = _strip_xml_control_chars(req["requirement"])
+        
+        # Level 1: 主体材料匹配
         matched = [m for m in materials if m.get("material_type") == mt]
         if matched:
             result.append({
@@ -2317,31 +2744,113 @@ def _check_qualification_material_status(requirements, subject_context):
                 "material_type": mt,
                 "status": "UPLOADED",
                 "material": matched[0],
+                "kb_excerpt": "",
+            })
+            continue
+        
+        # Level 2: 知识库检索
+        kb_found = False
+        kb_excerpt = ""
+        if knowledge_contexts:
+            for kb in knowledge_contexts.get("knowledge_list", []):
+                for snippet in kb.get("snippets", []):
+                    if not snippet:
+                        continue
+                    # 匹配关键词
+                    if keyword and keyword in snippet:
+                        kb_found = True
+                        kb_excerpt = snippet[:200]
+                        break
+                    # 匹配 material_type 中文名
+                    mt_label = {
+                        "BUSINESS_LICENSE": "营业执照",
+                        "QUALIFICATION_FILE": "资质文件",
+                        "LEGAL_PERSON_ID_CARD": "法人身份证",
+                        "AUTHORIZATION_LETTER": "授权委托书",
+                        "AUTHORIZED_PERSON_ID_CARD": "被授权人身份证",
+                        "QUALIFICATION_DECLARATION": "资质声明函",
+                        "LEGAL_PERSON_STATEMENT": "法定代表人身份证明",
+                        "FINANCIAL_STATEMENT": "财务报表",
+                        "INTEGRITY_COMMITMENT": "廉洁承诺书",
+                    }.get(mt, "")
+                    if mt_label and mt_label in snippet:
+                        kb_found = True
+                        kb_excerpt = _strip_xml_control_chars(snippet)[:200]
+                        break
+                if kb_found:
+                    break
+        
+        if kb_found:
+            safe_kb_excerpt = _strip_xml_control_chars(kb_excerpt) if kb_excerpt else ""
+            result.append({
+                "requirement": req["requirement"],
+                "material_type": mt,
+                "status": "KB_FOUND",
+                "material": None,
+                "kb_excerpt": safe_kb_excerpt,
             })
         else:
+            # Level 3: 都没有 → MISSING
             result.append({
                 "requirement": req["requirement"],
                 "material_type": mt,
                 "status": "MISSING",
                 "material": None,
+                "kb_excerpt": "",
             })
 
     return result
 
 
-def _generate_qualification_content(analysis_context, subject_context):
+def _generate_qualification_content(analysis_context, subject_context, knowledge_contexts=None, chapter=None):
     """生成资格证明文件的插入指令。
+
+    三级递进查找：
+    1. 先在主体材料中匹配
+    2. 主体没有 → 去知识库检索
+    3. 都没有 → 标记为待人工补充
+
+    Args:
+        analysis_context: 分析上下文
+        subject_context: 主体资料上下文
+        knowledge_contexts: 知识库上下文（用于二级查找）
+        chapter: 当前章节信息（含 children 列表，优先使用 children 作为资格要求）
 
     返回:
         str: 含 _QUALIFICATION_MARKER 的内容，供 _build_docx_bytes 识别处理
     """
-    requirements = _extract_qualification_requirements(analysis_context)
-    status_list = _check_qualification_material_status(requirements, subject_context)
+    # 优先使用目录 children 作为资格要求（来自 check_items 的结构化数据）
+    children = (chapter or {}).get("children", []) or []
+    if children:
+        # 从 children 构建 requirements
+        requirements = []
+        for child in children:
+            title = (child.get("title") or "").strip()
+            desc = (child.get("description") or "").strip()
+            if not title:
+                continue
+            # 从 title 中匹配材料类型
+            matched_type = "QUALIFICATION_FILE"
+            for keyword, material_type in _QUALIFICATION_MATERIAL_MAP:
+                if keyword in title:
+                    matched_type = material_type
+                    break
+            requirements.append({
+                "requirement": (title + " " + desc).strip()[:120],
+                "keyword": "",
+                "material_type": matched_type,
+            })
+    else:
+        # 降级：从文本分析提取
+        requirements = _extract_qualification_requirements(analysis_context)
+    
+    status_list = _check_qualification_material_status(requirements, subject_context, knowledge_contexts)
 
     import json as _json
     data = {
         "items": status_list,
         "uploaded_count": sum(1 for s in status_list if s["status"] == "UPLOADED"),
+        "kb_found_count": sum(1 for s in status_list if s["status"] == "KB_FOUND"),
         "missing_count": sum(1 for s in status_list if s["status"] == "MISSING"),
     }
 
@@ -2392,21 +2901,23 @@ def _generate_chapter_content(task, chapter, analysis_result, subject_context, k
                 # 原文锁定校验
                 is_safe, diffs = _verify_template_diff(template_text, filled)
                 if not is_safe:
-                    logger.warning("[template] 章节「%s」填充后原文锁定校验失败，降级到 LLM 生成", chapter_title)
-                else:
-                    logger.info("[template] 章节「%s」填空完成，占位符%s个，未填充%s个",
-                                chapter_title, len(placeholders), len(unfilled))
-                    return filled
+                    # 不降级到 LLM 生成（防止改写固定格式导致废标）
+                    # 能填的填，填不了的原样保留
+                    logger.warning("[template] 章节「%s」填充后原文锁定校验失败，保留填充后原文，%s个占位符未替换",
+                                   chapter_title, len(unfilled))
+                logger.info("[template] 章节「%s」填空完成，占位符%s个，未填充%s个",
+                            chapter_title, len(placeholders), len(unfilled))
+                return filled
 
     # ========== 表格填充引擎 ==========
     if chapter_type == CHAPTER_TYPE_TABLE_TEMPLATE:
         logger.info("[table] 章节「%s」使用表格引擎", chapter_title)
         return _generate_table_content(chapter_title, chapter_desc, analysis_context, subject_context)
 
-    # ========== 资格证明文件填充引擎 ==========
+    # ========== 资格证明文件填充引擎（三级递进：主体→知识库→留白） ==========
     if chapter_type == CHAPTER_TYPE_QUALIFICATION:
-        logger.info("[qualification] 章节「%s」使用资格证明插入引擎", chapter_title)
-        return _generate_qualification_content(analysis_context, subject_context)
+        logger.info("[qualification] 章节「%s」使用资格证明插入引擎（三级递进）", chapter_title)
+        return _generate_qualification_content(analysis_context, subject_context, knowledge_contexts, chapter)
 
     system_prompt = (
         "\u4f60\u662f\u4e00\u540d\u6295\u6807\u6587\u4ef6\u5185\u5bb9\u7f16\u6392\u52a9\u624b\uff0c\u4e0d\u662f\u81ea\u7531\u521b\u4f5c\u52a9\u624b\u3002" + "\n\n"
@@ -2461,6 +2972,116 @@ def _generate_chapter_content(task, chapter, analysis_result, subject_context, k
             user_parts.append("\n结构化项目信息：")
             user_parts.extend(info_lines)
     if analysis_context.get("business_requirements"):
+    # ========== 结构化分析数据（保留原始结构，非文本块） ==========
+        _elig = analysis_context.get("_eligibility", {}) or {}
+        if _elig and isinstance(_elig, dict):
+            quals = _elig.get("qualifications", []) or []
+            if quals:
+                user_parts.append("\n[结构化] 资格要求清单（逐项）：")
+                for idx, q in enumerate(quals, 1):
+                    if isinstance(q, dict):
+                        req = (q.get("requirement") or "").strip()
+                        mat = (q.get("material") or q.get("required_material") or "").strip()
+                        if req:
+                            line_text = f"  {idx}. {req}"
+                            if mat:
+                                line_text += f" → 需提供材料：{mat}"
+                            user_parts.append(line_text)
+            starred = _elig.get("starred_requirements", []) or []
+            if starred:
+                user_parts.append("\n[结构化] ★ 实质性要求（必须完全响应）：")
+                for idx, s in enumerate(starred, 1):
+                    if isinstance(s, dict):
+                        req = (s.get("requirement") or "").strip()
+                        if req:
+                            user_parts.append(f"  ★{idx}. {req}")
+            disqs = _elig.get("disqualifications", []) or []
+            if disqs:
+                user_parts.append("\n[结构化] 废标条件（不可违反）：")
+                for idx, d in enumerate(disqs, 1):
+                    if isinstance(d, dict):
+                        req = (d.get("requirement") or "").strip()
+                        if req:
+                            user_parts.append(f"  ✘{idx}. {req}")
+        
+        # 产品清单表
+        _tc = analysis_context.get("_table_classification", {}) or {}
+        if _tc and isinstance(_tc, dict):
+            pl = _tc.get("product_lists", []) or []
+            if pl:
+                user_parts.append("\n[结构化] 产品清单表：")
+                for ti, pl_item in enumerate(pl, 1):
+                    items = pl_item.get("items", []) or []
+                    for item in items:
+                        if isinstance(item, dict):
+                            name = item.get("采购产品名称", "") or item.get("产品名称", "") or ""
+                            spec = item.get("★规格参数", "") or item.get("技术参数与性能指标", "") or ""
+                            qty = item.get("★数量", "") or item.get("数量", "") or ""
+                            limit = item.get("★单价最高限价", "") or item.get("单价最高限价", "") or ""
+                            if name:
+                                line_text = f"  - {name}"
+                                if spec: line_text += f" | 规格：{spec[:60]}"
+                                if qty: line_text += f" | 数量：{qty}"
+                                if limit: line_text += f" | 限价：{limit}"
+                                user_parts.append(line_text)
+        
+            tech_reqs = _tc.get("tech_requirements", []) or []
+            if tech_reqs:
+                user_parts.append("\n[结构化] 技术参数要求（逐项）：")
+                for tr in tech_reqs:
+                    if isinstance(tr, dict):
+                        for item in tr.get("items", []) or []:
+                            if isinstance(item, dict):
+                                name = item.get("技术要求名称", "") or ""
+                                param = item.get("技术参数与性能指标", "") or item.get("技术参数", "") or ""
+                                if name:
+                                    line_text = f"  - {name}"
+                                    if param: line_text += f"：{param[:120]}"
+                                    user_parts.append(line_text)
+        
+            biz_reqs = _tc.get("business_requirements", []) or []
+            if biz_reqs:
+                user_parts.append("\n[结构化] 商务要求（逐项）：")
+                for br in biz_reqs:
+                    if isinstance(br, dict):
+                        for item in br.get("items", []) or []:
+                            if isinstance(item, dict):
+                                name = item.get("商务要求名称", "") or ""
+                                val = item.get("商务要求内容", "") or ""
+                                if name:
+                                    line_text = f"  - {name}"
+                                    if val: line_text += f"：{val[:120]}"
+                                    user_parts.append(line_text)
+        
+        # 评分标准
+        _sc = analysis_context.get("_scoring", {}) or {}
+        if _sc and isinstance(_sc, dict):
+            dims = _sc.get("dimensions", []) or []
+            if dims:
+                user_parts.append("\n[结构化] 评分维度：")
+                for idx, dim in enumerate(dims, 1):
+                    if isinstance(dim, dict):
+                        name = (dim.get("name") or "").strip()
+                        score = (dim.get("score") or "")
+                        criteria = (dim.get("criteria") or dim.get("standard") or "").strip()
+                        if name:
+                            line_text = f"  {idx}. {name}（{score}分）"
+                            if criteria: line_text += f" - {criteria[:100]}"
+                            user_parts.append(line_text)
+        
+        # 核心产品
+        _pkgs = analysis_context.get("_packages", []) or []
+        if _pkgs:
+            for pkg in _pkgs:
+                if isinstance(pkg, dict):
+                    params = pkg.get("parameters", {}) or {}
+                    if params:
+                        core_products = params.get("core_products", []) or []
+                        if core_products:
+                            user_parts.append("\n[结构化] 核心产品列表：")
+                            for cp in core_products[:10]:
+                                user_parts.append(f"  - {cp}")
+        
         user_parts.append(f"\n结构化商务要求：\n{analysis_context['business_requirements'][:1200]}")
     if analysis_context.get("technical_requirements"):
         user_parts.append(f"\n结构化技术要求：\n{analysis_context['technical_requirements'][:1200]}")
@@ -2595,8 +3216,27 @@ def _read_file_text(file_record):
     - CHROMA → 从 ChromaDB 按 chunk_id 读取并拼接
     - MINIO  → 从 MinIO 下载后解析
     - LOCAL  → 从本地文件读取后解析
+    
+    注意：二进制文件（图片、压缩包等）不会被解析为文本，
+    直接返回空字符串，避免乱码写入文档。
     """
     if not file_record:
+        return ""
+
+    # 检查文件类型：跳过二进制/图片文件
+    file_name = file_record.file_name or ""
+    ext = (Path(file_name).suffix or "").lower()
+    BINARY_EXTENSIONS = {
+        ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif",
+        ".webp", ".ico", ".svg",
+        ".zip", ".rar", ".7z", ".tar", ".gz",
+        ".exe", ".dll", ".so", ".dylib",
+        ".pdf",  # PDF will be handled separately by DocumentParser
+    }
+    # PDF 有专门的解析器，不在此过滤
+    BINARY_EXTENSIONS_FOR_SKIP = BINARY_EXTENSIONS - {".pdf"}
+    if ext in BINARY_EXTENSIONS_FOR_SKIP:
+        logger.debug("[file_text] 跳过二进制文件: %s (ext=%s)", file_name, ext)
         return ""
 
     # 0. 优先从doc_parse_cache读取（上传阶段已同步写入）
@@ -3303,16 +3943,30 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
         child_sections = _extract_child_content_sections(matched_content, children) if matched_content and matched_content != _EMPTY_PAGE_MARKER and children else {}
 
         if matched_content == _EMPTY_PAGE_MARKER:
+            # 留白一页：分页符 + 空白说明 + 分页符
+            # 标题已在 _write_outline_item 开头通过 add_heading 写入
+            # 分页符确保下个章节从下一页开始
+            document.add_page_break()
+            # 空白说明
+            p = document.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            run = p.add_run("（本节无内容）")
+            run.font.size = Pt(14)
+            run.font.color.rgb = RGBColor(0xAA, 0xAA, 0xAA)
+            run.font.name = "仿宋"
+            run.element.rPr.rFonts.set(qn("w:eastAsia"), "仿宋")
+            # 添加招标原文提示（如果有）
             plan_item = _find_plan_item(chapter_title_for_plan, title)
             original_excerpt = (plan_item.get("original_requirement_excerpt") or "").strip()
             original_excerpt = _strip_xml_control_chars(original_excerpt)
-            if plan_item.get("plan_action") == "LEAVE_BLANK" and plan_item.get("requirement_level") == "REQUIRED":
-                note = document.add_paragraph("本节属于强要求内容，当前未检索到可直接填充的有效资料，已按要求留白，请人工补充。")
-                note.style = document.styles["Normal"]
-                if original_excerpt:
-                    excerpt_para = document.add_paragraph(f"招标文件原文提示：{original_excerpt}")
-                    excerpt_para.style = document.styles["Normal"]
-            document.add_paragraph("")
+            if original_excerpt:
+                excerpt_p = document.add_paragraph(f"招标文件原文要求：{original_excerpt}")
+                excerpt_p.style = document.styles["Normal"]
+                excerpt_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                for run in excerpt_p.runs:
+                    run.font.color.rgb = RGBColor(0x99, 0x99, 0x99)
+                    run.font.size = Pt(10)
+            # 分页符 → 下一个章节从下一页开始
             document.add_page_break()
             return
 
@@ -3335,34 +3989,51 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                     _write_outline_item(child, level=level + 1, inherited_child_sections=child_sections, parent_title=chapter_title_for_plan)
                 return
 
-            # ========== 资格证明文件标记处理 ==========
+            # ========== 资格证明文件标记处理（三级递进：主体→知识库→留白） ==========
             if isinstance(matched_content, str) and matched_content.startswith(_QUALIFICATION_MARKER):
                 import json as _json
                 qual_data_str = matched_content[len(_QUALIFICATION_MARKER):]
                 try:
                     qual_data = _json.loads(qual_data_str)
                     items = qual_data.get("items", [])
+                    
+                    # 统计状态
+                    uploaded = qual_data.get("uploaded_count", 0)
+                    kb_found = qual_data.get("kb_found_count", 0)
+                    missing = qual_data.get("missing_count", 0)
+                    total = uploaded + kb_found + missing
+                    
                     document.add_paragraph("以下为本次需提交的资格证明材料清单及状态：")
                     for item in items:
                         req = item.get("requirement", "")
                         safe_req = _strip_xml_control_chars(req)
-                        mtype = item.get("material_type", "")
                         status = item.get("status", "MISSING")
+                        
                         if status == "UPLOADED":
-                            p = document.add_paragraph(f"✅ {safe_req}")
+                            p = document.add_paragraph(f"✅ {safe_req}（主体已上传）")
+                            p.style = document.styles["Normal"]
+                        elif status == "KB_FOUND":
+                            kb_excerpt = item.get("kb_excerpt", "")
+                            if kb_excerpt:
+                                p = document.add_paragraph(f"📄 {safe_req}（知识库检索到）")
+                            else:
+                                p = document.add_paragraph(f"📄 {safe_req}（知识库检索到）")
                             p.style = document.styles["Normal"]
                         else:
                             p = document.add_paragraph(f"⬜ {safe_req}（待人工补充）")
                             p.style = document.styles["Normal"]
                             if p.runs:
                                 p.runs[0].font.color.rgb = RGBColor(0xCC, 0x00, 0x00)
-                    if qual_data.get("missing_count", 0) > 0:
+                    
+                    if missing > 0:
                         note = document.add_paragraph(
-                            f"共需{qual_data.get('uploaded_count', 0) + qual_data.get('missing_count', 0)}项，"
-                            f"已上传{qual_data.get('uploaded_count', 0)}项，"
-                            f"缺失{qual_data.get('missing_count', 0)}项。缺失项请在[待人工补齐清单]中补充。"
+                            f"共需{total}项，"
+                            f"主体已上传{uploaded}项，"
+                            f"知识库检索到{kb_found}项，"
+                            f"缺失{missing}项。缺失项请在[待人工补齐清单]中补充。"
                         )
                         note.style = document.styles["Normal"]
+                        note.alignment = WD_ALIGN_PARAGRAPH.LEFT
                 except Exception as exc:
                     logger.warning("[qualification] 资格证明数据解析失败: %s", exc)
                     document.add_paragraph("（资格证明文件处理异常，请在[待人工补齐清单]中查看）")

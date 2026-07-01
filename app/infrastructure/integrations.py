@@ -226,6 +226,27 @@ class ChromaAdapter:
         data = self._request("POST", "/documents/query", params=params, json=payload)
         return self._normalize_document_response(data)
 
+    def query_objects(self, collection_name, query_text, top_k=10, metadata_json=None):
+        """通过业务服务检索结构化对象（产品库）。
+        
+        对应服务端 POST /objects/query，返回结构化 JSON 数据（object_json）。
+        
+        Args:
+            collection_name: 集合名称（如 "product"）
+            query_text: 查询文本（如产品名）
+            top_k: 返回匹配数上限
+            metadata_json: 可选的元数据过滤 JSON 字符串
+        
+        Returns:
+            dict: {top_k, matches: [{object_id, distance, object_json, metadata_json}]}
+        """
+        payload = {"query_text": query_text, "top_k": top_k}
+        if metadata_json:
+            payload["metadata_json"] = metadata_json
+        params = self._build_params(collection_name)
+        data = self._request("POST", "/objects/query", params=params, json=payload)
+        return data
+
     def get_or_create_collection(self, collection_name, metadata=None):
         """通过业务服务获取或创建集合（由服务端管理，接口层无需显式操作）。"""
         _ = collection_name, metadata
