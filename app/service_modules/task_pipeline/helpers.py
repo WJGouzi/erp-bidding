@@ -717,7 +717,15 @@ def _build_knowledge_base_context(task, query_text=None):
                             pass
                     if fname and fname not in enabled_file_names:
                         continue
-                    snippets.append(rr["text"].strip())
+                    from app.domain.analysis_schema import ConfidenceLevel
+                    snippet_score = rr.get("score", 0) or 0
+                    snippet_confidence = ConfidenceLevel.from_value(snippet_score).name
+                    snippets.append({
+                        "text": rr["text"].strip(),
+                        "score": snippet_score,
+                        "confidence": snippet_confidence,
+                        "source": rr.get("source", {}),
+                    })
         except Exception as exc:
             logger.warning("[kb] 知识库查询异常: %s", exc)
         
@@ -1117,10 +1125,29 @@ def _chapter_has_supporting_material(subject_context, knowledge_contexts, produc
         return True
     if knowledge_contexts and knowledge_contexts.get("knowledge_list"):
         for kb in knowledge_contexts.get("knowledge_list", []):
-            if any((snippet or "").strip() for snippet in kb.get("snippets", [])):
+            if _any_snippet_has_text(kb.get("snippets", [])):
                 return True
     if product_context and any((item.get("matched_text") or "").strip() for item in product_context.get("matched_products", [])):
         return True
+    return False
+
+
+
+
+def _any_snippet_has_text(snippets):
+    """判断 snippets 列表中是否有实质文本内容。
+    
+    兼容新旧两种格式：
+    - 旧格式: [str, str, ...]
+    - 新格式: [{"text": str, ...}, ...]
+    """
+    for snip in snippets:
+        if isinstance(snip, dict):
+            if (snip.get("text") or "").strip():
+                return True
+        else:
+            if (snip or "").strip():
+                return True
     return False
 
 
@@ -1174,8 +1201,14 @@ def _build_leaf_response_bindings(chapter, analysis_context, subject_context, kn
     kb_snippets = []
     for kb in (knowledge_contexts or {}).get("knowledge_list", []):
         for snippet in kb.get("snippets", [])[:10]:
-            if (snippet or "").strip():
-                kb_snippets.append(_truncate_binding_text(snippet, 120))
+            if isinstance(snippet, dict):
+                snippet_text = snippet.get("text", "") or ""
+                snippet_conf = snippet.get("confidence", "UNKNOWN")
+            else:
+                snippet_text = snippet or ""
+                snippet_conf = "UNKNOWN"
+            if snippet_text.strip():
+                kb_snippets.append(_truncate_binding_text(snippet_text, 120))
     product_snippets = [
         _truncate_binding_text(item.get("matched_text", ""), 120)
         for item in (product_context or {}).get("matched_products", [])[:3]
@@ -1745,8 +1778,12 @@ def _verify_kb_citations(generated_content, knowledge_contexts):
     kb_snippets = []
     for kb in knowledge_contexts.get("knowledge_list", []):
         for snippet in kb.get("snippets", []):
-            if snippet and len(snippet.strip()) > 20:
-                kb_snippets.append(snippet.strip())
+            if isinstance(snippet, dict):
+                snippet_text = snippet.get("text", "") or ""
+            else:
+                snippet_text = snippet or ""
+            if snippet_text.strip() and len(snippet_text.strip()) > 20:
+                kb_snippets.append(snippet_text.strip())
     
     if not kb_snippets:
         return {"verified": [], "unverified": []}
@@ -1990,6 +2027,7 @@ def _filter_low_confidence_kb_snippets(knowledge_contexts: dict, min_score: floa
     """过滤低置信度的知识库片段。
 
     从 knowledge_contexts 中移除置信度低于阈值的片段。
+    优先使用召回引擎的 score，降级到 _compute_text_confidence 启发式。
 
     Args:
         knowledge_contexts: _build_knowledge_base_context 的返回值
@@ -2007,7 +2045,12 @@ def _filter_low_confidence_kb_snippets(knowledge_contexts: dict, min_score: floa
         snippets = kb.get("snippets", [])
         filtered_snippets = []
         for snip in snippets:
-            score = _compute_text_confidence(snip, source="kb_recall")
+            if isinstance(snip, dict):
+                # 新格式：使用召回引擎的 score
+                score = snip.get("score", 0) or 0
+            else:
+                # 旧格式（纯文本）：启发式评估
+                score = _compute_text_confidence(snip, source="kb_recall")
             if score >= min_score:
                 filtered_snippets.append(snip)
         kb["snippets"] = filtered_snippets
@@ -2754,6 +2797,8 @@ def _check_qualification_material_status(requirements, subject_context, knowledg
         if knowledge_contexts:
             for kb in knowledge_contexts.get("knowledge_list", []):
                 for snippet in kb.get("snippets", []):
+                    if isinstance(snippet, dict):
+                        snippet = snippet.get("text", "") or ""  # 兼容 dict 格式
                     if not snippet:
                         continue
                     # 匹配关键词
@@ -2855,6 +2900,256 @@ def _generate_qualification_content(analysis_context, subject_context, knowledge
     }
 
     return _QUALIFICATION_MARKER + _json.dumps(data, ensure_ascii=False)
+
+
+def _generate_chapter_content_v4(task, chapter, analysis_result, subject_context, knowledge_contexts, product_context):
+    """v4 分段生成路由 — 根据 mandate_level 路由到对应引擎。
+
+    Args:
+        chapter: 目录节点，应包含以下字段（由 catalog_binder 注入）:
+            - mandate_level: "HARD"|"SOFT"|"FREE"
+            - bound_segments: list[str] (绑定的解析段 ID 列表)
+            - guardrails: list[dict] (生成约束)
+
+    路由规则:
+        HARD → 填空引擎 (原文复制 + 主体字段替换 + 原文锁定校验)
+        SOFT → 匹配引擎 (KB/产品/主体三级递进)
+        FREE → 约束LLM整理 + 后生成校验
+        无 mandate_level → 降级到原有 _generate_chapter_content
+    """
+    mandate_level = chapter.get("mandate_level")
+    if not mandate_level:
+        # 没有 mandate_level 字段，走原有逻辑
+        return _generate_chapter_content(task, chapter, analysis_result,
+                                          subject_context, knowledge_contexts,
+                                          product_context)
+
+    bound_segments = chapter.get("bound_segments", [])
+    guardrails = chapter.get("guardrails", [])
+
+    if mandate_level == "HARD":
+        return _hard_generate(task, chapter, analysis_result, subject_context)
+    elif mandate_level == "SOFT":
+        return _soft_generate(task, chapter, analysis_result, subject_context,
+                              knowledge_contexts, product_context, guardrails)
+    elif mandate_level == "FREE":
+        return _free_generate(task, chapter, analysis_result, subject_context,
+                              knowledge_contexts, product_context, guardrails)
+    else:
+        return _generate_chapter_content(task, chapter, analysis_result,
+                                          subject_context, knowledge_contexts,
+                                          product_context)
+
+
+def _hard_generate(task, chapter, analysis_result, subject_context):
+    """HARD 路径：原文复制 + 确定性填空。
+
+    不经过 LLM，纯规则操作。确保强制格式内容（声明函、承诺书、投标函等）
+    不被改写。
+    """
+    from app.infrastructure.mandate_classifier import MANDATE_HARD
+
+    chapter_title = chapter.get("title", "").strip()
+    effective_text = analysis_result.effective_text if analysis_result else ""
+
+    # 1. 从原文中找匹配章节
+    _, template_text = _detect_template_type(chapter_title, "", effective_text)
+    if not template_text:
+        # 没有匹配的原文模板 → 返回占位
+        return _EMPTY_PAGE_MARKER
+
+    # 2. 确定性填空
+    analysis_context = _extract_analysis_context(analysis_result)
+    field_map = _build_template_field_map(subject_context, analysis_context)
+    placeholders = _identify_placeholders_via_llm(template_text)
+    filled, unfilled = _fill_template(template_text, placeholders, field_map)
+
+    # 3. 原文锁定校验
+    if _template_has_meaningful_content(filled):
+        is_safe, diffs = _verify_template_diff(template_text, filled)
+        if not is_safe:
+            logger.warning("[hard] 原文锁定校验失败: %s, 保留填充后原文, %s个占位符未替换",
+                           chapter_title, len(unfilled))
+        return filled
+
+    return template_text
+
+
+def _soft_generate(task, chapter, analysis_result, subject_context,
+                   knowledge_contexts, product_context, guardrails):
+    """SOFT 路径：匹配引擎 — KB/产品/主体三级递进。
+
+    有据可依时填充，无据时留白。
+    """
+    chapter_title = chapter.get("title", "").strip()
+    analysis_context = _extract_analysis_context(analysis_result)
+    content_parts = []
+    evidence_sources = []
+
+    # 从 bound_segments 取本节的特定需求
+    segment_data = _extract_bound_segment_data(analysis_result, chapter.get("bound_segments", []))
+
+    # 收集三段证据
+    # Level 1: 主体资料
+    subject_materials = (subject_context or {}).get("materials", []) or []
+    for mat in subject_materials:
+        excerpt = (mat.get("text_excerpt") or "").strip()
+        if excerpt:
+            content_parts.append(excerpt)
+            evidence_sources.append({"source": "subject", "confidence": "EXACT"})
+
+    # Level 2: 知识库
+    for kb in (knowledge_contexts or {}).get("knowledge_list", []):
+        for snippet in kb.get("snippets", [])[:5]:
+            if isinstance(snippet, dict):
+                text = snippet.get("text", "") or ""
+                conf = snippet.get("confidence", "UNKNOWN")
+            else:
+                text = snippet or ""
+                conf = "UNKNOWN"
+            if text.strip():
+                content_parts.append(text.strip())
+                evidence_sources.append({"source": "knowledge_base", "confidence": conf})
+
+    # Level 3: 产品库
+    for product in (product_context or {}).get("matched_products", [])[:5]:
+        matched_text = (product.get("matched_text") or "").strip()
+        if matched_text:
+            content_parts.append(matched_text)
+            evidence_sources.append({"source": "product", "confidence": "HIGH"})
+
+    if not content_parts:
+        return _EMPTY_PAGE_MARKER
+
+    return "\n\n".join(content_parts)
+
+
+def _free_generate(task, chapter, analysis_result, subject_context,
+                   knowledge_contexts, product_context, guardrails):
+    """FREE 路径：约束 LLM 整理 + 后生成校验。
+
+    LLM 负责编排已有材料，不得编造。
+    生成后执行校验，未通过则降级为留白。
+    """
+    chapter_title = chapter.get("title", "").strip()
+    chapter_desc = chapter.get("description", "") or ""
+    analysis_context = _extract_analysis_context(analysis_result)
+
+    # 构建约束信息（不进 prompt，只作为约束）
+    guardrail_texts = []
+    for g in guardrails:
+        guardrail_texts.append(f"- {g.get('detail', '')}")
+    constraint_hint = "\n".join(guardrail_texts) if guardrail_texts else ""
+
+    # 收集材料
+    materials = []
+    # 分析需求
+    if analysis_context.get("technical_requirements"):
+        materials.append(f"[技术要求] {analysis_context['technical_requirements'][:500]}")
+    if analysis_context.get("business_requirements"):
+        materials.append(f"[商务要求] {analysis_context['business_requirements'][:500]}")
+    # 主体资料
+    for mat in (subject_context or {}).get("materials", [])[:5]:
+        excerpt = (mat.get("text_excerpt") or "").strip()
+        if excerpt:
+            materials.append(f"[主体资料] {excerpt[:200]}")
+    # 知识库
+    for kb in (knowledge_contexts or {}).get("knowledge_list", []):
+        for snippet in kb.get("snippets", [])[:3]:
+            if isinstance(snippet, dict):
+                text = snippet.get("text", "") or ""
+                conf = snippet.get("confidence", "UNKNOWN")
+            else:
+                text = snippet or ""
+                conf = "UNKNOWN"
+            if text.strip():
+                materials.append(f"[知识库:{conf}] {text.strip()[:200]}")
+
+    if not materials:
+        return _EMPTY_PAGE_MARKER
+
+    material_text = "\n---\n".join(materials)
+    constraint_info = f"\n生成约束：\n{constraint_hint}" if constraint_hint else ""
+
+    system_prompt = (
+        "你是一个投标文件内容编排助手，不是自由创作助手。\n\n"
+        "你的角色：只能使用「已提供」的材料编排内容，不能编造任何数据、承诺或能力。\n"
+        "必须遵守的规则：\n"
+        "1. 每段内容必须在材料中有对应依据\n"
+        "2. 如材料不足以支撑实质性承诺，仅整理已提供的要求或事实\n"
+        "3. 不得使用 Markdown 语法\n"
+        "4. 如果某个项完全没有材料支撑，标注【无匹配资料，待补充】\n"
+        "5. 材料中 [EXACT] = 确定信息可直接引用，[HIGH] = 高置信度可引用，\n"
+        "   [MEDIUM] = 中等置信度注意核实，[LOW] = 低置信度建议留白"
+    )
+    user_prompt = (
+        f"章节标题：{chapter_title}\n"
+        f"章节说明：{chapter_desc}\n"
+        f"{constraint_info}\n"
+        f"\n可用材料：\n{material_text[:3000]}\n\n"
+        "请基于以上材料生成章节正文。如果某个要点完全没有材料支撑，请标注【无匹配资料，待补充】。"
+    )
+
+    try:
+        adapter = LLMAdapter(
+            api_key=current_app.config.get("OPENAI_API_KEY"),
+            base_url=current_app.config.get("OPENAI_BASE_URL"),
+            default_model=current_app.config.get("OPENAI_MODEL_NAME"),
+        )
+        if not adapter.is_available():
+            return _EMPTY_PAGE_MARKER
+
+        result = adapter.generate_text(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            temperature=0.1,
+            max_tokens=2000,
+        )
+        if not result or not result.strip():
+            return _EMPTY_PAGE_MARKER
+
+        # 后生成校验
+        verify_result = post_generation_verify(chapter_title, result, {
+            "chapter_title": chapter_title,
+            "hard_constraints": [
+                {"item_id": f"guard_{i}", "requirement_text": g.get("detail", "")}
+                for i, g in enumerate(guardrails)
+            ],
+            "tier3_items": [
+                {"item_id": f"mat_{i}", "requirement_text": m[:80]}
+                for i, m in enumerate(materials[:10])
+            ],
+            "tier2_items": [],
+            "tier1_items": [],
+        })
+        if verify_result and verify_result.get("overall") == "FAIL":
+            logger.warning("[free] 后生成校验失败: %s, 降级为留白", chapter_title)
+            return f"【本节无法安全生成，请人工撰写】\n\n参考材料：\n{material_text[:500]}"
+
+        return result.strip()
+
+    except Exception as exc:
+        logger.warning("[free] LLM 生成异常: %s", exc)
+        return _EMPTY_PAGE_MARKER
+
+
+def _extract_bound_segment_data(analysis_result, bound_segments):
+    """从分析结果中提取与指定 segment 绑定的数据。"""
+    if not bound_segments or not analysis_result:
+        return {}
+    # 当前简化实现：如果 analysis_data 中有 _section_index，做简单匹配
+    try:
+        import json
+        payload = json.loads(analysis_result.analysis_data) if isinstance(analysis_result.analysis_data, str) else (analysis_result.analysis_data or {})
+        if not isinstance(payload, dict):
+            return {}
+        section_index = payload.get("_section_index", [])
+        if section_index:
+            matched = [s for s in section_index if s.get("id") in bound_segments]
+            return {"matched_sections": matched, "count": len(matched)}
+    except Exception:
+        pass
+    return {}
 
 
 def _generate_chapter_content(task, chapter, analysis_result, subject_context, knowledge_contexts, product_context):

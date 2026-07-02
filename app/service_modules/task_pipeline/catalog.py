@@ -500,12 +500,50 @@ def _assign_numbers(skeleton):
     return skeleton
 
 
-def build_catalog(analysis_data, classified_items):
-    """目录合并引擎主入口。"""
-    # 阶段1：基础骨架
-    skeleton = build_base_skeleton(analysis_data)
+def build_catalog(analysis_data, classified_items, section_index=None):
+    """目录合并引擎主入口。
+
+    Args:
+        analysis_data: 分析数据
+        classified_items: 分类的核对项
+        section_index: 可选的章节索引（用于从招标文件提取骨架）
+
+    骨架生成策略（三级递进）：
+        1. 从招标文件的"投标文件组成"章节提取（最贴合原文）
+        2. 从分析数据推断（无显式格式时）
+        3. 旧版硬编码骨架（兜底）
+    """
+    # 阶段1：三级递进获取骨架
+    skeleton = None
+
+    # 第一级：从招标文件提取
+    if section_index:
+        try:
+            from .catalog_skeleton_extractor import extract_enriched_skeleton_from_tender
+            skeleton = extract_enriched_skeleton_from_tender(section_index)
+            if skeleton:
+                logger.info("[catalog] 使用招标文件提取的骨架: %d 个节点", len(skeleton))
+        except Exception as exc:
+            logger.warning("[catalog] 招标文件骨架提取失败: %s", exc)
+
+    # 第二级：从分析数据推断
     if not skeleton:
-        logger.warning("[catalog] 骨架为空，返回空目录")
+        try:
+            from .catalog_inference import infer_skeleton_from_analysis
+            skeleton = infer_skeleton_from_analysis(analysis_data, section_index)
+            if skeleton:
+                logger.info("[catalog] 使用分析推断的骨架: %d 个节点", len(skeleton))
+        except Exception as exc:
+            logger.warning("[catalog] 分析推断骨架失败: %s", exc)
+
+    # 第三级：旧版硬编码骨架（兜底）
+    if not skeleton:
+        skeleton = build_base_skeleton(analysis_data)
+        if skeleton:
+            logger.info("[catalog] 使用旧版硬编码骨架: %d 个节点", len(skeleton))
+
+    if not skeleton:
+        logger.warning("[catalog] 骨架为空（三级全部失败），返回空目录")
         return []
     
     # 阶段2：合并评分维度
@@ -825,7 +863,16 @@ def _get_format_requirement_titles(analysis_data):
 
 def _build_package_aware_outline(task, analysis_result, filtered_analysis_data, classified_items, generation_level=None):
     """替换为新的合并引擎。"""
-    return build_catalog(filtered_analysis_data, classified_items)
+    # 尝试从 analysis_result 获取 section_index
+    section_index = None
+    if analysis_result and hasattr(analysis_result, 'analysis_data'):
+        try:
+            import json
+            payload = json.loads(analysis_result.analysis_data) if isinstance(analysis_result.analysis_data, str) else analysis_result.analysis_data or {}
+            section_index = payload.get('_section_index') if isinstance(payload, dict) else None
+        except Exception:
+            pass
+    return build_catalog(filtered_analysis_data, classified_items, section_index=section_index)
 
 
 

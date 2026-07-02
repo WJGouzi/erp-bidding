@@ -41,7 +41,7 @@ from .check_items import generate_check_items, assemble_check_items
 from ....infrastructure.table_classifier import classify_all_tables
 from ....infrastructure.document_parser import ContentBlock, Section
 from ....infrastructure.table_parser import parse_all_tables
-
+from .segmented import run_segmented_analysis as _run_segmented_analysis
 logger = logging.getLogger(__name__)
 
 
@@ -515,6 +515,13 @@ def start_analyze_v3(task, source_texts, adapter=None):
         sections = [temp_section]
         logger.info("[analysis_v3] sections 为空，使用 raw_text 构建临时章节")
 
+    # ── 构建章节索引 ──
+    section_index = []
+    try:
+        section_index = doc.build_section_index()
+        logger.info("[analysis_v3] 章节索引: %d 个节点", len(section_index))
+    except Exception as exc:
+        logger.warning("[analysis_v3] 章节索引构建异常: %s", exc)
     # ════════════════════════════════════════════
     #  第1.5层：格式要求提取（比选申请文件格式等）
     # ════════════════════════════════════════════
@@ -677,6 +684,19 @@ def start_analyze_v3(task, source_texts, adapter=None):
     # 注入章节标题到 analysis_data
     analysis_data["document_chapters"] = chapter_titles
 
+    # ── 分段分析注入 ──
+    if section_index:
+        try:
+            segment_results = _run_segmented_analysis(doc, section_index, raw_text)
+            if segment_results:
+                analysis_data["_segments"] = segment_results
+                from .assembler import assemble as _assemble_segments
+                comprehensive = _assemble_segments(segment_results, section_index)
+                if comprehensive:
+                    analysis_data["_comprehensive"] = comprehensive
+                    logger.info("[segmented] 已注入: %d segments", len(segment_results))
+        except Exception as exc:
+            logger.warning("[segmented] 分段分析异常(非阻断): %s", exc)
     # ── Validation Gate：校验数据质量（非阻断，仅日志） ──
     try:
         schema = AnalysisSchema.from_analysis_data(analysis_data)

@@ -88,6 +88,53 @@ class StructuredDocument:
         return result
 
 
+    def build_section_index(self) -> list:
+        """构建扁平章节索引。
+
+        递归遍历所有 section，输出扁平列表，每项包含：
+        - id: 章节唯一标识（如 "sec_1", "sec_2_1"）
+        - title: 章节标题
+        - level: 章节层级
+        - page_range: 页码范围
+        - parent_id: 父章节 id（根节点为 None）
+        - children_ids: 子章节 id 列表
+
+        Returns:
+            list[dict]: 扁平章节索引
+        """
+        index = []
+        counter = [0]  # 使用 list 实现闭包可变
+
+        def _walk(sections, parent_id=None):
+            for section in sections:
+                counter[0] += 1
+                sec_id = f"sec_{counter[0]}"
+                entry = {
+                    "id": sec_id,
+                    "title": section.title if section.title else "",
+                    "level": section.level,
+                    "page_range": section.page_range or [],
+                    "parent_id": parent_id,
+                    "children_ids": [],
+                }
+                # 先添加 entry 到 index，再处理 children
+                index.append(entry)
+                if section.children:
+                    child_ids = []
+                    _walk(section.children, parent_id=sec_id)
+                    for child in section.children:
+                        # 在 index 中找到这个 child
+                        for e in index:
+                            if e["title"] == child.title and e["parent_id"] == sec_id:
+                                child_ids.append(e["id"])
+                                break
+                    entry["children_ids"] = child_ids
+
+        _walk(self.sections)
+        # 后处理去重：同名+同级+同父节点 → 保留有内容的，删掉空的
+        index = _dedup_section_index(index)
+        return index
+
     @classmethod
     def from_dict(cls, data: dict) -> "StructuredDocument":
         doc = cls(data.get("file_name", ""), data.get("file_sha256", ""), data.get("parse_version", "1.0"))
@@ -196,6 +243,15 @@ def strip_heading_prefix(text: str) -> str:
     if not text:
         return text
     return _HEADING_PREFIX_RE.sub('', text)
+
+
+def _has_real_content(entry: dict) -> bool:
+    """判断章节节点是否有真实内容。"""
+    has_content = bool(entry.get("content"))
+    has_children = bool(entry.get("children_ids"))
+    page_range = entry.get("page_range", []) or []
+    has_pages = len(page_range) >= 2 and (page_range[1] or 0) > (page_range[0] or 0)
+    return has_content or has_children or has_pages
 
 
 class DocumentParser:
@@ -314,6 +370,24 @@ class DocumentParser:
                         break
                 
                 if text_heading > 0 and heading_level == 0:
+                    # ── 安检门1: 结尾标点拦截 ──
+                    # 以句号/分号/冒号结尾 → 判定为内容段落
+                    # 例外：纯中文编号标题（"一、项目概况。"）保留标题资格
+                    _is_pure_chinese_num = bool(
+                        re.match(r'^[一二三四五六七八九十]+[、，]', text)
+                        and len(text) <= 15
+                    )
+                    if text.endswith(('。', '；', '：', ';', ':')) and not _is_pure_chinese_num:
+                        block = ContentBlock(ContentBlock.TYPE_PARAGRAPH, text)
+                        current_section.content.append(block)
+                        continue
+
+                    # ── 安检门3: 标题过长拦截（≥40字 → 内容段落）──
+                    if len(text) >= 40:
+                        block = ContentBlock(ContentBlock.TYPE_PARAGRAPH, text)
+                        current_section.content.append(block)
+                        continue
+
                     # 跳过目录项（含 tab 或纯数字页码的短标题）
                     if "\t" in text:
                         # 来自 TOC 目录的条目，不作为章节
@@ -369,6 +443,9 @@ class DocumentParser:
         # 清理空的根章节
         doc.sections = [s for s in doc.sections if s.title != "__root__"]
         
+        # 安检门2: 事后扫描 — 移除连续 3+ 同级别空节点（列举列表误判）
+        _cleanup_fake_headings(doc.sections)
+
         # 如果没有检测到任何标题层级（纯文本），把内容放到一个根章节下
         if not doc.sections:
             root_content = []
@@ -491,6 +568,87 @@ class DocumentParser:
             section = Section(title="全文", level=1)
             section.content.append(ContentBlock(ContentBlock.TYPE_PARAGRAPH, text))
             doc.sections.append(section)
+
+    # ══════════════════════════════════════════════════════════════
+    #  安检门2: 事后扫描 — 移除连续 3+ 同级别空节点（列举列列表误判）
+    # ══════════════════════════════════════════════════════════════
+
+def _cleanup_fake_headings(sections_list):
+    """事后扫描：移除连续 3+ 同级别的空节点（列举列表误判）
+
+    同时处理顶层 sections 列表和子章节。
+    """
+    def _scan_siblings(children, parent=None):
+        if not children:
+            return
+        to_delete = []
+        i = 0
+        while i < len(children):
+            j = i
+            level = children[i].level if hasattr(children[i], 'level') else 0
+            while j < len(children):
+                c = children[j]
+                same_level = c.level == level if hasattr(c, 'level') else True
+                no_content = (len(getattr(c, 'content', []) or []) == 0
+                              and len(getattr(c, 'children', []) or []) == 0)
+                if same_level and no_content:
+                    j += 1
+                else:
+                    break
+            count = j - i
+            if count >= 3:
+                logger.debug("[parser] 安检门2: 将 %d 个连续空章节降级为内容", count)
+                for k in range(i, j):
+                    block = ContentBlock(ContentBlock.TYPE_PARAGRAPH,
+                                         getattr(children[k], 'title', ''))
+                    if parent is not None:
+                        parent.content.append(block)
+                to_delete.extend(range(i, j))
+                i = j
+            elif count == 0:
+                _scan_siblings(getattr(children[i], 'children', []) or [], children[i])
+                i += 1
+            else:
+                for k in range(i, j):
+                    _scan_siblings(getattr(children[k], 'children', []) or [], children[k])
+                i = j
+        for idx in reversed(to_delete):
+            del children[idx]
+
+    if sections_list:
+        _scan_siblings(sections_list)
+        for section in list(sections_list):
+            _scan_siblings(getattr(section, 'children', []) or [], section)
+
+def _dedup_section_index(index: list) -> list:
+    """去重：同名+同级+同父节点 → 保留有内容的版本，删除空洞节点。
+
+    key = (title, level, parent_id) 三元组。
+    防止同名但不同位置的真章节被误删。
+    """
+    content_keys = set()
+    content_ids = set()
+    for entry in index:
+        title = entry.get("title", "") or ""
+        if title and _has_real_content(entry):
+            key = (title, entry.get("level"), entry.get("parent_id"))
+            content_keys.add(key)
+            content_ids.add(entry.get("id"))
+
+    clean = []
+    seen_keys = set()
+    for entry in index:
+        title = entry.get("title", "") or ""
+        if not title:
+            clean.append(entry)
+            continue
+        key = (title, entry.get("level"), entry.get("parent_id"))
+        if key in content_keys:
+            if entry.get("id") in content_ids:
+                clean.append(entry)
+        else:
+            clean.append(entry)
+    return clean
 
     # ========== PDF 结构化解析 ==========
 

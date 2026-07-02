@@ -35,8 +35,12 @@ class ConfidenceLevel(Enum):
 
     @classmethod
     def from_value(cls, value: float) -> "ConfidenceLevel":
-        """根据数值返回最近的等级。"""
-        for level in reversed(cls.__members__.values()):
+        """根据数值返回最近的等级。
+
+        按值从高到低遍历，确保最高匹配先命中。
+        例如 value=0.95 应返回 EXACT(0.95) 而非 UNKNOWN(0.0)。
+        """
+        for level in sorted(cls.__members__.values(), key=lambda x: x.value, reverse=True):
             if value >= level.value:
                 return level
         return cls.UNKNOWN
