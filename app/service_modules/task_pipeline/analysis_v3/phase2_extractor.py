@@ -217,6 +217,55 @@ def _verify_statutory_items(sections, statutory_items):
     return results
 
 
+def _refine_statutory_with_section_context(statutory_results, qual_sections):
+    """根据资格章节上下文过滤统计项验证结果。
+    
+    如果某项统计关键词在全文匹配，但不在任何资格章节的文本中，
+    说明该条款只是被"顺便提到"而非文档的实际资格要求。
+    此时将 found 设为 False，提示需要人工确认。
+    """
+    # 合并所有资格章节的文本
+    qual_text = ""
+    for sec in qual_sections:
+        qual_text += "\n" + _section_to_text(sec)
+    
+    import re as _re
+    
+    for item in statutory_results:
+        if not item.get("found"):
+            continue
+            
+        # 从 requirement 中提取关键词重新在资格章节文本中搜索
+        req = item.get("requirement", "")
+        # 提取关键词（取前 15 个非标点字符作为搜索 key）
+        search_key = req[:30].strip()
+        if not search_key:
+            continue
+        
+        # 去掉括号内容（如"（营业执照/法人证书/执业许可证）"）增强匹配
+        clean_key = _re.sub(r'[（(][^）)]*[）)]', '', search_key).strip()
+        if not clean_key:
+            clean_key = search_key[:15]
+        
+        # 在资格章节文本中搜索
+        pos = qual_text.find(clean_key[:15])
+        if pos < 0:
+            # 尝试用 requirement 中的第一个短关键词
+            for kw in _extract_keyword_hints(req):
+                if kw and len(kw) >= 4:
+                    pos2 = qual_text.find(kw)
+                    if pos2 >= 0:
+                        pos = pos2
+                        break
+        
+        if pos < 0:
+            # 不在资格章节中 → 标记为需要关注
+            item["found"] = False
+            item["status"] = "attention"
+    
+    return statutory_results
+
+
 # ════════════════════════════════════════════
 #  第2步：章节定位 v2（评分机制）
 # ════════════════════════════════════════════
@@ -235,9 +284,10 @@ def _score_section(node):
         ("资格要求", 10), ("供应商资格", 10), ("投标人资格", 10),
         ("资格审查", 10), ("资格性审查", 10), ("申请人资格", 10),
         # 中置信度（5-7分）
-        ("投标人须知", 7), ("供应商须知", 7), ("比选须知", 7),
-        ("磋商须知", 7), ("谈判须知", 7),
         ("资质要求", 6), ("供应商条件", 6),
+        # 低置信度（2-3分）- 须知类章节为通用章节，非资格专属
+        ("投标人须知", 3), ("供应商须知", 3), ("比选须知", 3),
+        ("磋商须知", 3), ("谈判须知", 3),
         # 章节号信号
         ("第四章", 5), ("第五章", 5),
         # 低置信度（2-3分）
@@ -252,6 +302,9 @@ def _score_section(node):
         "目录", "TOC", "前附表", "合同模板", "合同草案",
         "响应文件格式", "评标办法", "评分", "评分标准",
         "磋商程序", "谈判程序", "评审程序",
+        # 以下章节内容混杂，并非资格专属，降低优先级
+        "采购合同", "合同文本", "合同条款",
+        "供应商须知附表", "投标人须知附表",
     ]
     for ns in noise_signals:
         if ns in title:
@@ -425,6 +478,49 @@ def _extract_requirements_from_sections(qual_sections, signals):
     results = {"qualifications": [], "disqualifications": [], "starred": []}
 
     seen_texts = set()
+    import re
+
+    # 资格类文本模式特征：包含明确的要求表述
+    _QUAL_SENTENCE_PATTERNS = [
+        "具有", "应当", "必须", "需提供", "应提供", "需要提供",
+        "须具有", "应具备", "需具备", "应当具备",
+        "要求", "条件", "资格",
+        "参加.*采购活动.*应",
+        "投标人.*需", "供应商.*需",
+        "提供.*证明", "提供.*材料", "提供.*文件",
+        "在经营活动中", "参加政府采购活动",
+        # 补充：常见的资格表述
+        "缴纳税收", "社会保障", "良好记录",
+        "无行贿", "行贿犯罪", "信用中国",
+        "采购活动前", "重大违法记录",
+        "不允许联合体", "本项目允许",
+        "具备.*能力", "依法缴纳", "须提供",
+        "ccgp-sichuan",
+    ]
+    _QUAL_RE_PATTERN = re.compile("|".join(_QUAL_SENTENCE_PATTERNS))
+
+    # 明显不是资格要求的文本模式（程序性、合同性、说明性内容）
+    _NOISE_PATTERNS = [
+        "采购公告", "竞争性谈判邀请", "磋商邀请",
+        "合同签订", "合同备案", "合同公告",
+        "合同履行", "合同验收",
+        "付款", "交货", "交付", "验收",
+        "响应文件截止", "开启时间", "提交方式",
+        "注册登录", "获取采购文件", "编制投标",
+        "技术支持", "CA及签章", "采购平台",
+        "本谈判文件", "本磋商文件", "本招标文件",
+        "报价货币", "计量单位", "知识产权",
+        "询问", "质疑", "投诉",
+        "ccgp-sichuan", "ccgp-sichuan",
+        "联系电话", "联系人", "邮编",
+        "下载", "上传", "回执单",
+        "系统操作", "交易系统",
+        "联合体.*应当.*共同", "联合体.*应当.*向",
+        "联合体.*均应当具备", "联合体各方.*不得",
+        "两个以上供应商可以组成",
+        "适用于", "如下", "符合下列",
+    ]
+    _NOISE_RE_PATTERN = re.compile("|".join(_NOISE_PATTERNS))
 
     for line in all_text.split("\n"):
         line = line.strip()
@@ -434,9 +530,28 @@ def _extract_requirements_from_sections(qual_sections, signals):
             continue
         seen_texts.add(line)
 
+        # 过滤：程序性/合同性/说明性文本（非资格要求）
+        if _NOISE_RE_PATTERN.search(line):
+            continue
+
+        # 过滤：纯数字行、编号行（无实质内容）
+        if re.match(r'^[\d\s\.,;:、\(\)（）\[\]【】\-]+$', line):
+            continue
+        # 过滤：章节标题行（如"第X章 XXX"、"第三章  供应商资格条件要求"）
+        if re.match(r'^第[一二三四五六七八九十零\d]+[章节篇]', line):
+            continue
+
         # 检测分类
         category = _classify_by_signal(line, signals)
+        # 无分类时：如果有资格特征短语则归为"通用资格要求"，否则跳过
         if not category:
+            if _QUAL_RE_PATTERN.search(line):
+                category = "通用资格要求"
+            else:
+                continue
+
+        # 额外过滤：没有资格特征短语的短文本（可能是误匹配）
+        if len(line) < 15 and not _QUAL_RE_PATTERN.search(line):
             continue
 
         entry = {
@@ -490,14 +605,41 @@ def _fallback_scan(sections, signals):
 # ════════════════════════════════════════════
 
 def _deduplicate_by_text(items):
-    """按 requirement 文本去重。"""
+    """按 requirement 文本去重（去除编号前缀后进行模糊匹配）。"""
+    import re as _re
+    
+    def _normalize_key(text):
+        """去除编号前缀和首尾空白，提取核心语义片段。"""
+        t = text.strip()
+        # 去除编号前缀：如 "1." "1、" "（1）" "一、" "一." "7.1" "(1)"
+        t = _re.sub(r'^[\d一二三四五六七八九十]+[、\.．）\)\s]*', '', t)
+        t = _re.sub(r'^[（(][\d一二三四五六七八九十]+[）)]\s*', '', t)
+        # 取前 80 个有效字符
+        return t[:80]
+    
     seen = set()
     result = []
     for item in items:
-        key = item.get("requirement", "")[:100]
-        if key not in seen:
-            seen.add(key)
+        raw = item.get("requirement", "") or ""
+        key = _normalize_key(raw)
+        if not key:
+            continue
+        # 双重去重：标准化后去重 + 前缀去重（避免 "6、" 和 "7.1" 实质相同的内容重复出现）
+        # 取前 50 字符作为核心语义指纹
+        fingerprint = _re.sub(r'[^一-鿿\w]', '', key)[:50]
+        if fingerprint not in seen:
+            seen.add(fingerprint)
             result.append(item)
+        else:
+            # 如果匹配到相似项，保留更短的（更原始的表达）
+            for i, existing in enumerate(result):
+                existing_raw = existing.get("requirement", "") or ""
+                existing_key = _normalize_key(existing_raw)
+                existing_fp = _re.sub(r'[^一-鿿\w]', '', existing_key)[:50]
+                if existing_fp == fingerprint and len(raw) < len(existing_raw):
+                    result[i] = item
+                    break
+    
     return result
 
 
@@ -553,8 +695,13 @@ def scan_eligibility_v2(sections):
             "starred": fallback_starred,
         }
 
-    # 6. 合并 statutory + dynamic
-    logger.info("[phase2_extractor] 第4步: 合并去重")
+    # 6. 用资格章节上下文验证 statutory 结果
+    if qual_sections and statutory_results:
+        logger.info("[phase2_extractor] 第4步: 上下文验证 %d 项法规要求", len(statutory_results))
+        statutory_results = _refine_statutory_with_section_context(statutory_results, qual_sections)
+    
+    # 7. 合并 statutory + dynamic
+    logger.info("[phase2_extractor] 第5步: 合并去重")
     all_quals = statutory_results + dynamic["qualifications"]
     all_quals = _deduplicate_by_text(all_quals)
 

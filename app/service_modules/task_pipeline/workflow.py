@@ -280,7 +280,6 @@ def create_derived_task(
     use_knowledge_base=False,
     use_product_library=False,
     catalog_generation_level=None,
-    word_count_level=None,
 ):
     """基于已有任务复用上游成果创建派生任务。"""
     logger.info("[task] 创建派生任务 source=%s name=%s", source_task_id, task_name)
@@ -310,7 +309,6 @@ def create_derived_task(
             use_knowledge_base=bool(use_knowledge_base),
             use_product_library=bool(use_product_library),
             catalog_generation_level=catalog_generation_level,
-            word_count_level=word_count_level,
         )
         db.session.add(task)
         log_operation(

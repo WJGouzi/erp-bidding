@@ -69,7 +69,7 @@ KEY_MAP = OrderedDict([
 
 RULES = [
     # ── 项目名称/编号 ──
-    ("project_code", r"项目编号[：:]\s*([A-Z0-9]+[A-Z0-9\-]+[A-Z0-9])", 1, "identity"),
+    ("project_code", r"项目编号[：:]\s*([^\s，。,\n】]+)", 1, "identity"),
     ("project_code", r"(?:采购|比选)编号[：:]\s*([\w\-]+)", 2, "identity"),
     ("project_name", r"项目名称[：:]\s*(.+?)(?:\s{2,}|$|（|\()", 1, "identity"),
     ("project_name", r"项目名称[：:]\s*(.+?)(?:。|；|\n|$)", 2, "identity"),
@@ -250,22 +250,22 @@ def _build_metadata(rule_result):
         "budget": {"total": 0, "note": "", "packages": {}},
         "key_dates": {
             "bid_deadline": "", "bid_opening": "",
-            "bid_validity_days": 90,
+            "bid_validity_days": "",
             "file_purchase_start": "", "file_purchase_end": "",
         },
         "extra": {
-            "file_purchase_price": 0,
+            "file_purchase_price": "",
             "bid_submission_location": "",
             "special_declaration": "",
-            "agency_fee": 0,
+            "agency_fee": "",
             "winner_count_text": "",
             "acceptance_standard": "",
             "pricing_rule": "",
-            "submission_copies": 0,
-            "service_period": 0,
+            "submission_copies": "",
+            "service_period": "",
             "delivery_location": "",
             "payment_terms": "",
-            "warranty_period": 0,
+            "warranty_period": "",
             "submission_docs_summary": "",
             "submission_copy_detail": "",
             "pkg_special_qual": "",
@@ -274,7 +274,7 @@ def _build_metadata(rule_result):
         "allow_consortium": False,
         "allow_subcontracting": False,
         "bid_security_required": False,
-        "performance_security_pct": 0,
+        "performance_security_pct": "",
         "package_count": 0,
         "document_type": {"value": "TENDER", "confidence": "low", "source": "default"},
         "tables": {},
@@ -380,7 +380,43 @@ def extract_metadata(doc_text, file_name="", table_results=None, sections=None):
         except Exception as exc:
             logger.warning("[phase1] 章节提取异常: %s", exc)
 
+    # 统一标准化：所有展示字段用 string，计算字段保留数字
+    metadata = _normalize_metadata_types(metadata)
     return metadata
+
+
+# 纯展示字段用 string，计算字段才保留数字
+# 预算金额(budget.total)和包数(package_count)需要计算，保留数字
+_DISPLAY_ONLY_STRING = True
+
+def _normalize_display_types(obj):
+    """将纯展示字段统一转换为 string，计算字段保留数字。"""
+    if isinstance(obj, dict):
+        result = {}
+        for k, v in obj.items():
+            if k in ("total", "package_count"):
+                # 计算字段：保持原类型（int/float）
+                result[k] = v
+            elif isinstance(v, (int, float)) and not isinstance(v, bool):
+                # 展示字段的数字 → string
+                result[k] = str(v)
+            elif isinstance(v, (dict, list)):
+                result[k] = _normalize_display_types(v)
+            else:
+                result[k] = v
+        return result
+    elif isinstance(obj, list):
+        return [_normalize_display_types(item) for item in obj]
+    return obj
+
+
+def _normalize_metadata_types(metadata):
+    """遍历 metadata 所有层级，将展示字段的数字转为 string。"""
+    result = _normalize_display_types(metadata)
+    # 确保 extra 始终为 dict（上游可能将其误设为 string）
+    if isinstance(result, dict) and not isinstance(result.get("extra"), dict):
+        result["extra"] = {}
+    return result
 
 
 def classify_document(file_name, doc_text):

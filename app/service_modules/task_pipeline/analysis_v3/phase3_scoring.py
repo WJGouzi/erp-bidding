@@ -324,12 +324,62 @@ def _find_tables_in_section(section):
 
 
 def _find_col_index(headers, candidates):
-    """在表头行中找匹配的列索引。"""
+    """在表头行中找匹配的列索引。
+
+    优先精确匹配 → 次优候选词匹配 → 子串匹配。
+    复合表头（如"评分因素及权重"）按主类型优先：含"因素""项"→名称列，含"分值""分数"→分值列。
+    """
+    NAME_KEYWORDS = {"评分因素", "评分项", "评审因素", "评审项目", "评审内容", "评分内容", "评分项目"}
+    SCORE_KEYWORDS = {"分值", "分数", "权重", "标准分值", "标准分数", "权值", "标准权重"}
+    CRITERIA_KEYWORDS = {"评分标准", "评审标准", "评审细则", "评分细则", "评审准则", "评标标准", "评分规则"}
+    RANK_KEYWORDS = {"序号", "排名", "顺序", "编号"}
+
+    # 判断表头的主类型
+    def _header_type(h):
+        if any(kw in h for kw in NAME_KEYWORDS):
+            return "name"
+        if any(kw in h for kw in SCORE_KEYWORDS):
+            return "score"
+        if any(kw in h for kw in CRITERIA_KEYWORDS):
+            return "criteria"
+        if any(kw in h for kw in RANK_KEYWORDS):
+            return "rank"
+        return None
+
+    # 第一遍：精确（或近精确）匹配
+    for i, h in enumerate(headers):
+        h_clean = h.strip()
+        for c in candidates:
+            if h_clean == c or h_clean.startswith(c + "（") or h_clean.startswith(c + "("):
+                return i
+
+    # 第二遍：按主类型匹配
+    target_type = None
+    first_candidate = candidates[0] if candidates else ""
+    if first_candidate in {"评分因素", "评分项", "评审因素", "评审项目", "评审内容", "评分内容", "评分项目"}:
+        target_type = "name"
+    elif first_candidate in {"分值", "分数", "权重", "标准分值", "标准分数", "权值", "标准权重"}:
+        target_type = "score"
+    elif first_candidate in {"评分标准", "评审标准", "评审细则", "评分细则", "评审准则", "评标标准", "评分规则"}:
+        target_type = "criteria"
+    elif first_candidate in {"序号", "排名", "顺序", "编号"}:
+        target_type = "rank"
+
+    if target_type:
+        # 优先返回匹配目标类型的表头
+        for i, h in enumerate(headers):
+            h_clean = h.strip()
+            h_type = _header_type(h_clean)
+            if h_type == target_type:
+                return i
+
+    # 第三遍：任意子串匹配（兜底）
     for i, h in enumerate(headers):
         h_clean = h.strip()
         for c in candidates:
             if c in h_clean:
                 return i
+
     return None
 
 
@@ -500,10 +550,129 @@ def _parse_text_table(lines):
 #  评分表解析
 # ══════════════════════════════════════════
 
+def _extract_weight_from_name(name):
+    """从评分因素名称中提取权重百分比（如"项目整体方案60%"→60）。
+
+    Returns:
+        int|None: 权重值（百分制数字），未找到返回 None
+    """
+    m = re.search(r"(\d+)\s*%", name)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def _extract_child_name(score_cell_text):
+    """从分值单元格提取子维度名称。
+
+    "服务方案\n20分" → "服务方案"
+    "质量保障体系\n20分" → "质量保障体系"
+    "30分" → ""（纯分值无名称时返回空）
+    """
+    text = score_cell_text.strip().replace("\n", "\n")
+    # 去掉末尾的分数（如 "20分" "20 分"）
+    text = re.sub(r"[\s]*\d+[\s]*分$", "", text).strip()
+    # 去掉换行符
+    text = text.replace("\n", " ").replace("\r", "").strip()
+    return text
+
+
+def _group_scoring_rows(rows, name_idx, score_idx, criteria_idx, rank_idx):
+    """将评分表行按名称分组，检测父子层级。
+
+    当同一名称在连续多行出现时，这些行是该名称的子维度。
+    例如：
+      项目整体方案60% | 服务方案\n20分
+      项目整体方案60% | 质量保障体系\n20分
+      项目整体方案60% | 应急措施\n20分
+    → parent: 项目整体方案60%（60分）, children: [服务方案20, 质量保障体系20, 应急措施20]
+    """
+    from collections import OrderedDict
+
+    # 第一遍：按名称分组
+    groups = OrderedDict()
+    for row in rows:
+        if len(row) <= max(name_idx, score_idx) if score_idx else len(row) <= 1:
+            continue
+        name = row[name_idx].strip() if name_idx < len(row) else ""
+        if not name:
+            continue
+        if name not in groups:
+            groups[name] = []
+        groups[name].append(row)
+
+    dimensions = []
+
+    for name, group_rows in groups.items():
+        if len(group_rows) == 1:
+            # 单行 → 普通维度
+            row = group_rows[0]
+            score = _extract_number(row[score_idx]) if score_idx < len(row) else 0
+            criteria = row[criteria_idx].strip() if criteria_idx is not None and criteria_idx < len(row) else ""
+            if score == 0:
+                continue
+            score_type = _detect_score_type(name, criteria)
+            sub_dims = _extract_sub_dimensions(criteria)
+            dim = {
+                "name": name[:60],
+                "score": int(score) if score == int(score) else score,
+                "type": score_type,
+            }
+            if sub_dims:
+                dim["sub_dimensions"] = sub_dims[:5]
+            dimensions.append(dim)
+        else:
+            # 多行 → 父子维度
+            # 父级分数：从权重百分比转换（如"60%"→60分）
+            weight = _extract_weight_from_name(name)
+            parent_score = weight if weight else 0
+            if parent_score == 0:
+                m = re.search(r"(\d+)", name)
+                if m:
+                    parent_score = int(m.group(1))
+
+            # 子维度
+            children = []
+            actual_total = 0
+            for row in group_rows:
+                child_score = _extract_number(row[score_idx]) if score_idx < len(row) else 0
+                child_criteria = row[criteria_idx].strip() if criteria_idx is not None and criteria_idx < len(row) else ""
+                if child_score == 0:
+                    continue
+                child_name = _extract_child_name(row[score_idx]) if score_idx < len(row) else ""
+                if not child_name:
+                    child_name = "子项" + str(len(children) + 1)
+                actual_total += child_score
+                children.append({
+                    "name": child_name[:40],
+                    "score": int(child_score) if child_score == int(child_score) else child_score,
+                    "criteria": child_criteria[:100],
+                })
+
+            if not children:
+                continue
+
+            if parent_score == 0 or abs(parent_score - actual_total) > 10:
+                # 权重与子项之和偏差大时，以子项之和为准
+                parent_score = actual_total
+
+            score_type = _detect_score_type(name, "")
+            dim = {
+                "name": name[:60],
+                "score": int(parent_score) if parent_score == int(parent_score) else parent_score,
+                "type": score_type,
+                "children": children,
+            }
+            dimensions.append(dim)
+
+    return dimensions
+
+
 def parse_scoring_table(table_block):
     """从 ContentBlock（type=table）中解析评分维度。
 
     支持灵活的表头匹配，不要求固定表头顺序。
+    自动检测父子层级（同一名称出现多行→子维度分组）。
     """
     headers = getattr(table_block, "headers", []) or []
     rows = getattr(table_block, "rows", []) or []
@@ -528,37 +697,7 @@ def parse_scoring_table(table_block):
         # 没有分值列，尝试用最后一列
         score_idx = len(headers) - 1
 
-    dimensions = []
-
-    for row in rows:
-        if len(row) <= max(name_idx, score_idx) if score_idx else len(row) <= 1:
-            continue
-
-        name = row[name_idx].strip() if name_idx < len(row) else ""
-        if not name:
-            continue
-
-        score = _extract_number(row[score_idx]) if score_idx < len(row) else 0
-        if score == 0:
-            continue
-
-        criteria = row[criteria_idx].strip() if criteria_idx is not None and criteria_idx < len(row) else ""
-
-        score_type = _detect_score_type(name, criteria)
-        sub_dims = _extract_sub_dimensions(criteria)
-
-        dim = {
-            "name": name[:60],
-            "score": int(score) if score == int(score) else score,
-            "type": score_type,
-        }
-
-        if sub_dims:
-            dim["sub_dimensions"] = sub_dims[:5]
-
-        dimensions.append(dim)
-
-    return dimensions
+    return _group_scoring_rows(rows, name_idx, score_idx, criteria_idx, rank_idx)
 
 
 def _parse_scoring_from_text(section_text):
@@ -673,30 +812,42 @@ def extract_scoring(sections):
             dimensions.extend(dims)
 
     section_text = _section_to_text(scoring_section)
-    text_tables = _detect_text_tables(section_text)
-    for text_table in text_tables:
-        fake_headers = text_table["headers"]
-        from collections import namedtuple
-        FakeBlock = namedtuple("FakeBlock", ["headers", "rows"])
-        fake_block = FakeBlock(headers=fake_headers, rows=text_table["rows"])
-        dims = parse_scoring_table(fake_block)
-        if dims:
-            for d in dims:
-                if not any(x["name"] == d["name"] for x in dimensions):
-                    dimensions.append(d)
+
+    # 原生表格已产出评分维度时，跳过文本表格检测（避免重复解析评分标准列）
+    if not dimensions:
+        text_tables = _detect_text_tables(section_text)
+        for text_table in text_tables:
+            fake_headers = text_table["headers"]
+            from collections import namedtuple
+            FakeBlock = namedtuple("FakeBlock", ["headers", "rows"])
+            fake_block = FakeBlock(headers=fake_headers, rows=text_table["rows"])
+            dims = parse_scoring_table(fake_block)
+            if dims:
+                dimensions.extend(dims)
 
     if not dimensions:
         dimensions = _parse_scoring_from_text(section_text)
 
     method = _detect_scoring_method(section_text)
 
-    seen_names = set()
-    unique_dims = []
+    # 去重：有 children 的维度优先保留（保留层级结构），同名平铺维度去重
+    seen_names = {}
     for d in dimensions:
-        if d["name"] not in seen_names:
-            seen_names.add(d["name"])
-            unique_dims.append(d)
+        name = d["name"]
+        if name in seen_names:
+            existing = seen_names[name]
+            # 已有 children 的保留，新来的如果是平铺则丢弃
+            if existing.get("children"):
+                continue
+            # 新来的有 children，替换旧的
+            if d.get("children"):
+                seen_names[name] = d
+                continue
+            # 两个都平铺，保留第一个
+            continue
+        seen_names[name] = d
 
+    unique_dims = list(seen_names.values())
     total_score = sum(d.get("score", 0) for d in unique_dims)
     return {"method": method, "total_score": total_score, "dimensions": unique_dims}
 

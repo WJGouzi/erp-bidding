@@ -19,7 +19,7 @@ from .common import log_operation
 
 logger = logging.getLogger(__name__)
 
-PARSE_VERSION = "1.0"
+PARSE_VERSION = "2.0"
 
 
 def _get_chroma_client() -> ChromaDBClient:

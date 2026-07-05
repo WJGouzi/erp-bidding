@@ -410,11 +410,24 @@ def start_analyze_v3(task, source_texts, adapter=None):
                     "[analysis_v3] FileStorage 不存在: file_id=%s",
                     shared_resource.tender_file_id)
             elif file_record.storage_provider in ("CHROMA", "CHROMA_MANAGED"):
-                # CHROMA 存储：直接从解析缓存重建文档
+                # CHROMA 存储：优先从解析缓存重建文档
                 doc = _get_structured_doc_from_cache(file_record)
                 if not doc:
-                    logger.warning(
-                        "[analysis_v3] 缓存重建失败: file_id=%s", file_record.id)
+                    # 缓存不存在或已失效：回退到原始字节解析
+                    logger.info("[analysis_v3] 缓存不可用，回退到原始解析: file_id=%s", file_record.id)
+                    payload = _get_file_payload(file_record)
+                    if payload:
+                        try:
+                            doc = parser.parse_structured(
+                                file_record.file_name, payload)
+                            logger.info("[analysis_v3] 回退解析成功: file=%s", file_record.file_name)
+                        except Exception as exc2:
+                            logger.warning("[analysis_v3] 回退解析失败: %s", exc2)
+                    else:
+                        logger.warning(
+                            "[analysis_v3] 无法读取文件内容: file_id=%s, storage=%s, local=%s",
+                            file_record.id, file_record.storage_provider,
+                            file_record.local_path)
             else:
                 # MINIO/LOCAL：读取文件原始字节后解析
                 payload = _get_file_payload(file_record)
@@ -469,6 +482,15 @@ def start_analyze_v3(task, source_texts, adapter=None):
         doc_tables = getattr(doc, 'tables', []) or []
         if doc_tables:
             classification = classify_all_tables(doc_tables)
+            # 提取表格周围的段落文本
+            try:
+                from ....infrastructure.table_classifier import extract_table_surroundings
+                doc_body = getattr(doc, 'element', None)
+                if doc_body and hasattr(doc_body, 'body'):
+                    surroundings = extract_table_surroundings(doc_body.body)
+                    classification["_table_surroundings"] = surroundings
+            except Exception as exc:
+                logger.warning("[analysis_v3] 提取表格周围段落异常: %s", exc)
             if table_results is None:
                 table_results = {}
             table_results["_classification"] = classification
@@ -664,13 +686,18 @@ def start_analyze_v3(task, source_texts, adapter=None):
     # ── 收集文档章节标题（用于后续目录生成） ──
     chapter_titles = []
     seen_titles = set()
+    _CONTRACT_KW = ["合同模板", "合同条款", "合同样本", "合同范本", "合同草案", "合同（草案）", "合同主要条款", "合同通用条款", "合同专用条款"]
     for sec in sections:
         title = _strip_heading_prefix(getattr(sec, "title", "") or "")
+        raw_title = getattr(sec, "title", "") or ""
+        # 跳过合同模板章节（生成标书不需要）
+        if any(kw in raw_title for kw in _CONTRACT_KW):
+            continue
         # 只收集一级章节（第一章、一、等）
         if title and len(title) < 50 and title not in seen_titles:
             level = getattr(sec, "level", 0)
             if level <= 2:  # 一级或二级标题
-                chapter_titles.append(getattr(sec, "title", "") or "")  # 保留原文
+                chapter_titles.append(raw_title)  # 保留原文
                 seen_titles.add(title)
     
     analysis_data = assemble_v3_analysis_data(
@@ -691,7 +718,10 @@ def start_analyze_v3(task, source_texts, adapter=None):
             if segment_results:
                 analysis_data["_segments"] = segment_results
                 from .assembler import assemble as _assemble_segments
-                comprehensive = _assemble_segments(segment_results, section_index)
+                # 过滤 section_index 中的合同模板章节（不传给汇编器）
+                _si_filtered = [s for s in section_index 
+                                if not any(kw in (s.get("title","") or "") for kw in ["合同模板","合同条款","合同样本","合同范本"])]
+                comprehensive = _assemble_segments(segment_results, _si_filtered)
                 if comprehensive:
                     analysis_data["_comprehensive"] = comprehensive
                     logger.info("[segmented] 已注入: %d segments", len(segment_results))
@@ -756,9 +786,9 @@ def _extract_package_names(raw_text, package_nos):
     """从 raw_text 中提取各包的名称。"""
     if not package_nos or not raw_text:
         return {}
-    # 匹配 "第X包：名称" 或 "第X包:名称" 模式
+    # 匹配 "第X包：名称" 或 "采购包X：名称" 模式
     pkg_names = {}
-    for m in re.finditer(r"第(\d+)包[：:]\s*([^；;。\n]+)", raw_text):
+    for m in re.finditer(r"(?:第|采购包)(\d+)包[：:]\s*([^；;。]+)", raw_text):
         pkg_no = int(m.group(1))
         name = m.group(2).strip()
         if pkg_no in package_nos:
@@ -793,10 +823,11 @@ def _get_file_payload(file_record):
     return None
 
 
-def _get_structured_doc_from_cache(file_record):
+def _get_structured_doc_from_cache(file_record, current_version="2.0"):
     """从 doc_parse_cache 中重建结构化文档。
     
     适用于 storage_provider == CHROMA 的场景。
+    如果缓存版本低于 current_version，返回 None 触发重新解析。
     """
     if not file_record:
         return None
@@ -806,6 +837,24 @@ def _get_structured_doc_from_cache(file_record):
 
     cached = DocParseCache.query.filter_by(file_id=file_record.id).first()
     if cached and cached.parsed_json:
+        # 检查缓存版本，旧版本降级使用
+        if cached.parse_version and cached.parse_version < current_version:
+            logger.warning("[analysis_v3] 缓存版本(%s)低于当前(%s)，file_id=%s，尝试重新解析",
+                           cached.parse_version, current_version, file_record.id)
+            # 尝试从原始字节重新解析
+            _payload = _get_file_payload(file_record)
+            if _payload:
+                try:
+                    from ....infrastructure.document_parser import DocumentParser as _Parser
+                    _p = _Parser()
+                    _new_doc = _p.parse_structured(file_record.file_name, _payload)
+                    if _new_doc and _new_doc.sections:
+                        logger.info("[analysis_v3] 重新解析成功: file=%s", file_record.file_name)
+                        return _new_doc
+                except Exception as _reparse_exc:
+                    logger.warning("[analysis_v3] 重新解析失败: %s", _reparse_exc)
+            # 无法重新解析，降级使用旧缓存
+            logger.warning("[analysis_v3] 无法重新解析，降级使用旧缓存: file_id=%s", file_record.id)
         try:
             data = json.loads(cached.parsed_json.decode("utf-8"))
             return StructuredDocument.from_dict(data)

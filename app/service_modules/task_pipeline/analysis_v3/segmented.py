@@ -103,6 +103,10 @@ def get_level2_segments(section_index):
             existing_children = len(existing.get("children_ids", []))
             new_children = len(e.get("children_ids", []))
             if new_children > existing_children:
+                # 额外检查：新版本如果出现在后面，更可能是正文而非目录引用
+                chapter_groups[ch_key] = e
+            elif new_children == existing_children:
+                # 子节点数相同时，保留靠后的版本（更可能是正文）
                 chapter_groups[ch_key] = e
     
     chapters = list(chapter_groups.values())
@@ -275,9 +279,19 @@ def run_segmented_analysis(doc, section_index, full_text):
         logger.info("[segmented] 无可用分段，跳过")
         return []
 
-    logger.info("[segmented] 开始分段分析: %d segments", len(segments))
+    # 排除合同模板章节（不分析、不生成标书）
+    _CONTRACT_KW = ["合同模板", "合同条款", "合同样本", "合同范本"]
+    filtered_segments = [
+        s for s in segments
+        if not any(kw in (s.get("title", "") or "") for kw in _CONTRACT_KW)
+    ]
+    skipped = len(segments) - len(filtered_segments)
+    if skipped:
+        logger.info("[segmented] 跳过 %d 个合同模板章节", skipped)
+
+    logger.info("[segmented] 开始分段分析: %d segments", len(filtered_segments))
     results = []
-    for seg in segments:
+    for seg in filtered_segments:
         try:
             result = analyze_single_segment(doc, seg, section_index, full_text)
             results.append(result)

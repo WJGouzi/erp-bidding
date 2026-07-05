@@ -124,10 +124,13 @@ def _save_v3_check_items(shared_resource_id, check_items):
     db.session.flush()
     
     for i, item in enumerate(check_items):
+        if not isinstance(item, dict):
+            logger.warning("[analysis] 核对项异常跳过: index=%s, type=%s", i, type(item).__name__)
+            continue
         record = BiddingCheckItem(
             shared_resource_id=shared_resource_id,
             check_key=item.get("check_key", f"v3_item_{i}"),
-            check_label=item.get("content") or item.get("check_label", "核对项"),
+            check_label=(item.get("content") or item.get("check_label", "核对项"))[:255],
             check_value=item.get("prep_guide") or item.get("check_value", ""),
             confirmed_flag=False,
             sort_no=i + 1,
@@ -177,6 +180,12 @@ def _complete_analysis(task_id, execution_id=None):
         v3_result = _start_v3_llm_free(task, source_texts)
         if v3_result and v3_result.get("analysis_data"):
             v3_data = v3_result["analysis_data"]
+            # 注入 format_requirements（v3 返回在顶层，需合并到 analysis_data）
+            fmt_req = v3_result.get("format_requirements")
+            if fmt_req and isinstance(fmt_req, dict) and fmt_req.get("required_sections"):
+                v3_data["format_requirements"] = fmt_req
+                logger.info("[analysis] 注入格式要求到 analysis_data: %d sections",
+                           len(fmt_req["required_sections"]))
             result.analysis_data = json.dumps(v3_data, ensure_ascii=False)
             # 回填旧版本兼容字段（供前端旧接口使用）
             meta = v3_data.get("metadata", {})
@@ -204,11 +213,27 @@ def _complete_analysis(task_id, execution_id=None):
             else:
                 budget_total = 0
             pkg_count = meta.get("package_count", 0)
-            deadline = meta.get("key_dates", {}).get("bid_deadline", "")
+            key_dates_val = meta.get("key_dates", {})
+            if isinstance(key_dates_val, dict):
+                deadline = key_dates_val.get("bid_deadline", "")
+            else:
+                deadline = ""
             
             result.overview = f"项目: {project_name} (编号: {project_code})"
+            # 注入 bidder_notice，供封面/目录等下游使用
+            if project_name or project_code or purchaser_name or agent_name:
+                bidder_notice_entry = v3_data.setdefault("bidder_notice", {})
+                if project_name:
+                    bidder_notice_entry["project_name"] = project_name
+                if project_code:
+                    bidder_notice_entry["project_no"] = project_code
+                if purchaser_name:
+                    bidder_notice_entry["purchaser"] = purchaser_name
+                if agent_name:
+                    bidder_notice_entry["agent"] = agent_name
+                # 重新序列化 analysis_data
+                result.analysis_data = json.dumps(v3_data, ensure_ascii=False)
             if budget_total:
-                
                 if budget_total % 10000 == 0:
                     result.overview += f" | 预算: {budget_total//10000}万元"
                 else:
@@ -238,6 +263,9 @@ def _complete_analysis(task_id, execution_id=None):
             biz_parts = []
             meta = v3_data.get("metadata", {})
             extra = meta.get("extra", {})
+            if not isinstance(extra, dict):
+                logger.warning("[analysis] meta.extra 类型异常: %s, value=%s", type(extra).__name__, extra)
+                extra = {}
             # 全部 extra 字段到中文标签的映射（按展示顺序）
             _EXTRA_LABELS = [
                 ("payment_terms", "付款方式"),
@@ -262,8 +290,15 @@ def _complete_analysis(task_id, execution_id=None):
                 if val:
                     if field_key == "agency_fee":
                         biz_parts.append(f"{field_label}：{val}元")
-                    elif field_key == "service_period" and isinstance(val, (int, float)) and val < 100:
-                        biz_parts.append(f"{field_label}：{val}天")
+                    elif field_key == "service_period":
+                        try:
+                            period_val = int(val)
+                            if period_val < 100:
+                                biz_parts.append(f"{field_label}：{period_val}天")
+                            else:
+                                biz_parts.append(f"{field_label}：{val}")
+                        except (ValueError, TypeError):
+                            biz_parts.append(f"{field_label}：{val}")
                     else:
                         biz_parts.append(f"{field_label}：{val}")
             # 如果 section extractor 有扁平原文，也追加
@@ -278,6 +313,8 @@ def _complete_analysis(task_id, execution_id=None):
             tech_parts = []
             pkgs = v3_data.get("packages", [])
             for p in pkgs:
+                if not isinstance(p, dict):
+                    continue
                 pname = p.get("name", f"第{p.get('package_no')}包")
                 params = p.get("parameters") or {}
                 counts = []
@@ -303,16 +340,23 @@ def _complete_analysis(task_id, execution_id=None):
                 if result.technical_requirements == "暂未提取到技术要求。":
                     tech_table_parts = []
                     for tr in tc.get("tech_requirements", []):
+                        if not isinstance(tr, dict):
+                            continue
                         for item in tr.get("items", []):
+                            if not isinstance(item, dict):
+                                continue
                             name = item.get("技术要求名称", "")
                             params = item.get("技术参数与性能指标", "")
                             if name and params:
                                 tech_table_parts.append(f"  {name}: {params[:100]}")
                     # 从 product_lists 补充产品规格（兼容★前缀的列名）
                     for pl in tc.get("product_lists", []):
+                        if not isinstance(pl, dict):
+                            continue
                         items = pl.get("items", [])
                         for item in items:
-                            # ★ 前缀兼容：同时搜带★和不带★的 key
+                            if not isinstance(item, dict):
+                                continue
                             name = item.get("采购产品名称", "") or item.get("产品名称", "")
                             spec = (item.get("★规格参数", "") or item.get("技术参数与性能指标", "") 
                                     or item.get("规格参数", "") or item.get("规格", ""))
@@ -332,7 +376,11 @@ def _complete_analysis(task_id, execution_id=None):
                 # 商务要求表（含交货时间、交货地点、付款方式等）
                 biz_table_parts = []
                 for br in tc.get("business_requirements", []):
+                    if not isinstance(br, dict):
+                        continue
                     for item in br.get("items", []):
+                        if not isinstance(item, dict):
+                            continue
                         name = item.get("商务要求名称", "")
                         content_val = item.get("商务要求内容", "")
                         if name and content_val:
@@ -347,7 +395,11 @@ def _complete_analysis(task_id, execution_id=None):
                 # 服务要求表
                 srv_table_parts = []
                 for sr in tc.get("service_requirements", []):
+                    if not isinstance(sr, dict):
+                        continue
                     for item in sr.get("items", []):
+                        if not isinstance(item, dict):
+                            continue
                         name = item.get("服务要求名称", "")
                         content_val = item.get("服务要求内容", "")
                         if name and content_val:
@@ -380,8 +432,9 @@ def _complete_analysis(task_id, execution_id=None):
                 result.document_type = doc_type
             
             # 生成核对项
-            if v3_result.get("check_items"):
-                _save_v3_check_items(shared_resource.id, v3_result["check_items"])
+            check_items_list = v3_result.get("check_items")
+            if isinstance(check_items_list, list) and check_items_list:
+                _save_v3_check_items(shared_resource.id, check_items_list)
             
             # 更新有效文本
             if v3_result.get("effective_text"):
@@ -404,6 +457,7 @@ def _complete_analysis(task_id, execution_id=None):
             raise RuntimeError("v3 分析返回空结果")
     except Exception as v3_exc:
         logger.error("[analysis] v3 分析失败 task=%s: %s", task_id, v3_exc)
+        logger.error("[analysis] v3 失败详情 traceback:", exc_info=v3_exc)
         raise  # v3-only 路径，不再降级
     merged_payload = {}
     try:
@@ -456,13 +510,10 @@ def start_analyze(task_id):
     task = BiddingTask.query.filter_by(id=task_id, deleted_flag=False).first()
     if not task:
         raise LookupError("标书任务不存在")
-    # 允许重新分析的情况：未上传、失败、或已完成分析但后续步骤未开始
-    allowed_statuses = {"UPLOADED", "FAILED", "ANALYZED", "CHECKED"}
-    if task.status == "ANALYZED":
-        # 重新分析：清理旧数据
-        _clean_analysis_data(task.shared_resource_id)
-    elif task.status == "CHECKED":
-        # 已确认核对项但未生成目录：清理后重新分析
+    # 允许从任何状态重复分析
+    # 已分析过或有后续步骤的，先清理旧数据再重新分析
+    if task.status in {"ANALYZED", "CHECKED", "PACKAGE_PENDING", "CATALOG_CONFIRMED",
+                        "GENERATING", "GENERATED", "CANCELLED"}:
         _clean_analysis_data(task.shared_resource_id)
     elif task.status not in {"UPLOADED", "FAILED"}:
         raise ValueError("当前任务状态不允许启动分析")

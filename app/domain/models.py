@@ -175,7 +175,6 @@ class BiddingTask(db.Model):
     knowledge_base_ids = db.Column(db.Text, nullable=True)
     use_product_library = db.Column(db.Boolean, nullable=False, default=False)
     catalog_generation_level = db.Column(db.String(32), nullable=True)
-    word_count_level = db.Column(db.String(32), nullable=True)
 
     # 生成运行态与结果文件。
     generate_stage_code = db.Column(db.String(32), nullable=True)
@@ -210,7 +209,6 @@ class BiddingTask(db.Model):
             "knowledge_base_ids": self.knowledge_base_ids,
             "use_product_library": self.use_product_library,
             "catalog_generation_level": self.catalog_generation_level,
-            "word_count_level": self.word_count_level,
             "generate_stage_code": self.generate_stage_code,
             "generate_stage_message": self.generate_stage_message,
             "result_file_id": self.result_file_id,

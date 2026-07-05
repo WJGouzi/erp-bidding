@@ -274,7 +274,6 @@ def get_generate_config(task_id):
         "knowledge_base_ids": normalize_knowledge_base_ids(task.knowledge_base_ids),
         "use_product_library": task.use_product_library,
         "catalog_generation_level": task.catalog_generation_level,
-        "word_count_level": task.word_count_level,
     }
 
 
@@ -286,7 +285,6 @@ def save_generate_config(
     knowledge_base_ids=None,
     use_product_library=False,
     catalog_generation_level=None,
-    word_count_level=None,
 ):
     """保存主体、模型和知识库等生成配置。"""
     logger.info("[task] 保存生成配置 task=%s model=%s", task_id, model_type)
@@ -306,7 +304,6 @@ def save_generate_config(
     task.knowledge_base_ids = ",".join(str(item) for item in normalized_kb_ids) if normalized_kb_ids else None
     task.use_product_library = bool(use_product_library)
     task.catalog_generation_level = catalog_generation_level
-    task.word_count_level = word_count_level
     catalog_record = refresh_auto_catalog_content(task)
     _sync_existing_chapter_titles(task, catalog_record)
     log_operation(
@@ -489,11 +486,57 @@ def get_generate_progress(task_id):
 
 
 def get_generate_chapters(task_id):
-    """获取章节级生成状态列表。"""
+    """获取章节级生成进度摘要（精简版）。"""
     task = BiddingTask.query.filter_by(id=task_id, deleted_flag=False).first()
     if not task:
         raise LookupError("标书任务不存在")
-    return {"task_id": task.id, "chapters": _get_task_chapters(task.id)}
+    chapters = (
+        BiddingTaskChapter.query.filter_by(task_id=task.id)
+        .order_by(BiddingTaskChapter.chapter_no.asc(), BiddingTaskChapter.id.asc())
+        .all()
+    )
+    total = len(chapters)
+    completed = sum(1 for c in chapters if c.status == "SUCCESS")
+    failed = sum(1 for c in chapters if c.status == "FAILED")
+    running = [c for c in chapters if c.status == "RUNNING"]
+    pending = [c for c in chapters if c.status == "PENDING"]
+    current = None
+    next_chapter = None
+    if running:
+        r = running[0]
+        current = {
+            "chapter_no": r.chapter_no,
+            "title": r.chapter_title,
+            "progress": r.progress,
+            "message": r.stage_message or "正在生成...",
+        }
+    elif failed:
+        f = failed[0]
+        current = {
+            "chapter_no": f.chapter_no,
+            "title": f.chapter_title,
+            "progress": f.progress,
+            "message": f.error_message or "生成失败",
+        }
+    if pending:
+        p = pending[0]
+        next_chapter = {
+            "chapter_no": p.chapter_no,
+            "title": p.chapter_title,
+        }
+    return {
+        "task_id": task.id,
+        "status": task.status,
+        "current": current,
+        "next": next_chapter,
+        "summary": {
+            "total": total,
+            "completed": completed,
+            "running": len(running),
+            "failed": failed,
+            "pending": len(pending),
+        },
+    }
 
 
 def download_result_file(task_id):

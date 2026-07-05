@@ -222,7 +222,7 @@ class ContentBlock:
 
 
 # ── 通用标题前置符剥离 ──
-_HEADING_PREFIX_RE = __import__('re').compile(r'^[^\w一-鿿\d]+')
+_HEADING_PREFIX_RE = __import__('re').compile(r'^[★◆●■▲➢※▪▶•·❤\s]+')
 
 
 def strip_heading_prefix(text: str) -> str:
@@ -257,7 +257,7 @@ def _has_real_content(entry: dict) -> bool:
 class DocumentParser:
     """版面感知的文档解析器。"""
 
-    PARSE_VERSION = "1.0"
+    PARSE_VERSION = "2.0"
 
     def __init__(self, ocr_client=None):
         self.ocr_client = ocr_client
@@ -331,12 +331,20 @@ class DocumentParser:
             (2, r'^\d+\.\d+\s'),                                   # 1.1
             (3, r'^（[一二三四五六七八九十零〇]+）'),                    # （一）
             (3, r'^\d+\.\d+\.\d+\s'),                            # 1.1.1
+            # 中文括号封面/封皮标记，如（资格性响应文件封面、封皮）
+            (2, r'^（[^）]*封面[^）]*）'),
+            (2, r'^（[^）]*封皮[^）]*）'),
+
         ]
 
         stack = [Section(title="__root__", level=0)]
         current_section = stack[-1]
+        # ── 跟踪 body 子元素到章节的映射 ──
+        body_child_section_map = []  # list of (body_child_index, section)
+        _body_child_counter = 0
 
         for para in document.paragraphs:
+            _body_child_counter += 1
             text = para.text.strip()
             if not text:
                 continue
@@ -345,6 +353,15 @@ class DocumentParser:
             heading_level = heading_map.get(style_name, 0)
 
             if heading_level > 0:
+                # 覆盖检查：如果样式层级与文本内容不匹配（如 Heading2 的"第七章"），
+                # 使用文本检测的层级（更准确）
+                _text_level_override = 0
+                for _tl, _tp in text_heading_patterns:
+                    if re.match(_tp, text):
+                        _text_level_override = _tl
+                        break
+                if _text_level_override > 0 and _text_level_override < heading_level:
+                    heading_level = _text_level_override
                 # 创建新章节
                 new_section = Section(title=text, level=heading_level)
                 # 弹出比当前层级深或相等的章节
@@ -359,6 +376,7 @@ class DocumentParser:
                     doc.sections.append(new_section)
                 stack.append(new_section)
                 current_section = new_section
+                body_child_section_map.append((_body_child_counter, current_section))
             else:
                 # 文本内容级标题检测（当样式为 Normal 但内容像标题时）
                 text_heading = 0
@@ -382,8 +400,10 @@ class DocumentParser:
                         current_section.content.append(block)
                         continue
 
-                    # ── 安检门3: 标题过长拦截（≥40字 → 内容段落）──
-                    if len(text) >= 40:
+                    # ── 安检门3: 标题过长拦截（≥100字 → 内容段落）──
+                    # 有标题关键词（承诺、声明、保证、格式、封面、封皮、应答、一览表、情况表）时仍保留标题资格
+                    _heading_kw = re.search(r'承诺|声明|保证|格式|封面|封皮|应答|一览表|情况表|响应函|投标函|报价函|授权|证明|合同|协议|方案|说明|须知', text)
+                    if not _heading_kw and len(text) >= 100:
                         block = ContentBlock(ContentBlock.TYPE_PARAGRAPH, text)
                         current_section.content.append(block)
                         continue
@@ -406,15 +426,40 @@ class DocumentParser:
                         doc.sections.append(new_section)
                     stack.append(new_section)
                     current_section = new_section
+                    body_child_section_map.append((_body_child_counter, current_section))
                 else:
-                    block = ContentBlock(ContentBlock.TYPE_PARAGRAPH, text)
-                    # 尝试判断列表
-                    num_prefix = re.match(r'^[\d一二三四五六七八九十]+[、.．\s]', text)
-                    bullet_prefix = re.match(r'^[-\u2022\u25cf\u25cb\u25a0]\s', text)
-                    if num_prefix or bullet_prefix:
-                        block.type = ContentBlock.TYPE_LIST
-                        block.level = 0
-                    current_section.content.append(block)
+                    # ── 安检门4: 格式检测 — 加粗+大号字体的潜在标题（无编号前缀）──
+                    try:
+                        _has_bold = any(getattr(r, "bold", None) for r in para.runs)
+                        _large_font = any(
+                            getattr(getattr(r, "font", None), "size", None) and
+                            getattr(r.font, "size", None) >= 152400
+                            for r in para.runs
+                        )
+                    except Exception:
+                        _has_bold = False
+                        _large_font = False
+                    if _has_bold and _large_font and 3 <= len(text) < 80 and not text.endswith(('。', '；', '：', ';', ':', '、', '）')) and '：' not in text:
+                        _new_sec = Section(title=text, level=2)
+                        while stack and stack[-1].level >= 2:
+                            stack.pop()
+                        if len(stack) == 1 and stack[0].level == 0:
+                            doc.sections.append(_new_sec)
+                        elif stack:
+                            stack[-1].children.append(_new_sec)
+                        else:
+                            doc.sections.append(_new_sec)
+                        stack.append(_new_sec)
+                        current_section = _new_sec
+                    else:
+                        block = ContentBlock(ContentBlock.TYPE_PARAGRAPH, text)
+                        # 尝试判断列表
+                        num_prefix = re.match(r'^[\d一二三四五六七八九十]+[、.．\s]', text)
+                        bullet_prefix = re.match(r'^[-•●○■\s]', text)
+                        if num_prefix or bullet_prefix:
+                            block.type = ContentBlock.TYPE_LIST
+                            block.level = 0
+                        current_section.content.append(block)
 
         # 在解析表格前，先保存栈中的段落内容
         if stack:
@@ -433,9 +478,40 @@ class DocumentParser:
                     doc.sections.append(child)
                 root_section.children = []
 
-        # 解析表格（带位置感知）
-        for table_idx, table in enumerate(document.tables):
-            self._parse_table(table, doc, table_index=table_idx, docx_document=document)
+        # 直接遍历 body 子元素，按出现顺序将每个 table 分配给对应的活跃章节
+        _para_counter = 0  # 对应 document.paragraphs 中的索引（0-based）
+        _table_counter = 0
+        _current_section_for_table = doc.sections[-1] if doc.sections else None
+
+        try:
+            body = document.element.body
+            for child in body:
+                tag = child.tag.split("}")[-1] if "}" in child.tag else child.tag
+                if tag in ("p", "pPr"):
+                    if _para_counter < len(document.paragraphs):
+                        # 从 body_child_section_map 中查找该段落的章节
+                        for _bidx, _sec in reversed(body_child_section_map):
+                            if _bidx <= _para_counter + 1:
+                                _current_section_for_table = _sec
+                                break
+                    _para_counter += 1
+                elif tag == "tbl":
+                    if _table_counter < len(document.tables):
+                        self._parse_table(document.tables[_table_counter], doc,
+                                          table_index=_table_counter, docx_document=document,
+                                          _position_hint=_current_section_for_table)
+                        _table_counter += 1
+        except Exception:
+            logger.warning("[parser] 直接 body 遍历失败，使用降级定位: %s", exc_info=True)
+            # 降级：使用 body_child_counter 近似定位
+            for table_idx, table in enumerate(document.tables):
+                _table_body_idx = _body_child_counter + table_idx + 1
+                _nearest_section = None
+                for _bidx, _sec in reversed(body_child_section_map):
+                    if _bidx < _table_body_idx:
+                        _nearest_section = _sec
+                        break
+                self._parse_table(table, doc, table_index=table_idx, docx_document=document, _position_hint=_nearest_section)
 
         # 保存原始表格对象供 table_parser 使用
         doc.tables = list(document.tables)
@@ -444,7 +520,7 @@ class DocumentParser:
         doc.sections = [s for s in doc.sections if s.title != "__root__"]
         
         # 安检门2: 事后扫描 — 移除连续 3+ 同级别空节点（列举列表误判）
-        _cleanup_fake_headings(doc.sections)
+        self._cleanup_fake_headings(doc.sections)
 
         # 如果没有检测到任何标题层级（纯文本），把内容放到一个根章节下
         if not doc.sections:
@@ -458,7 +534,7 @@ class DocumentParser:
                 if root.content or root.children:
                     doc.sections = [root]
 
-    def _parse_table(self, table, doc: StructuredDocument, table_index: int = 0, docx_document=None):
+    def _parse_table(self, table, doc: StructuredDocument, table_index: int = 0, docx_document=None, _position_hint=None):
         """从 python-docx Table 对象提取结构化表格，并尝试分配到正确的章节。
 
         Args:
@@ -484,7 +560,7 @@ class DocumentParser:
             return
 
         # 尝试定位表格在文档体中的位置
-        target_section = doc.sections[-1]  # 默认：最后章节
+        target_section = _position_hint or doc.sections[-1]  # 默认：最后章节或位置提示
         if docx_document and hasattr(docx_document, "element") and hasattr(docx_document.element, "body"):
             try:
                 body = docx_document.element.body
@@ -513,8 +589,8 @@ class DocumentParser:
                         elif tag == "tbl":
                             prev_text = ""  # 表格后的内容
                     
-                    if prev_text:
-                        # 按标题定位
+                    if prev_text and not _position_hint:
+                        # 按标题定位（仅当没有位置提示时使用文本查找作为后备）
                         target_section = self._find_section_by_text(doc, prev_text)
             except Exception as exc:
                 pass
@@ -573,83 +649,66 @@ class DocumentParser:
     #  安检门2: 事后扫描 — 移除连续 3+ 同级别空节点（列举列列表误判）
     # ══════════════════════════════════════════════════════════════
 
-def _cleanup_fake_headings(sections_list):
-    """事后扫描：移除连续 3+ 同级别的空节点（列举列表误判）
+    def _cleanup_fake_headings(self, sections_list):
+        """事后扫描：移除连续 3+ 同级别的空节点（列举列表误判）
+    
+        同时处理顶层 sections 列表和子章节。
+        """
+        def _is_legitimate_empty(section):
+            """判断空节点是否为合法结构节点（封面、编号标题等，不应被移除）。"""
+            title = getattr(section, 'title', '') or ''
+            if '封面' in title or '封皮' in title:
+                return True
+            if re.match(r'^[一二三四五六七八九十零〇]+[、，,．.]', title):
+                return True
+            if re.match(r'^（[^）]*）', title):
+                return True
+            return False
 
-    同时处理顶层 sections 列表和子章节。
-    """
-    def _scan_siblings(children, parent=None):
-        if not children:
-            return
-        to_delete = []
-        i = 0
-        while i < len(children):
-            j = i
-            level = children[i].level if hasattr(children[i], 'level') else 0
-            while j < len(children):
-                c = children[j]
-                same_level = c.level == level if hasattr(c, 'level') else True
-                no_content = (len(getattr(c, 'content', []) or []) == 0
-                              and len(getattr(c, 'children', []) or []) == 0)
-                if same_level and no_content:
-                    j += 1
+        def _scan_siblings(children, parent=None):
+            if not children:
+                return
+            to_delete = []
+            i = 0
+            while i < len(children):
+                j = i
+                level = children[i].level if hasattr(children[i], 'level') else 0
+                while j < len(children):
+                    c = children[j]
+                    same_level = c.level == level if hasattr(c, 'level') else True
+                    no_content = (len(getattr(c, 'content', []) or []) == 0
+                                  and len(getattr(c, 'children', []) or []) == 0)
+                    if same_level and no_content:
+                        j += 1
+                    else:
+                        break
+                count = j - i
+                # 检查这批空节点中是否有合法结构节点（封面、编号等）
+                _has_legit = any(_is_legitimate_empty(children[k]) for k in range(i, j))
+                if count >= 3 and not _has_legit:
+                    logger.debug("[parser] 安检门2: 将 %d 个连续空章节降级为内容", count)
+                    for k in range(i, j):
+                        block = ContentBlock(ContentBlock.TYPE_PARAGRAPH,
+                                             getattr(children[k], 'title', ''))
+                        if parent is not None:
+                            parent.content.append(block)
+                    to_delete.extend(range(i, j))
+                    i = j
+                elif count == 0:
+                    _scan_siblings(getattr(children[i], 'children', []) or [], children[i])
+                    i += 1
                 else:
-                    break
-            count = j - i
-            if count >= 3:
-                logger.debug("[parser] 安检门2: 将 %d 个连续空章节降级为内容", count)
-                for k in range(i, j):
-                    block = ContentBlock(ContentBlock.TYPE_PARAGRAPH,
-                                         getattr(children[k], 'title', ''))
-                    if parent is not None:
-                        parent.content.append(block)
-                to_delete.extend(range(i, j))
-                i = j
-            elif count == 0:
-                _scan_siblings(getattr(children[i], 'children', []) or [], children[i])
-                i += 1
-            else:
-                for k in range(i, j):
-                    _scan_siblings(getattr(children[k], 'children', []) or [], children[k])
-                i = j
-        for idx in reversed(to_delete):
-            del children[idx]
-
-    if sections_list:
-        _scan_siblings(sections_list)
-        for section in list(sections_list):
-            _scan_siblings(getattr(section, 'children', []) or [], section)
-
-def _dedup_section_index(index: list) -> list:
-    """去重：同名+同级+同父节点 → 保留有内容的版本，删除空洞节点。
-
-    key = (title, level, parent_id) 三元组。
-    防止同名但不同位置的真章节被误删。
-    """
-    content_keys = set()
-    content_ids = set()
-    for entry in index:
-        title = entry.get("title", "") or ""
-        if title and _has_real_content(entry):
-            key = (title, entry.get("level"), entry.get("parent_id"))
-            content_keys.add(key)
-            content_ids.add(entry.get("id"))
-
-    clean = []
-    seen_keys = set()
-    for entry in index:
-        title = entry.get("title", "") or ""
-        if not title:
-            clean.append(entry)
-            continue
-        key = (title, entry.get("level"), entry.get("parent_id"))
-        if key in content_keys:
-            if entry.get("id") in content_ids:
-                clean.append(entry)
-        else:
-            clean.append(entry)
-    return clean
-
+                    for k in range(i, j):
+                        _scan_siblings(getattr(children[k], 'children', []) or [], children[k])
+                    i = j
+            for idx in reversed(to_delete):
+                del children[idx]
+    
+        if sections_list:
+            _scan_siblings(sections_list)
+            for section in list(sections_list):
+                _scan_siblings(getattr(section, 'children', []) or [], section)
+    
     # ========== PDF 结构化解析 ==========
 
     def _parse_pdf_structured(self, payload: bytes, doc: StructuredDocument):
@@ -1176,3 +1235,33 @@ def _dedup_section_index(index: list) -> list:
             if line:
                 lines.append(line)
         return "\n".join(lines).strip()
+
+def _dedup_section_index(index: list) -> list:
+    """去重：同名+同级+同父节点 → 保留有内容的版本，删除空洞节点。
+
+    key = (title, level, parent_id) 三元组。
+    防止同名但不同位置的真章节被误删。
+    """
+    content_keys = set()
+    content_ids = set()
+    for entry in index:
+        title = entry.get("title", "") or ""
+        if title and _has_real_content(entry):
+            key = (title, entry.get("level"), entry.get("parent_id"))
+            content_keys.add(key)
+            content_ids.add(entry.get("id"))
+
+    clean = []
+    seen_keys = set()
+    for entry in index:
+        title = entry.get("title", "") or ""
+        if not title:
+            clean.append(entry)
+            continue
+        key = (title, entry.get("level"), entry.get("parent_id"))
+        if key in content_keys:
+            if entry.get("id") in content_ids:
+                clean.append(entry)
+        else:
+            clean.append(entry)
+    return clean

@@ -79,15 +79,7 @@ BID_SKELETON = [
         "required": False,
         "detection_key": "business",
     },
-    {
-        "id": "scoring",
-        "title": "评分标准响应",
-        "mandate_level": "FREE",
-        "fill_strategy": "KB_FIRST",
-        "description": "针对评分细则的逐项响应",
-        "required": False,
-        "detection_key": "scoring",
-    },
+
     {
         "id": "service",
         "title": "售后服务及培训方案",

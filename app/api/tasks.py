@@ -38,7 +38,6 @@ derive_model = task_ns.model(
         "use_knowledge_base": fields.Boolean(required=False, description="是否启用知识库"),
         "use_product_library": fields.Boolean(required=False, description="是否启用产品库"),
         "catalog_generation_level": fields.String(required=False, description="目录生成程度，可选值: LOW(简洁直达), MEDIUM(兼顾常规), HIGH(详细展开)"),
-        "word_count_level": fields.String(required=False, description="字数等级，可选值: SHORT(少 约2.5万字), MEDIUM(常规篇幅 约6万字), LONG(详尽篇幅)"),
     },
 )
 
@@ -70,7 +69,6 @@ generate_config_model = task_ns.model(
         "knowledge_base_ids": fields.List(fields.Integer, required=False, description="知识库ID列表"),
         "use_product_library": fields.Boolean(required=False, description="是否启用产品库"),
         "catalog_generation_level": fields.String(required=False, description="目录生成程度，可选值: LOW(简洁直达), MEDIUM(兼顾常规), HIGH(详细展开)"),
-        "word_count_level": fields.String(required=False, description="字数等级，可选值: SHORT(600-900字), MEDIUM(常规篇幅), LONG(详尽篇幅)"),
     },
 )
 
@@ -230,7 +228,6 @@ class TaskDeriveResource(Resource):
             use_knowledge_base=payload.get("use_knowledge_base", False),
             use_product_library=payload.get("use_product_library", False),
             catalog_generation_level=payload.get("catalog_generation_level"),
-            word_count_level=payload.get("word_count_level"),
         )
         return success(data, message="再次生成任务创建成功")
 
@@ -368,9 +365,7 @@ class TaskGenerateConfigResource(Resource):
         'knowledge_base_ids 知识库ID列表。\n' \
         'use_product_library 是否使用产品库 \n ' \
         'catalog_generation_level 目录生成程度，可选值: LOW(简洁直达), MEDIUM(兼顾常规), HIGH(详细展开) \n' \
-        'word_count_level 字数等级，可选值: SHORT(少 约2.5万字), MEDIUM(常规篇幅 约6万字), LONG(详尽篇幅)' 
-
-    )
+            )
     def post(self, task_id):
         """保存主体、模型、知识库与产品库等生成参数。"""
 
@@ -383,7 +378,6 @@ class TaskGenerateConfigResource(Resource):
             knowledge_base_ids=payload.get("knowledge_base_ids"),
             use_product_library=payload.get("use_product_library", False),
             catalog_generation_level=payload.get("catalog_generation_level"),
-            word_count_level=payload.get("word_count_level"),
         )
         return success(data, message="生成配置已保存")
 

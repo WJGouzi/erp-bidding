@@ -131,6 +131,7 @@ def _map_product_headers_unified(headers):
 
 _FIELD_UNSET = object()
 _EMPTY_PAGE_MARKER = "[[EMPTY_PAGE]]"
+_CONTENT_BLOCKS_PREFIX = "[[CONTENT_BLOCKS]]"
 _TABLE_MARKER_PREFIX = "[[TABLE:"
 _QUALIFICATION_MARKER = "[[QUALIFICATION_DOCS]]"
 
@@ -161,25 +162,6 @@ def _get_catalog_generation_profile(level):
         },
     }
     return {"level": normalized, **profile_map[normalized]}
-
-
-def _normalize_word_count_level(level):
-    """规范化字数等级配置。"""
-    normalized = str(level or "MEDIUM").strip().upper()
-    if normalized not in {"SHORT", "MEDIUM", "LONG"}:
-        return "MEDIUM"
-    return normalized
-
-
-def _get_word_count_profile(level):
-    """返回字数等级对应的篇幅控制建议。"""
-    normalized = _normalize_word_count_level(level)
-    profile_map = {
-        "SHORT": {"label": "SHORT", "instruction": "建议篇幅：约800-1200字，内容精准直达核心响应点。", "max_tokens": 2000},
-        "MEDIUM": {"label": "MEDIUM", "instruction": "建议篇幅：约1200-2000字，内容完整并覆盖主要响应点，适当展开说明。", "max_tokens": 3000},
-        "LONG": {"label": "LONG", "instruction": "建议篇幅：约2000-3000字，内容充分展开并包含详细支撑说明。", "max_tokens": 4000},
-    }
-    return profile_map[normalized]
 
 
 def _get_task_chapters(task_id):
@@ -318,30 +300,61 @@ def _extract_analysis_context(analysis_result):
         # 确保 bidder_notice 有 project_name/project_no（可能顶层也有）
         if not bidder_notice.get("project_name"):
             for field in ("project_name", "项目名称", "标的名称"):
-                val = payload.get(field) or getattr(analysis_result, field, None) or ""
+                # v3 分析数据存储在 metadata.project_name.value
+                meta = payload.get("metadata", {}) if isinstance(payload, dict) else {}
+                if isinstance(meta, dict):
+                    meta_val = meta.get("project_name", {})
+                    if isinstance(meta_val, dict):
+                        meta_val = meta_val.get("value", "")
+                else:
+                    meta_val = ""
+                val = meta_val or payload.get(field) or getattr(analysis_result, field, None) or ""
                 if val:
                     bidder_notice["project_name"] = val
                     break
         if not bidder_notice.get("project_no"):
             for field in ("project_no", "项目编号", "比选编号"):
-                val = payload.get(field) or getattr(analysis_result, field, None) or ""
+                # v3 分析数据存储在 metadata.project_code.value
+                meta = payload.get("metadata", {}) if isinstance(payload, dict) else {}
+                if isinstance(meta, dict):
+                    meta_val = meta.get("project_code", {})
+                    if isinstance(meta_val, dict):
+                        meta_val = meta_val.get("value", "")
+                else:
+                    meta_val = ""
+                val = meta_val or payload.get(field) or getattr(analysis_result, field, None) or ""
                 if val:
                     bidder_notice["project_no"] = val
                     break        # 提取 product_lists 供表格填充引擎使用
         product_lists = []
-        # 同时保留原始表格结构（headers + rows）用于原样复制
+        # 保留所有原始表格结构（headers + rows + merges）用于原样复制
         raw_tables = []
         tc = payload.get("table_classification", {}) if isinstance(payload, dict) else {}
         if tc:
             for pl in tc.get("product_lists", []):
                 for item in pl.get("items", []):
                     product_lists.append(item)
-                # 保留原始表格结构用于原样复制
-                if pl.get("headers") and pl.get("rows"):
+            # 使用 raw_tables（由 classify_all_tables 前置提取，含所有表格的原始数据）
+            for rt in tc.get("raw_tables", []):
+                if rt.get("headers") and rt.get("rows"):
                     raw_tables.append({
-                        "headers": pl["headers"],
-                        "rows": pl["rows"][:100],
+                        "headers": rt["headers"],
+                        "rows": rt["rows"],
+                        "merges": rt.get("merges", []),
+                        "text_before": rt.get("text_before", ""),
+                        "text_after": rt.get("text_after", ""),
                     })
+            # 合并表格周围段落文本
+            surroundings = tc.get("_table_surroundings", [])
+            if surroundings and isinstance(surroundings, list):
+                for si, surr in enumerate(surroundings):
+                    if si < len(raw_tables):
+                        tb = surr.get("text_before", "").strip()
+                        ta = surr.get("text_after", "").strip()
+                        if tb:
+                            raw_tables[si]["text_before"] = tb
+                        if ta:
+                            raw_tables[si]["text_after"] = ta
         context["_raw_product_lists"] = product_lists
         context["_raw_product_tables"] = raw_tables
         context["_eligibility"] = payload.get("eligibility", {}) if isinstance(payload, dict) else {}
@@ -615,12 +628,28 @@ def _get_confirmed_catalog_record(task):
 
 
 def _build_chapter_contents_from_records(chapter_records):
-    """从章节记录中提取已生成的内容快照。"""
+    """从章节记录中提取已生成的内容快照（支持 ContentBlock 结构）。"""
+    import json as _json
     chapter_contents = []
     for item in chapter_records:
         if not item.content_snapshot:
             raise RuntimeError(f"章节{item.chapter_no}尚未生成完成，无法组装结果文件")
-        chapter_contents.append({"title": item.chapter_title, "content": item.content_snapshot})
+        snapshot = item.content_snapshot
+        content_blocks = None
+        # 检测是否为序列化的 ContentBlock
+        if snapshot.startswith(_CONTENT_BLOCKS_PREFIX):
+            try:
+                blocks_data = _json.loads(snapshot[len(_CONTENT_BLOCKS_PREFIX):])
+                if isinstance(blocks_data, list):
+                    content_blocks = blocks_data
+                    snapshot = ""  # content_blocks 优先
+            except (_json.JSONDecodeError, TypeError):
+                pass
+        chapter_contents.append({
+            "title": item.chapter_title,
+            "content": snapshot,
+            "content_blocks": content_blocks,
+        })
     return chapter_contents
 
 
@@ -2618,38 +2647,127 @@ def _extract_table_data_from_analysis(table_type, analysis_context, subject_cont
     return rows
 
 
+def _match_raw_table(chapter_title, chapter_desc, raw_tables):
+    """从原始表格列表中匹配与当前章节最相关的表格。
+    
+    匹配策略：
+    1. 先检查章节标题中的关键词
+    2. 再检查章节描述中的关键词
+    3. 返回匹配的原始表格（含 headers + rows + source_type）
+    """
+    if not raw_tables:
+        return None
+    
+    combined = f"{chapter_title} {chapter_desc}"
+    
+    # 关键词 → 表格 source_type 映射
+    keyword_map = {
+        "报价": ("product_list", "报价"),
+        "分项报价": ("product_list", "分项"),
+        "产品": ("product_list", "产品"),
+        "技术响应": ("tech_requirements", "技术"),
+        "技术参数": ("tech_requirements", "参数"),
+        "服务要求": ("service_requirements", "服务"),
+        "服务响应": ("service_requirements", "服务"),
+        "商务响应": ("business_requirements", "商务"),
+        "商务应答": ("business_requirements", "商务"),
+        "资格": ("qualification_checks", "资格"),
+        "偏离": ("response_forms", "偏离"),
+        "应答表": ("response_forms", "应答"),
+        "评分": ("scoring", "评分"),
+        "前附表": ("preliminary", "前附"),
+    }
+    
+    best_match = None
+    best_score = 0
+    for keyword, (source_type, _) in keyword_map.items():
+        if keyword in combined:
+            # 找同类型的原始表格
+            for rt in raw_tables:
+                st = rt.get("source_type", "")
+                if st == source_type:
+                    score = 10
+                    # 子类型关键词匹配加分
+                    headers_text = " ".join(rt.get("headers", []))
+                    if keyword in headers_text:
+                        score += 5
+                    if score > best_score:
+                        best_score = score
+                        best_match = rt
+            # 无 source_type 时按表头关键词匹配
+            if not best_match:
+                for rt in raw_tables:
+                    st = rt.get("source_type", "")
+                    if st:
+                        continue
+                    headers_text = " ".join(rt.get("headers", []))
+                    if keyword in headers_text:
+                        best_match = rt
+                        break
+    
+    # 没匹配到关键词时返回 None，让调用方降级到旧路径
+    if not best_match:
+        return None
+    
+    return best_match
+
+
 def _generate_table_content(chapter_title, chapter_desc, analysis_context, subject_context):
     """生成表格模板的填充内容（tab 分隔的文本格式）。
 
-    策略变更：对报价/产品类表格，优先使用原始表格框架（招标文件原表复制），
-    只从产品库填充空白单元格。没有原始表时降级到硬编码逻辑。
+    策略变更：
+    1. 优先使用原始表格框架（招标文件原表复制），只从产品库填充空白单元格
+    2. 没有原始表时降级到关键词匹配的硬编码逻辑
+    3. 所有类型的原始表格都会被保留和匹配（不限于产品表）
 
     返回:
         str: 包含表格数据的文本（_table_marker 开头）
     """
     table_type = chapter_title
+    raw_tables = analysis_context.get("_raw_product_tables", [])
 
-    # ========== 新路径：原始表复用+填空（报价/产品类） ==========
-    if "报价" in table_type or "报价一览表" in table_type:
-        raw_tables = analysis_context.get("_raw_product_tables", [])
-        if raw_tables:
-            rt = raw_tables[0]
-            original_headers = rt.get("headers", [])
-            original_rows = rt.get("rows", [])
-            if original_headers and original_rows:
-                # 用原始表头作为表头
-                columns = list(original_headers)
-                # 填充空白单元格
+    # ========== 新路径：原始表复用+填空（所有类型） ==========
+    matched_table = _match_raw_table(chapter_title, chapter_desc, raw_tables)
+    if matched_table:
+        original_headers = matched_table.get("headers", [])
+        original_rows = matched_table.get("rows", [])
+        if original_headers and original_rows:
+            columns = list(original_headers)
+            # 对产品报价表尝试填充空白单元格
+            source_type = matched_table.get("source_type", "")
+            if source_type == "product_list":
                 filled_rows = _fill_table_from_original(original_headers, original_rows)
-                lines = []
-                lines.append("\t".join(columns))
-                for row in filled_rows:
-                    padded = row + [""] * (len(columns) - len(row))
-                    lines.append("\t".join(padded[:len(columns)]))
-                marker = f"{_TABLE_MARKER_PREFIX}{table_type}]]"
-                return marker + "\n" + "\n".join(lines)
+            else:
+                filled_rows = list(original_rows)
+            # 去重：rows[0] 和 headers 可能是同一行（_extract_raw_table 的设计）
+            data_start = 0
+            if filled_rows and original_headers and filled_rows[0] == original_headers:
+                data_start = 1
+            lines = []
+            lines.append("\t".join(columns))
+            for row in filled_rows[data_start:]:
+                padded = row + [""] * (len(columns) - len(row))
+                lines.append("\t".join(padded[:len(columns)]))
+            marker = f"{_TABLE_MARKER_PREFIX}{table_type}]]"
+            # 附带合并单元格信息
+            merges = matched_table.get("merges", [])
+            merge_line = "" 
+            if merges:
+                merge_parts = []
+                for m in merges:
+                    merge_parts.append(f"{m.get('type','')}:{m.get('row',0)}:{m.get('col',0)}:{m.get('span',1)}")
+                merge_line = "\n--MERGES--\n" + "\n".join(merge_parts)
+            # 附带表格前后段落文本
+            text_before = matched_table.get("text_before", "").strip()
+            text_after = matched_table.get("text_after", "").strip()
+            extras = ""
+            if text_before:
+                extras += "\n--TEXT-BEFORE--\n" + text_before
+            if text_after:
+                extras += "\n--TEXT-AFTER--\n" + text_after
+            return marker + "\n" + "\n".join(lines) + merge_line + extras
 
-    # ========== 旧路径：硬编码表格（非产品类原有逻辑） ==========
+    # ========== 旧路径：硬编码表格（无原始表时兜底） ==========
     columns, found = _detect_table_columns(chapter_title, chapter_desc)
     data_rows = _extract_table_data_from_analysis(table_type, analysis_context, subject_context)
 
@@ -3154,6 +3272,26 @@ def _extract_bound_segment_data(analysis_result, bound_segments):
 
 def _generate_chapter_content(task, chapter, analysis_result, subject_context, knowledge_contexts, product_context):
     """调用模型生成单个章节的详细正文内容。"""
+    # 阶段A：尝试模板绑定 — 如果有原文模板，直接复制+填空，不走LLM
+    try:
+        _analysis_data = analysis_result.safe_analysis_data() if analysis_result else {}
+        _fmt = _analysis_data.get("format_requirements", {}) if isinstance(_analysis_data, dict) else {}
+        if _fmt:
+            from .template_binder import bind_template, fill_content
+            chapter_title_for_bind = chapter.get("title", "").strip()
+            binding = bind_template(chapter_title_for_bind, _fmt)
+            if binding.has_template:
+                filled = fill_content(binding, subject_context, knowledge_contexts, product_context)
+                if filled:
+                    import json as _json
+                    serialized = _json.dumps([b.to_dict() for b in filled], ensure_ascii=False)
+                    logger.info("[template_binder] 章节「%s」使用模板绑定完成，%d个内容块",
+                                chapter_title_for_bind, len(filled))
+                    return _CONTENT_BLOCKS_PREFIX + serialized
+    except Exception as _exc:
+        logger.warning("[template_binder] 章节「%s」模板绑定异常: %s",
+                       chapter.get("title", ""), _exc)
+
     bid_type_label_map = {"GOODS": "\u8d27\u7269\u7c7b", "SERVICE": "\u670d\u52a1\u7c7b", "ENGINEERING": "\u5de5\u7a0b\u7c7b"}
     bid_type_label = bid_type_label_map.get(task.bid_type, "\u8d27\u7269\u7c7b")
     chapter_title = chapter.get("title", "").strip()
@@ -3163,8 +3301,6 @@ def _generate_chapter_content(task, chapter, analysis_result, subject_context, k
     analysis_context = _extract_analysis_context(analysis_result)
 
     catalog_profile = _get_catalog_generation_profile(task.catalog_generation_level)
-    word_profile = _get_word_count_profile(task.word_count_level)
-
     selected_package_no = getattr(task, "selected_package_no", None) or ""
 
     children = chapter.get("children", [])
@@ -3246,7 +3382,6 @@ def _generate_chapter_content(task, chapter, analysis_result, subject_context, k
             effective_text = filtered_text
 
     user_parts.append(f"\u5199\u4f5c\u6307\u5bfc\uff1a{catalog_profile['directive']}")
-    user_parts.append(f"\u7bc7\u5e45\u63a7\u5236\uff1a{word_profile['instruction']}")
     user_parts.append("\u7f16\u5199\u539f\u5219\uff1a\u4e25\u683c\u4f9d\u636e\u5df2\u63d0\u4f9b\u6750\u6599\u7ec4\u7ec7\u5185\u5bb9\uff0c\u4e0d\u5f97\u7f16\u9020\u3002\u5982\u67d0\u9879\u65e0\u652f\u6491\u8d44\u6599\uff0c\u5b81\u53ef\u4fdd\u6301\u7b80\u7565\uff0c\u4e5f\u4e0d\u8981\u8865\u5199\u627f\u8bfa\u3002")
     bidder_notice = analysis_context.get("bidder_notice", {}) or {}
     if bidder_notice:
@@ -3492,7 +3627,7 @@ def _generate_chapter_content(task, chapter, analysis_result, subject_context, k
 
     temperature = current_app.config.get("LLM_TEMPERATURE", 0.4)
     # \u786e\u4fdd\u6bcf\u7ae0\u81f3\u5c11\u67092000 tokens
-    max_tokens = max(int(word_profile.get("max_tokens", 1500)), 2000)
+    max_tokens = 3000
 
     raw = adapter.generate_text(
         system_prompt=system_prompt,
@@ -3697,6 +3832,7 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
     from docx.enum.text import WD_ALIGN_PARAGRAPH
     from docx.oxml.ns import qn
     from docx.oxml import OxmlElement
+    from lxml import etree
 
     catalog_payload = json.loads(catalog_record.catalog_content) if isinstance(catalog_record.catalog_content, str) else (catalog_record.catalog_content or {})
     outline = catalog_payload.get("outline", []) if isinstance(catalog_payload, dict) else []
@@ -3714,10 +3850,35 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                           bidder_notice.get("标的名称", "") or "").strip()
     if not cover_project_no and analysis_result:
         cover_project_no = (getattr(analysis_result, "project_no", None) or "").strip()
+    # 深度兜底：直接从 analysis_data JSON 的 metadata 中读取
+    if not cover_item_name or not cover_project_no:
+        _ad_raw = getattr(analysis_result, "analysis_data", None) if analysis_result else None
+        if _ad_raw:
+            import json as _json
+            try:
+                _ad = _json.loads(_ad_raw) if isinstance(_ad_raw, str) else (_ad_raw or {})
+            except Exception:
+                _ad = {}
+            if isinstance(_ad, dict):
+                _meta = _ad.get("metadata", {}) or {}
+                if not cover_item_name:
+                    _pn = _meta.get("project_name", {}) or {}
+                    if isinstance(_pn, dict):
+                        _pn = _pn.get("value", "")
+                    if _pn and str(_pn).strip():
+                        cover_item_name = str(_pn).strip()
+                if not cover_project_no:
+                    _pc = _meta.get("project_code", {}) or {}
+                    if isinstance(_pc, dict):
+                        _pc = _pc.get("value", "")
+                    if _pc and str(_pc).strip():
+                        cover_project_no = str(_pc).strip()
     cover_package_no = (getattr(task, "selected_package_no", "") or bidder_notice.get("package_no") or "").strip()
     cover_bid_time = utc_now().strftime("%Y年%m月%d日")
 
     document = Document()
+    inserted_material_ids = set()
+    image_extensions = {"png", "jpg", "jpeg", "gif", "bmp", "tiff", "tif", "webp"}
 
     # ========== 插入免责声明页（第一页） ==========
     def _add_disclaimer_page(doc):
@@ -3801,9 +3962,9 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
         hpf.space_after = Pt(space_after)
         hpf.line_spacing = 1.5
 
-    _set_heading_style(1, "\u5b8b\u4f53", 22, True, 24, 12)
-    _set_heading_style(2, "\u5b8b\u4f53", 14, True, 18, 8)
-    _set_heading_style(3, "\u5b8b\u4f53", 13, True, 12, 6)
+    _set_heading_style(1, "\u5b8b\u4f53", 16, True, 24, 12)
+    _set_heading_style(2, "\u5b8b\u4f53", 15, True, 18, 8)
+    _set_heading_style(3, "\u5b8b\u4f53", 14, True, 12, 6)
     _set_heading_style(4, "\u5b8b\u4f53", 12, True, 6, 6)
 
     # ========== \u8f85\u52a9\u51fd\u6570 ==========
@@ -3823,6 +3984,127 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
         cleaned = re.sub(r'media/image\d+\.\w+', '', cleaned)
         cleaned = _strip_xml_control_chars(cleaned)
         return cleaned.strip()
+
+    def _write_table_from_lines(doc, lines, merges=None):
+        """从文本行创建表格，支持合并单元格（直接 XML 构建）。"""
+        table_rows = []
+        for _line in lines:
+            _stripped = _line.strip()
+            if not _stripped:
+                continue
+            if '\t' in _stripped:
+                _cells = [c.strip() for c in _stripped.split('\t')]
+            else:
+                _cells = [c.strip() for c in re.split(r'\s{3,}|\|', _stripped) if c.strip()]
+            if len(_cells) >= 1:
+                table_rows.append(_cells)
+        if not table_rows:
+            return
+
+        _max_cols = max(len(r) for r in table_rows)
+        _ns = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
+        _cw = 9072 // max(1, _max_cols)
+
+        # 构建垂直合并查找
+        _v_merges = {}
+        for _m in (merges or []):
+            if _m.get("type") == "vertical":
+                _v_merges[_m.get("col", 0)] = {"row": _m.get("row", 0), "span": _m.get("span", 1)}
+
+        # 创建表格 XML
+        _tbl = etree.SubElement(doc.element.body, _ns + 'tbl')
+        _tblPr = etree.SubElement(_tbl, _ns + 'tblPr')
+        _tblW = etree.SubElement(_tblPr, _ns + 'tblW')
+        _tblW.set(_ns + 'w', '9072')
+        _tblW.set(_ns + 'type', 'dxa')
+        _tblStyle = etree.SubElement(_tblPr, _ns + 'tblStyle')
+        _tblStyle.set(_ns + 'val', 'Table Grid')
+        _tblGrid = etree.SubElement(_tbl, _ns + 'tblGrid')
+        for _ in range(_max_cols):
+            _gc = etree.SubElement(_tblGrid, _ns + 'gridCol')
+            _gc.set(_ns + 'w', str(_cw))
+
+        # 构建每行的 col→tc 映射
+        def _build_map(_ri, _ncols):
+            _h = [m for m in (merges or []) if m.get("type") == "horizontal" and m.get("row") == _ri]
+            _h.sort(key=lambda x: x.get("col", 0))
+            _map = {}
+            _ci = 0
+            _tci = 0
+            while _ci < _ncols:
+                _match = [m for m in _h if m.get("col") == _ci]
+                if _match:
+                    _span = _match[0].get("span", 1)
+                    _text = table_rows[_ri][_ci] if _ci < len(table_rows[_ri]) else ""
+                    _map[_ci] = (_tci, _span, _text)
+                    _tci += 1
+                    _ci += _span
+                else:
+                    _text = table_rows[_ri][_ci] if _ci < len(table_rows[_ri]) else ""
+                    _map[_ci] = (_tci, 1, _text)
+                    _tci += 1
+                    _ci += 1
+            return _map
+
+        for _ri in range(len(table_rows)):
+            _mapping = _build_map(_ri, _max_cols)
+            _tr = etree.SubElement(_tbl, _ns + 'tr')
+            # 按 tc 分组
+            _tc_groups = {}
+            for _ci, (_tci, _span, _text) in _mapping.items():
+                if _tci not in _tc_groups:
+                    _tc_groups[_tci] = (_ci, _span, _text)
+            for _ci, _span, _text in [_tc_groups[k] for k in sorted(_tc_groups.keys())]:
+                _tc = etree.SubElement(_tr, _ns + 'tc')
+                _tcPr = etree.SubElement(_tc, _ns + 'tcPr')
+                _tcW = etree.SubElement(_tcPr, _ns + 'tcW')
+                _tcW.set(_ns + 'w', str(_cw * _span))
+                _tcW.set(_ns + 'type', 'dxa')
+                if _span > 1:
+                    _gs = etree.SubElement(_tcPr, _ns + 'gridSpan')
+                    _gs.set(_ns + 'val', str(_span))
+                if _ci in _v_merges:
+                    _vm_info = _v_merges[_ci]
+                    if _ri == _vm_info["row"]:
+                        _vm = etree.SubElement(_tcPr, _ns + 'vMerge')
+                        _vm.set(_ns + 'val', 'restart')
+                    elif _ri > _vm_info["row"] and _ri < _vm_info["row"] + _vm_info["span"]:
+                        _vm = etree.SubElement(_tcPr, _ns + 'vMerge')
+                        _vm.set(_ns + 'val', 'continue')
+                if _text:
+                    _p = etree.SubElement(_tc, _ns + 'p')
+                    _r_elem = etree.SubElement(_p, _ns + 'r')
+                    _t = etree.SubElement(_r_elem, _ns + 't')
+                    _t.text = _strip_xml_control_chars(_text)
+                    _t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
+                    # 字体格式
+                    _rPr = etree.SubElement(_r_elem, _ns + 'rPr')
+                    _rFonts = etree.SubElement(_rPr, _ns + 'rFonts')
+                    _rFonts.set(_ns + 'ascii', '\u4eff\u5b8b')
+                    _rFonts.set(_ns + 'hAnsi', '\u4eff\u5b8b')
+                    _rFonts.set(_ns + 'eastAsia', '\u4eff\u5b8b')
+                    _sz = etree.SubElement(_rPr, _ns + 'sz')
+                    _sz.set(_ns + 'val', '24')  # 小四 = 12pt = 24 half-pts
+                    _szCs = etree.SubElement(_rPr, _ns + 'szCs')
+                    _szCs.set(_ns + 'val', '24')
+                    if _ri == 0:
+                        _b = etree.SubElement(_rPr, _ns + 'b')
+        return
+    
+
+    def _build_subject_declaration_text():
+        materials = subject_context.get("materials", []) if subject_context else []
+        if not company_name or not materials:
+            return ""
+        labels = [item.get("material_label", "").strip() for item in materials if item.get("material_label")]
+        joined_labels = "、".join(dict.fromkeys(labels))
+        if not joined_labels:
+            return ""
+        return (
+            f"{company_name}郑重声明：本单位已按本项目要求提供主体资质、身份证明及授权相关材料，"
+            f"包括{joined_labels}。凡在本标书中引用到前述主体资料的章节，均同步插入对应原始文件、扫描页或图片内容；"
+            "未在正文中单独展开的资料，统一附于本文件后续附件章节备查。"
+        )
 
     def _write_formatted_content(doc, text):
         if not text or not text.strip():
@@ -3847,53 +4129,7 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
             pf.first_line_indent = Pt(24)
             pf.line_spacing = 1.5
 
-    def _write_table_from_lines(doc, lines):
-        table_rows = []
-        for line in lines:
-            stripped = line.strip()
-            if not stripped:
-                continue
-            cells_data = [c.strip() for c in re.split(r'\t+|\s{3,}|\|', stripped) if c.strip()]
-            if len(cells_data) >= 2:
-                table_rows.append(cells_data)
-        if not table_rows:
-            return
-        max_cols = max(len(row) for row in table_rows)
-        table = doc.add_table(rows=len(table_rows), cols=max_cols)
-        table.style = "Table Grid"
-        table.alignment = 1
-        for row_idx, row_data in enumerate(table_rows):
-            for col_idx, cell_text in enumerate(row_data):
-                if col_idx < len(table.rows[row_idx].cells):
-                    cell = table.rows[row_idx].cells[col_idx]
-                    # 表格内容也可能含有控制字符
-                    safe_cell_text = _strip_xml_control_chars(cell_text)
-                    cell.text = safe_cell_text
-                    if row_idx == 0:
-                        for paragraph in cell.paragraphs:
-                            for run in paragraph.runs:
-                                run.bold = True
-                                run.font.size = Pt(12)
-                                run.font.name = "\u4eff\u5b8b"
-                                run.element.rPr.rFonts.set(qn("w:eastAsia"), "\u4eff\u5b8b")
-        doc.add_paragraph("")
-
-    image_extensions = {"png", "jpg", "jpeg", "bmp", "gif", "webp"}
-    inserted_material_ids = set()
-
-    def _build_subject_declaration_text():
-        materials = subject_context.get("materials", []) if subject_context else []
-        if not company_name or not materials:
-            return ""
-        labels = [item.get("material_label", "").strip() for item in materials if item.get("material_label")]
-        joined_labels = "、".join(dict.fromkeys(labels))
-        if not joined_labels:
-            return ""
-        return (
-            f"{company_name}郑重声明：本单位已按本项目要求提供主体资质、身份证明及授权相关材料，"
-            f"包括{joined_labels}。凡在本标书中引用到前述主体资料的章节，均同步插入对应原始文件、扫描页或图片内容；"
-            "未在正文中单独展开的资料，统一附于本文件后续附件章节备查。"
-        )
+    
 
     def _get_material_identity(material):
         return material.get("id") or material.get("file_id") or material.get("file_name")
@@ -4048,49 +4284,7 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
         for material in remaining:
             _write_material_block(material)
 
-    def _write_missing_requirements_page():
-        missing_items = coverage_snapshot.get("missing_items", []) if coverage_snapshot else []
-        if not missing_items:
-            return
-        document.add_page_break()
-        document.add_heading("待人工补齐清单", level=1)
-        intro = document.add_paragraph(
-            "以下目录项在当前生成过程中未形成有效正文，需根据招标文件要求和实际资料进行人工补充。"
-        )
-        intro.style = document.styles["Normal"]
-        for item in missing_items:
-            target_title = (item.get("target_title") or item.get("chapter_title") or "未命名条目").strip()
-            requirement = (item.get("requirement") or "").strip()
-            requirement = _strip_xml_control_chars(requirement)
-            status = item.get("status") or "PENDING"
-            source_reference = (item.get("source_reference") or "").strip()
-            source_reference = _strip_xml_control_chars(source_reference)
-            p = document.add_paragraph()
-            p.style = document.styles["Normal"]
-            p.paragraph_format.first_line_indent = Pt(0)
-            head = p.add_run(f"{_strip_xml_control_chars(target_title)} [{status}]")
-            head.bold = True
-            head.font.name = "宋体"
-            head.font.size = Pt(12)
-            head.element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
-            if requirement:
-                safe_req = _strip_xml_control_chars(requirement)
-                detail = p.add_run(f"：{safe_req}")
-            else:
-                detail = p.add_run("：当前未提取到更明确的要求描述，请回查招标原文。")
-            detail.font.name = "宋体"
-            detail.font.size = Pt(12)
-            detail.element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
-            if source_reference:
-                source_para = document.add_paragraph(f"来源文件：{source_reference}")
-                source_para.style = document.styles["Normal"]
-                source_para.paragraph_format.first_line_indent = Pt(24)
-            original_excerpt = (item.get("original_requirement_excerpt") or "").strip()
-            original_excerpt = _strip_xml_control_chars(original_excerpt)
-            if item.get("requirement_level") == "REQUIRED" and original_excerpt:
-                excerpt_para = document.add_paragraph(f"招标文件原文提示：{_strip_xml_control_chars(original_excerpt)}")
-                excerpt_para.style = document.styles["Normal"]
-                excerpt_para.paragraph_format.first_line_indent = Pt(24)
+
 
     def _normalize_outline_title_for_match(title):
         return re.sub(r"\s+", "", str(title or "").strip())
@@ -4131,36 +4325,83 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                 sections[child_title] = "\n".join(body_lines).strip()
         return sections
 
-    # ========== 第二页固定封面 ==========
-    for _ in range(5):
+        # ========== 第二页封面（优先使用招标文件封面模板） ==========
+    _cover_analysis_data = None
+    _cover_fmt = {}
+    if analysis_result:
+        try:
+            _ad = analysis_result.safe_analysis_data()
+            if isinstance(_ad, dict):
+                _cover_fmt = _ad.get("format_requirements", {}) or {}
+        except Exception:
+            _cover_fmt = {}
+    
+    _cover_template_found = False
+    if _cover_fmt and isinstance(_cover_fmt, dict):
+        _cover_sections = _cover_fmt.get("required_sections", [])
+        for _sec in _cover_sections:
+            _sec_title = _sec.get("title", "").strip()
+            if "封面" in _sec_title or "封皮" in _sec_title:
+                _cover_blocks = _sec.get("content_blocks", [])
+                if _cover_blocks:
+                    for _blk in _cover_blocks:
+                        if _blk.get("type") == "paragraph":
+                            _text = _blk.get("text", "")
+                            _text = _text.replace("XXX（单位名称）", company_name or "XXX")
+                            _text = _text.replace("XXX", company_name or "XXX")
+                            _text = _text.replace("（项目名称）", cover_item_name or "（项目名称）")
+                            _text = _text.replace("（项目编号）", cover_project_no or "（项目编号）")
+                            _p = document.add_paragraph()
+                            _p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                            _r = _p.add_run(_text)
+                            _r.font.name = "宋体"
+                            _r.font.size = Pt(16)
+                            _r.element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
+                        elif _blk.get("type") == "table":
+                            _headers = _blk.get("headers", [])
+                            _rows = _blk.get("rows", [])
+                            if _headers and _rows:
+                                _t = document.add_table(rows=len(_rows), cols=len(_headers))
+                                _t.style = "Table Grid"
+                                for _ci, _h in enumerate(_headers):
+                                    _t.rows[0].cells[_ci].text = _h
+                                for _ri, _row in enumerate(_rows):
+                                    for _ci, _cell in enumerate(_row):
+                                        _filled = _cell.replace("XXX", company_name or "") if _ci == 0 else _cell
+                                        _t.rows[_ri].cells[_ci].text = _filled
+                    _cover_template_found = True
+                    break
+    
+    if not _cover_template_found:
+        # 自有封面模板
+        for _ in range(5):
+            document.add_paragraph("")
+        title_para = document.add_paragraph()
+        title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = title_para.add_run("投标文件")
+        run.font.name = "宋体"
+        run.font.size = Pt(22)
+        run.bold = True
+        run.element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
+
         document.add_paragraph("")
-    title_para = document.add_paragraph()
-    title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = title_para.add_run("\u6295\u6807\u6587\u4ef6")
-    run.font.name = "\u5b8b\u4f53"
-    run.font.size = Pt(22)
-    run.bold = True
-    run.element.rPr.rFonts.set(qn("w:eastAsia"), "\u5b8b\u4f53")
+        cover_fields = [
+            ("标的名称", cover_item_name),
+            ("项目编号", cover_project_no),
+            ("投标人名称", company_name),
+            ("投标时间", cover_bid_time),
+        ]
+        if cover_package_no:
+            cover_fields.append(("包号", cover_package_no))
 
-    document.add_paragraph("")
-    cover_fields = [
-        ("\u6807\u7684\u540d\u79f0", cover_item_name),
-        ("\u9879\u76ee\u7f16\u53f7", cover_project_no),
-        ("\u6295\u6807\u4eba\u540d\u79f0", company_name),
-        ("\u6295\u6807\u65f6\u95f4", cover_bid_time),
-    ]
-    if cover_package_no:
-        cover_fields.append(("\u5305\u53f7", cover_package_no))
-
-    for label, value in cover_fields:
-        field_para = document.add_paragraph()
-        field_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        safe_value = _strip_xml_control_chars(str(value or ""))
-        run = field_para.add_run(f"{label}\uff1a{safe_value}")
-        run.font.name = "\u5b8b\u4f53"
-        run.font.size = Pt(16)
-        run.element.rPr.rFonts.set(qn("w:eastAsia"), "\u5b8b\u4f53")
-
+        for label, value in cover_fields:
+            field_para = document.add_paragraph()
+            field_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            safe_value = _strip_xml_control_chars(str(value or ""))
+            run = field_para.add_run(f"{label}：{safe_value}")
+            run.font.name = "宋体"
+            run.font.size = Pt(16)
+            run.element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
     document.add_page_break()
 
     # ========== \u76ee\u5f55\u9875\uff08\u5360\u4f4d\uff09 ==========
@@ -4266,14 +4507,106 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
             return
 
         if matched_content:
+            # ========== 优先处理 ContentBlock 结构化内容 ==========
+            _chapter_cc = chapter_contents[chapter_idx].get("content_blocks") if level == 1 and chapter_idx is not None and chapter_idx < len(chapter_contents) else None
+            if not _chapter_cc:
+                for _cc in chapter_contents:
+                    if title in _cc.get("title", "") or _cc.get("title", "") in title:
+                        _chapter_cc = _cc.get("content_blocks")
+                        if _chapter_cc:
+                            break
+
+            if _chapter_cc:
+                for _block in _chapter_cc:
+                    if isinstance(_block, dict):
+                        if _block.get("type") == "paragraph":
+                            _p = document.add_paragraph(_strip_xml_control_chars(_block.get("text", "")))
+                            _p.style = document.styles["Normal"]
+                            for _r in _p.runs:
+                                _r.font.name = "仿宋"
+                                _r.font.size = Pt(12)
+                                _r.element.rPr.rFonts.set(qn("w:eastAsia"), "仿宋")
+                        elif _block.get("type") == "table":
+                            _headers = _block.get("headers", [])
+                            _rows = _block.get("rows", [])
+                            _merge_cells = _block.get("merge_cells", [])
+                            if _headers and _rows:
+                                _t = document.add_table(rows=len(_rows), cols=len(_headers))
+                                _t.style = "Table Grid"
+                                # 写表头
+                                for _ci, _h in enumerate(_headers):
+                                    _cell = _t.rows[0].cells[_ci]
+                                    _cell.text = _h
+                                # 写数据行
+                                for _ri, _row in enumerate(_rows):
+                                    for _ci, _cell_text in enumerate(_row):
+                                        if _ri + 1 < len(_t.rows) and _ci < len(_t.rows[_ri + 1].cells):
+                                            _t.rows[_ri + 1].cells[_ci].text = _cell_text
+                # ContentBlock 已处理，跳过后续文本写入
+                # 仍需要处理子章节
+                if children:
+                    pass
+                else:
+                    return
+
             # ========== 表格标记处理 ==========
             if isinstance(matched_content, str) and matched_content.startswith(_TABLE_MARKER_PREFIX):
+                # 先写入章节描述文字（表格前可能有文字段落）
+                if desc and desc not in title:
+                    desc_p = document.add_paragraph(_strip_xml_control_chars(desc))
+                    desc_p.style = document.styles["Normal"]
+                    for run in desc_p.runs:
+                        run.font.name = "仿宋"
+                        run.font.size = Pt(12)
+                        run.element.rPr.rFonts.set(qn("w:eastAsia"), "仿宋")
                 # 提取表格类型和 tab 分隔数据
                 end_marker = matched_content.find("]]\n")
                 if end_marker > 0:
                     table_data = matched_content[end_marker + 3:].strip()
                     if table_data:
-                        _write_table_from_lines(document, table_data.split("\n"))
+                        # 分离：合并信息、前后段落、表格数据
+                        merge_lines = []
+                        text_before_block = ""
+                        text_after_block = ""
+                        table_lines = table_data.split("\n")
+                        # 检查是否有 --TEXT-BEFORE--
+                        if "--TEXT-BEFORE--" in table_lines:
+                            tb_idx = table_lines.index("--TEXT-BEFORE--")
+                            text_before_block = table_lines[tb_idx + 1] if tb_idx + 1 < len(table_lines) else ""
+                            # 移除 TEXT-BEFORE 行
+                            table_lines = table_lines[:tb_idx] + table_lines[tb_idx + 2:]
+                        # 检查是否有 --TEXT-AFTER--
+                        if "--TEXT-AFTER--" in table_lines:
+                            ta_idx = table_lines.index("--TEXT-AFTER--")
+                            text_after_block = table_lines[ta_idx + 1] if ta_idx + 1 < len(table_lines) else ""
+                            table_lines = table_lines[:ta_idx] + table_lines[ta_idx + 2:]
+                        # 分离合并单元格信息
+                        if "--MERGES--" in table_lines:
+                            idx = table_lines.index("--MERGES--")
+                            merge_data_lines = table_lines[idx+1:]
+                            table_lines = table_lines[:idx]
+                            for ml in merge_data_lines:
+                                parts = ml.split(":")
+                                if len(parts) == 4:
+                                    merge_lines.append({"type": parts[0], "row": int(parts[1]), "col": int(parts[2]), "span": int(parts[3])})
+                        # 写入表格前的段落
+                        if text_before_block:
+                            tb_p = document.add_paragraph(_strip_xml_control_chars(text_before_block))
+                            tb_p.style = document.styles["Normal"]
+                            for run in tb_p.runs:
+                                run.font.name = "仿宋"
+                                run.font.size = Pt(12)
+                                run.element.rPr.rFonts.set(qn("w:eastAsia"), "仿宋")
+                        # 写入表格
+                        _write_table_from_lines(document, table_lines, merges=merge_lines)
+                        # 写入表格后的段落
+                        if text_after_block:
+                            ta_p = document.add_paragraph(_strip_xml_control_chars(text_after_block))
+                            ta_p.style = document.styles["Normal"]
+                            for run in ta_p.runs:
+                                run.font.name = "仿宋"
+                                run.font.size = Pt(12)
+                                run.element.rPr.rFonts.set(qn("w:eastAsia"), "仿宋")
                 else:
                     # 如果只有标记没有数据，写入说明
                     document.add_paragraph("（此处为表格模板，请根据实际情况填写）")
@@ -4298,40 +4631,30 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                     missing = qual_data.get("missing_count", 0)
                     total = uploaded + kb_found + missing
                     
-                    document.add_paragraph("以下为本次需提交的资格证明材料清单及状态：")
-                    for item in items:
+                    for _qi_idx, item in enumerate(items):
+                        if _qi_idx > 0:
+                            document.add_page_break()
                         req = item.get("requirement", "")
                         safe_req = _strip_xml_control_chars(req)
                         status = item.get("status", "MISSING")
                         
+                        # 每项资格内容使用三级标题
+                        _qh = document.add_heading(_strip_xml_control_chars(req), level=3)
+                        
                         if status == "UPLOADED":
-                            p = document.add_paragraph(f"✅ {safe_req}（主体已上传）")
+                            p = document.add_paragraph("（主体已上传相关证明材料）")
                             p.style = document.styles["Normal"]
                         elif status == "KB_FOUND":
-                            kb_excerpt = item.get("kb_excerpt", "")
-                            if kb_excerpt:
-                                p = document.add_paragraph(f"📄 {safe_req}（知识库检索到）")
-                            else:
-                                p = document.add_paragraph(f"📄 {safe_req}（知识库检索到）")
+                            p = document.add_paragraph("（知识库检索到相关证明材料）")
                             p.style = document.styles["Normal"]
                         else:
-                            p = document.add_paragraph(f"⬜ {safe_req}（待人工补充）")
+                            p = document.add_paragraph("（待人工补充相关证明材料）")
                             p.style = document.styles["Normal"]
                             if p.runs:
                                 p.runs[0].font.color.rgb = RGBColor(0xCC, 0x00, 0x00)
-                    
-                    if missing > 0:
-                        note = document.add_paragraph(
-                            f"共需{total}项，"
-                            f"主体已上传{uploaded}项，"
-                            f"知识库检索到{kb_found}项，"
-                            f"缺失{missing}项。缺失项请在[待人工补齐清单]中补充。"
-                        )
-                        note.style = document.styles["Normal"]
-                        note.alignment = WD_ALIGN_PARAGRAPH.LEFT
                 except Exception as exc:
                     logger.warning("[qualification] 资格证明数据解析失败: %s", exc)
-                    document.add_paragraph("（资格证明文件处理异常，请在[待人工补齐清单]中查看）")
+                    document.add_paragraph("（资格证明文件处理异常，请在对应章节查看）")
                 _write_subject_materials_for_outline_item(title, desc)
                 children_for_qual = outline_item.get("children", [])
                 for child in children_for_qual:
@@ -4351,7 +4674,7 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                 stripped = line.strip()
                 if not stripped:
                     if in_table_block:
-                        _write_table_from_lines(document, table_lines)
+                        _write_table_from_lines(document, table_lines, merges=[])
                         table_lines = []
                         in_table_block = False
                     continue
@@ -4360,12 +4683,12 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                     table_lines.append(stripped)
                 else:
                     if in_table_block:
-                        _write_table_from_lines(document, table_lines)
+                        _write_table_from_lines(document, table_lines, merges=[])
                         table_lines = []
                         in_table_block = False
                     normal_lines.append(stripped)
             if in_table_block and table_lines:
-                _write_table_from_lines(document, table_lines)
+                _write_table_from_lines(document, table_lines, merges=[])
             if normal_lines:
                 _write_formatted_content(document, "\n".join(normal_lines))
 
@@ -4379,10 +4702,11 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
         item["_chapter_idx"] = idx
 
     # ========== \u6309\u76ee\u5f55\u7ed3\u6784\u751f\u6210\u6b63\u6587 ==========
-    for item in outline:
+    for _oi_idx, item in enumerate(outline):
+        if _oi_idx > 0:
+            document.add_page_break()
         _write_outline_item(item, level=1)
 
-    _write_missing_requirements_page()
     _write_remaining_subject_materials()
 
     stream = BytesIO()

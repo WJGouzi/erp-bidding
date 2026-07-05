@@ -49,7 +49,7 @@ def setup_logging(log_dir=None, log_level="DEBUG", console_level="INFO"):
     root.addHandler(file_handler)
     
     # 第三方库的日志调低，避免刷屏
-    for noisy in ("sqlalchemy.engine", "urllib3", "chromadb"):
+    for noisy in ("sqlalchemy.engine", "urllib3", "chromadb", "httpx", "httpcore", "openai"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
     
     logging.getLogger("app").info("日志系统初始化完成, 文件路径: %s", log_path / "app.log")

@@ -273,6 +273,78 @@ def _extract_scoring(table) -> dict:
     return {"headers": raw_headers, "dimensions": dimensions}
 
 
+def _extract_raw_table(table) -> dict:
+    """提取表格的原始行列数据（不依赖分类），含合并单元格信息。
+    
+    返回:
+        {"headers": [...], "rows": [[...], ...], "merges": [...]}
+        merges: [{"type": "horizontal"|"vertical", "row": int, "col": int, "span": int}, ...]
+    """
+    ns = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
+    if not hasattr(table, 'rows') or not table.rows:
+        return {"headers": [], "rows": [], "merges": []}
+    
+    # 提取所有行的单元格数据（兼容 python-docx Table 和 TableStub）
+    first_row = table.rows[0]
+    if hasattr(first_row, 'cells'):
+        # python-docx Table: rows[0] 是 Row 对象
+        headers = [cell.text.strip() for cell in first_row.cells]
+    else:
+        # TableStub: rows[0] 是 list[str]
+        headers = [str(c).strip() for c in first_row]
+    rows = []
+    merges = []
+    # 记录每行已被水平合并覆盖的列
+    covered_horiz = {}  # row_idx -> set(col_idx)
+    for r_idx, row in enumerate(table.rows):
+        if hasattr(row, 'cells'):
+            # python-docx Row
+            cells = [cell.text.strip() for cell in row.cells]
+        else:
+            # TableStub list
+            cells = [str(c).strip() for c in row]
+        covered = covered_horiz.setdefault(r_idx, set())
+        for c_idx in range(len(cells)):
+            cell_text = cells[c_idx]
+            # 跳过已被合并覆盖的虚拟列
+            if c_idx in covered:
+                continue
+            # 合并单元格检测（仅 python-docx Row 支持）
+            if hasattr(row, 'cells') and c_idx < len(row.cells):
+                cell = row.cells[c_idx]
+                try:
+                    tc = cell._tc
+                    grid_span = tc.find(f'.//{ns}gridSpan')
+                    v_merge = tc.find(f'.//{ns}vMerge')
+                    if grid_span is not None:
+                        span_val = int(grid_span.get(f'{ns}val', '1'))
+                        if span_val > 1:
+                            merges.append({"type": "horizontal", "row": r_idx, "col": c_idx, "span": span_val})
+                            for cc in range(c_idx, min(c_idx + span_val, len(cells))):
+                                covered.add(cc)
+                    if v_merge is not None:
+                        v_val = v_merge.get(f'{ns}val', 'continue')
+                        if v_val == 'restart' or v_val is None:
+                            merge_count = 1
+                            for nr in range(r_idx + 1, len(table.rows)):
+                                if hasattr(table.rows[nr], 'cells') and c_idx < len(table.rows[nr].cells):
+                                    nc = table.rows[nr].cells[c_idx]
+                                    nv = nc._tc.find(f'.//{ns}vMerge')
+                                    if nv is not None and nv.get(f'{ns}val', 'continue') == 'continue':
+                                        merge_count += 1
+                                    elif nv is not None and nv.get(f'{ns}val', 'restart') == 'restart' and nc.text.strip() == cell_text:
+                                        merge_count += 1
+                                    else:
+                                        break
+                            if merge_count > 1:
+                                merges.append({"type": "vertical", "row": r_idx, "col": c_idx, "span": merge_count})
+                except Exception:
+                    pass
+        rows.append(cells)
+    
+    return {"headers": headers, "rows": rows, "merges": merges}
+
+
 def _extract_table_data(table, table_type: str) -> dict:
     """按类型提取表格结构化数据。"""
     if table_type == TYPE_PRELIMINARY:
@@ -323,18 +395,45 @@ def classify_all_tables(tables, min_confidence: float = 0.25) -> dict:
         "qualification_checks": [],
         "other_tables": [],
         "table_index": {},
+        "raw_tables": [],
     }
     
+    # 前置提取：所有表格的原始数据（无论分类结果如何）
+    for table in tables:
+        # 跳过非 python-docx Table 对象（如已解析的 dict/list）
+        if not hasattr(table, 'rows') or not table.rows:
+            result["raw_tables"].append({"headers": [], "rows": [], "merges": []})
+            continue
+        try:
+            result["raw_tables"].append(_extract_raw_table(table))
+        except Exception as exc:
+            logger.warning("[table_classifier] 提取原始表格数据异常: %s", exc)
+            result["raw_tables"].append({"headers": [], "rows": [], "merges": []})
+            continue
+    
     for i, table in enumerate(tables):
-        table_no = i + 1
-        table_type, confidence = classify_table(table)
-        result["table_index"][table_no] = table_type
+        # 跳过非 python-docx Table 对象（如已解析的 dict/list）
+        if not hasattr(table, 'rows') or not table.rows:
+            continue
+        try:
+            table_no = i + 1
+            table_type, confidence = classify_table(table)
+            result["table_index"][table_no] = table_type
+        except Exception as exc:
+            logger.warning("[table_classifier] 分类异常(table=%d): %s", i + 1, exc)
+            result["other_tables"].append(i + 1)
+            continue
         
         if confidence < min_confidence or table_type == TYPE_OTHER:
             result["other_tables"].append(table_no)
             continue
         
-        data = _extract_table_data(table, table_type)
+        try:
+            data = _extract_table_data(table, table_type)
+        except Exception as exc:
+            logger.warning("[table_classifier] 提取表格数据异常(table=%d, type=%s): %s", table_no, table_type, exc)
+            result["other_tables"].append(table_no)
+            continue
         
         if table_type == TYPE_PRELIMINARY:
             result["preliminary"] = data
@@ -368,3 +467,58 @@ def classify_all_tables(tables, min_confidence: float = 0.25) -> dict:
     )
     
     return result
+
+
+def extract_table_surroundings(body, ns='{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'):
+    """提取文档中每个表格前后的段落文本。
+
+    Args:
+        body: python-docx Document.element.body
+        ns: OOXML namespace
+
+    Returns:
+        list[dict]: [{"text_before": "...", "text_after": "..."}, ...]
+        顺序与 doc.tables 对应
+    """
+    children = list(body)
+    surroundings = []
+    table_index = -1
+    for i, child in enumerate(children):
+        tag = child.tag.split('}')[-1] if '}' in child.tag else child.tag
+        if tag != 'tbl':
+            continue
+        table_index += 1
+        text_before = ""
+        text_after = ""
+        
+        # 查找前一个非空段落
+        for j in range(i - 1, max(i - 10, -1), -1):
+            ptag = children[j].tag.split('}')[-1] if '}' in children[j].tag else children[j].tag
+            if ptag == 'tbl':
+                break  # 遇到上一个表格停止
+            if ptag == 'p':
+                ts = [t.text for t in children[j].findall(f'.//{ns}t') if t.text]
+                txt = ''.join(ts).strip()
+                if txt:
+                    text_before = txt
+                    break
+        
+        # 查找后一个非空段落
+        for j in range(i + 1, min(i + 10, len(children))):
+            ptag = children[j].tag.split('}')[-1] if '}' in children[j].tag else children[j].tag
+            if ptag == 'tbl':
+                break  # 遇到下一个表格停止
+            if ptag == 'p':
+                ts = [t.text for t in children[j].findall(f'.//{ns}t') if t.text]
+                txt = ''.join(ts).strip()
+                if txt:
+                    text_after = txt
+                    break
+        
+        surroundings.append({
+            "table_index": table_index,
+            "text_before": text_before,
+            "text_after": text_after,
+        })
+    
+    return surroundings

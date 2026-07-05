@@ -117,10 +117,16 @@ def _basic_merge(segment_results: list) -> dict:
     result = _empty_result()
     seen_excerpts = set()
 
+    # 排除合同模板章节的资格/评分/商务分析（合同内容不应影响标书生成）
+    _CONTRACT_KEYWORDS = ["合同模板", "合同条款", "合同样本", "合同范本", "合同草案", "合同（草案）", "合同主要条款", "合同通用条款", "合同专用条款"]
+    
     for seg in segment_results:
         seg_id = seg.get("segment_id", "")
         title = seg.get("title", "")
         page_range = seg.get("page_range", [])
+        
+        # 判断是否为合同章节
+        _is_contract = any(kw in title for kw in _CONTRACT_KEYWORDS)
 
         # ── metadata ──
         meta = seg.get("metadata", {}) or {}
@@ -151,9 +157,9 @@ def _basic_merge(segment_results: list) -> dict:
             if mandate_item not in result["mandate_items"]:
                 result["mandate_items"].append(mandate_item)
 
-        # ── eligibility ──
+        # ── eligibility（合同章节不贡献资格/废标项） ──
         elig = seg.get("eligibility", {}) or {}
-        if isinstance(elig, dict):
+        if isinstance(elig, dict) and not _is_contract:
             for q in elig.get("qualifications", []) or []:
                 req = q.get("requirement") or q.get("text") or ""
                 if req and req not in seen_excerpts:
@@ -172,9 +178,9 @@ def _basic_merge(segment_results: list) -> dict:
                         "source_segment_ids": [seg_id],
                     })
 
-        # ── scoring ──
+        # ── scoring（合同章节不贡献评分） ──
         scoring = seg.get("scoring", {}) or {}
-        if isinstance(scoring, dict) and scoring.get("dimensions"):
+        if isinstance(scoring, dict) and scoring.get("dimensions") and not _is_contract:
             # 取评分方法最完整的一个段
             if not result["scoring"]["method"] and scoring.get("method"):
                 result["scoring"]["method"] = scoring["method"]
@@ -191,8 +197,10 @@ def _basic_merge(segment_results: list) -> dict:
                             "source_segment_ids": [seg_id],
                         })
 
-        # ── business/technical ──
+        # ── business/technical（合同章节不贡献商务/技术要求） ──
         for field in ("business_requirements", "technical_requirements"):
+            if _is_contract:
+                continue
             items = seg.get(field, []) or []
             if isinstance(items, list):
                 for item in items:
@@ -204,9 +212,9 @@ def _basic_merge(segment_results: list) -> dict:
                             "source_segment_ids": [seg_id],
                         })
 
-        # ── products ──
+        # ── products（合同章节不贡献产品） ──
         products = seg.get("products", []) or []
-        if isinstance(products, list):
+        if isinstance(products, list) and not _is_contract:
             for p in products:
                 name = p.get("name") or p.get("product_name") or ""
                 if name and name not in seen_excerpts:

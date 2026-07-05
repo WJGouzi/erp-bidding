@@ -16,7 +16,7 @@
 
 import logging
 import re
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any
 
 logger = logging.getLogger(__name__)
 
@@ -117,40 +117,189 @@ def _extract_required_sections(section) -> List[Dict]:
                 file_type = ftype
                 break
 
+        # 提取固定文本内容（即使没有表格，也要捕获内容）
+        template_texts = []
+        # 新增：有序内容列表，保留文本与表格的原始顺序
+        template_content = []
+        for block in getattr(child, "content", []):
+            txt = getattr(block, "text", None)
+            if txt and txt.strip() and len(txt.strip()) >= 10:
+                template_texts.append(txt.strip())
+            _type = getattr(block, "type", "") or ""
+            if _type == "table":
+                _headers = getattr(block, "headers", []) or []
+                _rows = getattr(block, "rows", []) or []
+                template_content.append({
+                    "type": "table",
+                    "headers": _headers[:10],
+                    "rows": _rows[:20],
+                })
+            elif txt and txt.strip() and len(txt.strip()) >= 5:
+                template_content.append({
+                    "type": "text",
+                    "text": txt.strip()[:2000],
+                })
+        # 也检查子章节的内容
+        for sub in getattr(child, "children", []):
+            for block in getattr(sub, "content", []):
+                txt = getattr(block, "text", None)
+                if txt and txt.strip() and len(txt.strip()) >= 10:
+                    template_texts.append(txt.strip())
+                _type = getattr(block, "type", "") or ""
+                if _type == "table":
+                    _headers = getattr(block, "headers", []) or []
+                    _rows = getattr(block, "rows", []) or []
+                    template_content.append({
+                        "type": "table",
+                        "headers": _headers[:10],
+                        "rows": _rows[:20],
+                    })
+                elif txt and txt.strip() and len(txt.strip()) >= 5:
+                    template_content.append({
+                        "type": "text",
+                        "text": txt.strip()[:2000],
+                    })
+
         required.append({
             "title": title,
             "order": idx + 1,
             "required": True,
             "has_template": has_template,
             "template_tables": _extract_template_tables(child),
+            "template_texts": template_texts,
+            "template_content": template_content,
             "file_type": file_type,
         })
 
     return required
 
 
+def _collapse_merged_columns(headers: List[str], rows: List[List[str]], cell_index: int = 0) -> tuple:
+    """根据表头行中连续重复的列名折叠合并列（处理 WPS 伪合并）。
+
+    WPS 表格经常出现相邻列有相同文本但无标准 OOXML hMerge 的情况，
+    表现为 gridSpan=2 但两个物理格都存在且文本相同。
+    此函数将连续相同文本的列合并为一个逻辑列。
+
+    Args:
+        headers: 表头列表
+        rows: 数据行列表
+        cell_index: 当 headers 长度与行单元格数不一致时尝试的索引偏移
+
+    Returns:
+        (collapsed_headers, collapsed_rows)
+    """
+    if not headers:
+        return headers, rows
+
+    # 检测需要折叠的列：连续相同文本的列组
+    collapse_groups = []  # [(start, end), ...]
+    i = 0
+    while i < len(headers):
+        j = i + 1
+        while j < len(headers) and headers[j] == headers[i] and headers[i] != '':
+            j += 1
+        if j - i > 1:
+            collapse_groups.append((i, j - 1))  # start, end inclusive
+        i = j
+
+    if not collapse_groups:
+        return headers, rows
+
+    # 构建旧列→新列的映射
+    col_map = {}
+    new_idx = 0
+    for i in range(len(headers)):
+        # 如果此列属于折叠组且不是第一个，映射到前一个
+        in_group = False
+        for start, end in collapse_groups:
+            if start < i <= end:
+                col_map[i] = col_map.get(start, new_idx - 1)
+                in_group = True
+                break
+        if not in_group:
+            col_map[i] = new_idx
+            new_idx += 1
+
+    # 折叠表头
+    new_headers = []
+    seen = set()
+    for i, h in enumerate(headers):
+        nc = col_map.get(i, i)
+        if nc not in seen:
+            new_headers.append(h)
+            seen.add(nc)
+
+    # 折叠数据行
+    new_rows = []
+    for row in rows:
+        new_row = [''] * len(new_headers)
+        for i, cell in enumerate(row):
+            nc = col_map.get(i, i)
+            if nc < len(new_row):
+                if not new_row[nc]:
+                    new_row[nc] = cell
+                elif cell and cell != new_row[nc]:
+                    # 非空内容不同时追加
+                    new_row[nc] += ' ' + cell
+        new_rows.append(new_row)
+
+    return new_headers, new_rows
+
+
 def _extract_template_tables(section) -> List[Dict]:
     """从章节中提取模板表格。
 
-    搜索当前章节及其子章节的内容块，收集 table 类型块。
+    仅搜索当前章节的直接内容块，**不递归子章节**。
+    通过限制作用域防止解析器分组错误的表被错误关联。
     """
     tables = []
-
-    def _collect(node):
-        for block in getattr(node, "content", []):
-            if getattr(block, "type", "") == "table":
-                headers = getattr(block, "headers", []) or []
-                rows = getattr(block, "rows", []) or []
-                if headers or rows:
-                    tables.append({
-                        "headers": headers[:10],
-                        "rows": rows[:20],
-                    })
-        for child in getattr(node, "children", []):
-            _collect(child)
-
-    _collect(section)
+    
+    for block in getattr(section, "content", []):
+        if getattr(block, "type", "") == "table":
+            headers = getattr(block, "headers", []) or []
+            rows = getattr(block, "rows", []) or []
+            if not headers and not rows:
+                continue
+            # 折叠水平合并列（处理 WPS 伪合并）
+            headers, rows = _collapse_merged_columns(headers, rows)
+            tables.append({
+                "headers": headers[:20],
+                "rows": rows[:30],
+            })
     return tables
+
+
+
+def _detect_cover_sections(sections) -> List[Dict]:
+    """检测所有章节中的封面页。
+
+    遍历整个文档章节树，搜索标题中包含"封面"或"封皮"的章节。
+    封面页可能出现在文档树的任意位置（顶层级、格式章节子级等），
+    需要全局搜索而非仅局限于格式章节。
+    """
+    covers = []
+    
+    def _search(section_list):
+        for child in section_list:
+            title = getattr(child, "title", "") or ""
+            if "封面" in title or "封皮" in title:
+                lines = []
+                for block in getattr(child, "content", []):
+                    text = getattr(block, "text", "") or ""
+                    if text.strip():
+                        lines.append(text.strip())
+                covers.append({
+                    "title": title,
+                    "template_text": "\n".join(lines)[:1000],
+                    "order": len(covers) + 1,
+                })
+            children = getattr(child, "children", [])
+            if children:
+                _search(children)
+    
+    _search(sections if isinstance(sections, list) else [])
+    return covers
 
 
 def _extract_fixed_texts(section) -> List[Dict]:
@@ -203,10 +352,13 @@ def extract_format_requirements(sections) -> Optional[Dict]:
         logger.info("[phase1.5] 格式章节 '%s' 无子章节", chapter_title)
         return None
 
-    # 收集所有模板表格
+    # 收集所有模板表格（注入所属章节标题）
     all_tables = []
     for rs in required_sections:
-        all_tables.extend(rs.get("template_tables", []))
+        section_title = rs.get("title", "")
+        for tbl in rs.get("template_tables", []):
+            tbl["title"] = section_title
+            all_tables.append(tbl)
 
     # 收集固定文本
     fixed_texts = _extract_fixed_texts(chapter)
@@ -223,10 +375,14 @@ def extract_format_requirements(sections) -> Optional[Dict]:
         chapter_title, len(required_sections), len(all_tables), len(fixed_texts), confidence,
     )
 
+    # 检测封面页
+    cover_pages = _detect_cover_sections(sections)
+
     return {
         "chapter_title": chapter_title,
         "required_sections": required_sections,
         "template_tables": all_tables,
         "fixed_texts": fixed_texts,
+        "cover_pages": cover_pages,
         "confidence": confidence,
     }

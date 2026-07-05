@@ -102,6 +102,18 @@ def assemble_bidding_info(result, analysis: dict) -> dict:
 
     pkg_info = _get_current_package_info(result)
 
+    # bid_deadline/bid_open_time 优先从顶层读取，fallback 到 key_dates 子结构
+    _bid_dl = meta.get("bid_deadline", "") or ""
+    if not _bid_dl:
+        _kd = meta.get("key_dates", {})
+        if isinstance(_kd, dict):
+            _bid_dl = _kd.get("bid_deadline", "") or ""
+    _bid_ot = meta.get("bid_open_time", "") or ""
+    if not _bid_ot:
+        _kd2 = meta.get("key_dates", {})
+        if isinstance(_kd2, dict):
+            _bid_ot = _kd2.get("bid_opening", "") or ""
+
     return {
         "project_name": meta.get("project_name", {}).get("value", "") if isinstance(meta.get("project_name"), dict) else (meta.get("project_name") or ""),
         "project_code": meta.get("project_code", {}).get("value", "") if isinstance(meta.get("project_code"), dict) else (meta.get("project_code") or ""),
@@ -114,7 +126,7 @@ def assemble_bidding_info(result, analysis: dict) -> dict:
         "summary": getattr(result, "computed_overview", None) or result.overview or "",
         "sme_only": meta.get("sme_only", False),
         "dark_bid": meta.get("dark_bid", False),
-        "bid_deadline": meta.get("bid_deadline", ""),
+        "bid_deadline": _bid_dl,
         "bid_bond": meta.get("bid_bond", ""),
-        "bid_open_time": meta.get("bid_open_time", ""),
+        "bid_open_time": _bid_ot,
     }
