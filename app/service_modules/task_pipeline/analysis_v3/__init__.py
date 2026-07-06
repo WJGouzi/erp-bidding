@@ -410,25 +410,21 @@ def start_analyze_v3(task, source_texts, adapter=None):
                     "[analysis_v3] FileStorage 不存在: file_id=%s",
                     shared_resource.tender_file_id)
             elif file_record.storage_provider in ("CHROMA", "CHROMA_MANAGED"):
-                # CHROMA 存储：优先从解析缓存重建文档
-                # 先尝试获取文件原始字节（用于强制重新解析）
+                # CHROMA 存储：优先从解析缓存重建文档，绝不删除缓存
+                # （因为 CHROMA 文件可能没有 MinIO 备份，缓存是唯一数据源）
+                # 先尝试获取文件原始字节（如果有 MinIO 备份则可以重新解析）
                 _file_payload = _get_file_payload(file_record)
                 if _file_payload:
-                    # 有原始文件，可以安全删除缓存强制重新解析
+                    # 有原始文件（MinIO 备份）：先解析，成功后更新缓存
                     try:
-                        from ....domain import DocParseCache as _DPC
-                        _DPC.query.filter_by(file_id=file_record.id).delete()
-                        db.session.commit()
-                        logger.info("[analysis_v3] 删除旧解析缓存(file_id=%s)以强制重新解析", file_record.id)
-                    except Exception as _ce:
-                        logger.warning("[analysis_v3] 删除旧缓存异常: %s", _ce)
-                        db.session.rollback()
-                    # 直接解析原始文件
-                    try:
-                        doc = parser.parse_structured(file_record.file_name, _file_payload)
-                        logger.info("[analysis_v3] 重新解析成功: file=%s", file_record.file_name)
+                        _new_doc = parser.parse_structured(file_record.file_name, _file_payload)
+                        if _new_doc:
+                            doc = _new_doc
+                            logger.info("[analysis_v3] CHROMA+MinIO 重新解析成功: file=%s", file_record.file_name)
                     except Exception as _parse_exc:
-                        logger.warning("[analysis_v3] 重新解析失败: %s，降级使用缓存", _parse_exc)
+                        logger.warning("[analysis_v3] CHROMA+MinIO 重新解析失败: %s，降级使用缓存", _parse_exc)
+                    if not doc:
+                        # 解析失败，从缓存恢复
                         doc = _get_structured_doc_from_cache(file_record)
                     if doc:
                         try:
@@ -439,7 +435,6 @@ def start_analyze_v3(task, source_texts, adapter=None):
                     # 无原始文件（仅 ChromaDB 有数据），使用缓存
                     doc = _get_structured_doc_from_cache(file_record)
                     if doc:
-                        # 缓存加载后：从 doc.tables（TableStub，含 merge_cells）回填到 sections 的 ContentBlock 中
                         try:
                             _backfill_merge_cells_from_tables(doc)
                         except Exception as _bf_exc:
@@ -448,23 +443,8 @@ def start_analyze_v3(task, source_texts, adapter=None):
                         raise RuntimeError(
                             f"无法获取文件内容: file_id={file_record.id}, "
                             f"storage={file_record.storage_provider}, "
-                            f"缓存不可用且无原始文件可重新解析"
+                            f"缓存不存在，请重新上传文件"
                         )
-                if not doc:
-                    # 缓存不存在或已失效：回退到原始字节解析
-                    logger.info("[analysis_v3] 缓存不可用，回退到原始解析: file_id=%s", file_record.id)
-                    payload = _get_file_payload(file_record)
-                    if payload:
-                        try:
-                            doc = parser.parse_structured(
-                                file_record.file_name, payload)
-                            logger.info("[analysis_v3] 回退解析成功: file=%s", file_record.file_name)
-                        except Exception as exc2:
-                            logger.warning("[analysis_v3] 回退解析失败: %s", exc2)
-                    else:
-                        logger.warning(
-                            "[analysis_v3] 无法读取文件内容: file_id=%s, storage=%s",
-                            file_record.id, file_record.storage_provider)
             else:
                 # MINIO：读取文件原始字节后解析
                 payload = _get_file_payload(file_record)
@@ -859,9 +839,12 @@ def _get_file_payload(file_record):
         adapter = MinioAdapter(endpoint, access_key, secret_key, bucket_name, secure)
         return adapter.download_bytes(file_record.minio_object_name)
 
-    # 非 MINIO 存储（如 CHROMA）无法获取原始文件字节
-
-    return None
+    # 非 MINIO 存储无法获取原始文件字节
+    raise RuntimeError(
+        f"无法获取文件原始字节: file_id={file_record.id}, "
+        f"storage_provider={file_record.storage_provider}, "
+        f"只有 MINIO 存储支持原始字节读取"
+    )
 
 
 def _get_structured_doc_from_cache(file_record, current_version="2.1"):

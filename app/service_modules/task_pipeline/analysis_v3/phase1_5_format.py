@@ -309,6 +309,7 @@ def _extract_template_tables(section) -> List[Dict]:
             tables.append({
                 "headers": headers,
                 "rows": rows,
+                "merge_cells": getattr(block, "merge_cells", []) or [],
             })
     return tables
 
@@ -383,6 +384,27 @@ def _build_per_cell(headers, rows, merge_cells, column_widths):
     except Exception as exc:
         logger.warning("[phase1.5] _build_per_cell 失败: %s", exc)
         return None
+
+
+def _clean_section_title(title: str) -> str:
+    """清洗章节标题用于精确 key 匹配。
+
+    移除序号前缀（"一、""1.""（一）""第一章 "等），全角转半角，压缩空格。
+    """
+    if not title:
+        return ""
+    # 全角转半角
+    t = title.replace("\u3000", " ").replace("\uff01", "!").replace("\uff0c", ",").replace("\uff1a", ":")
+    # 去掉序号前缀：一、二、三...  1. 2.  （一）（二）  第一章 第二章
+    t = re.sub(r'^[\u4e00-\u9fff]{1,3}[\u3001\u3002]\s*', '', t)
+    t = re.sub(r'^\d+[.、]\s*', '', t)
+    t = re.sub(r'^[（(][\u4e00-\u9fff\d]+[）)]\s*', '', t)
+    t = re.sub(r'^第[\u4e00-\u9fff\d]+[章章节条]\s*', '', t)
+    # 压缩空格
+    t = re.sub(r'\s+', ' ', t).strip()
+    return t
+
+
 def extract_format_requirements(sections) -> Optional[Dict]:
     """从文档章节树中提取格式要求。
 
@@ -427,6 +449,13 @@ def extract_format_requirements(sections) -> Optional[Dict]:
         confidence = 0.7 + min(len(required_sections) / 20, 0.2)
     if any(rs["has_template"] for rs in required_sections):
         confidence = min(confidence + 0.1, 0.95)
+    # 构建 section_lookup：清洗后的标题 → section dict，用于生成阶段精确匹配
+    section_lookup = {}
+    for rs in required_sections:
+        key = _clean_section_title(rs.get("title", ""))
+        if key:
+            section_lookup[key] = rs
+
 
     logger.info(
         "[phase1.5] 格式要求提取完成: chapter='%s', sections=%d, tables=%d, fixed=%d, confidence=%.2f",
@@ -439,6 +468,7 @@ def extract_format_requirements(sections) -> Optional[Dict]:
     return {
         "chapter_title": chapter_title,
         "required_sections": required_sections,
+        "section_lookup": section_lookup,
         "template_tables": all_tables,
         "fixed_texts": fixed_texts,
         "cover_pages": cover_pages,

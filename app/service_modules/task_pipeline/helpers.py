@@ -322,7 +322,7 @@ def _extract_analysis_context(analysis_result):
                     product_lists.append(item)
             # 使用 raw_tables（由 classify_all_tables 前置提取，含所有表格的原始数据）
             for rt in tc.get("raw_tables", []):
-                if not rt:
+                if not isinstance(rt, dict):
                     continue
                 if rt.get("headers") and rt.get("rows"):
                     raw_tables.append({
@@ -4115,41 +4115,49 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                         _chapter_cc = _cc.get("content_blocks")
                         if _chapter_cc:
                             break
-                # 仍未找到 content_blocks：从 format_requirements 直接查找模板内容（适配分隔页子节点）
+                # 分隔页子节点：直接从 analysis_data 查找模板内容
                 if not _chapter_cc:
                     try:
-                        _fmt = analysis_context.get("_format_requirements", {}) if isinstance(analysis_context, dict) else {}
-                        _secs = _fmt.get("required_sections", []) if isinstance(_fmt, dict) else []
-                        if _secs:
-                            from .template_binder import _clean_title as _fmt_clean
-                            _clean_t = _fmt_clean(title)
-                            for _sec in _secs:
-                                _sec_t = _sec.get("title", "").strip()
-                                _sec_clean = _fmt_clean(_sec_t)
-                                if _clean_t in _sec_clean or _sec_clean in _clean_t:
-                                    _tc = _sec.get("template_content", []) or _sec.get("content_blocks", [])
-                                    if _tc:
-                                        from .template_binder import ContentBlock as _CB
-                                        _blocks = []
-                                        for _bd in _tc:
-                                            if not isinstance(_bd, dict):
-                                                continue
-                                            _bt = _bd.get("type", "text")
-                                            if _bt in ("text", "paragraph"):
-                                                _blocks.append(_CB.paragraph(_bd.get("text", ""), []))
-                                            elif _bt == "table":
-                                                _blocks.append(_CB.table(
-                                                    _bd.get("headers", []),
-                                                    _bd.get("rows", []),
-                                                    _bd.get("merge_cells", []),
-                                                    _bd.get("column_widths", []),
-                                                    per_cell=_bd.get("per_cell"),
-                                                ))
-                                        if _blocks:
-                                            _chapter_cc = [b.to_dict() for b in _blocks]
-                                            break
-                    except Exception as _fmt_exc:
-                        logger.warning("[write] format_requirements 后备查找失败: %s", _fmt_exc)
+                        _ad_raw3 = getattr(analysis_result, "analysis_data", None) if analysis_result else None
+                        if _ad_raw3:
+                            import json as _json3
+                            _ad3 = _json3.loads(_ad_raw3) if isinstance(_ad_raw3, str) else (_ad_raw3 or {})
+                            _fmt3 = _ad3.get("format_requirements", {}) if isinstance(_ad3, dict) else {}
+                            _sec_lookup3 = _fmt3.get("section_lookup", {}) if isinstance(_fmt3, dict) else {}
+                            from .template_binder import _clean_title as _fmt_clean3
+                            _clean_t3 = _fmt_clean3(title)
+                            _sec3 = _sec_lookup3.get(_clean_t3) if isinstance(_sec_lookup3, dict) else None
+                            if not _sec3:
+                                _secs3 = _fmt3.get("required_sections", []) if isinstance(_fmt3, dict) else []
+                                for _s in _secs3:
+                                    _st = _s.get("title", "").strip()
+                                    _sc = _fmt_clean3(_st)
+                                    if _clean_t3 in _sc or _sc in _clean_t3:
+                                        _sec3 = _s
+                                        break
+                            if _sec3:
+                                _tc3 = _sec3.get("template_content", []) or _sec3.get("content_blocks", [])
+                                if _tc3:
+                                    from .template_binder import ContentBlock as _CB3
+                                    _blocks3 = []
+                                    for _bd3 in _tc3:
+                                        if not isinstance(_bd3, dict):
+                                            continue
+                                        _bt3 = _bd3.get("type", "text")
+                                        if _bt3 in ("text", "paragraph"):
+                                            _blocks3.append(_CB3.paragraph(_bd3.get("text", ""), []))
+                                        elif _bt3 == "table":
+                                            _blocks3.append(_CB3.table(
+                                                _bd3.get("headers", []),
+                                                _bd3.get("rows", []),
+                                                _bd3.get("merge_cells", []),
+                                                _bd3.get("column_widths", []),
+                                                per_cell=_bd3.get("per_cell"),
+                                            ))
+                                    if _blocks3:
+                                        _chapter_cc = [b.to_dict() for b in _blocks3]
+                    except Exception as _fmt_exc3:
+                        logger.warning("[write] format_requirements 后备查找失败: %s", _fmt_exc3)
 
             if _chapter_cc:
                 for _block in _chapter_cc:
@@ -4401,68 +4409,76 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                 _sep_raw = None
             _render_separator_page(document, item, original_text=_sep_raw)
             document.add_page_break()
-            # 子节点以 level=1 渲染
+            # 子节点以 level=1 渲染（先写入格式要求中的模板表格，再写子章节）
             for _child in item.get("children", []):
-                # 在 _write_outline_item 之前，直接从 format_requirements 写入模板表格
                 _child_title = _child.get("title", "").strip()
-                _fmt_reqs = analysis_context.get("_format_requirements", {}) if isinstance(analysis_context, dict) else {}
-                if _fmt_reqs:
-                    from .template_binder import _clean_title as _fmt_clean2
-                    _secs2 = _fmt_reqs.get("required_sections", []) if isinstance(_fmt_reqs, dict) else []
-                    _child_clean = _fmt_clean2(_child_title)
-                    for _sec2 in _secs2:
-                        _st2 = _sec2.get("title", "").strip()
-                        _sc2 = _fmt_clean2(_st2)
-                        if _child_clean in _sc2 or _sc2 in _child_clean:
-                            _tc2 = _sec2.get("template_content", []) or _sec2.get("content_blocks", [])
-                            if _tc2:
-                                # 找到匹配的模板 → 写入表格内容块
-                                from .template_binder import ContentBlock as _CB2
-                                for _bd2 in _tc2:
-                                    if not isinstance(_bd2, dict):
+                # 从 analysis_data 中获取 format_requirements（含 section_lookup 精确匹配）
+                _ad_raw2 = getattr(analysis_result, "analysis_data", None) if analysis_result else None
+                if _ad_raw2:
+                    import json as _json2
+                    try:
+                        _ad2 = _json2.loads(_ad_raw2) if isinstance(_ad_raw2, str) else (_ad_raw2 or {})
+                    except Exception:
+                        _ad2 = {}
+                    _fmt2 = _ad2.get("format_requirements", {}) if isinstance(_ad2, dict) else {}
+                    _sec_lookup2 = _fmt2.get("section_lookup", {}) if isinstance(_fmt2, dict) else {}
+                    from .template_binder import _clean_title as _fmt_clean3
+                    _child_clean2 = _fmt_clean3(_child_title)
+                    # 使用 section_lookup 精确匹配（清洗后的标题 → section dict）
+                    _sec3 = _sec_lookup2.get(_child_clean2) if isinstance(_sec_lookup2, dict) else None
+                    if not _sec3:
+                        # 降级：遍历所有 required_sections 用子串匹配（兼容旧数据不含 section_lookup）
+                        _req_secs2 = _fmt2.get("required_sections", []) if isinstance(_fmt2, dict) else []
+                        for _s in _req_secs2:
+                            _st = _s.get("title", "").strip()
+                            _sc = _fmt_clean3(_st)
+                            if _child_clean2 in _sc or _sc in _child_clean2:
+                                _sec3 = _s
+                                break
+                    if _sec3:
+                        _tc3 = _sec3.get("template_content", []) or _sec3.get("content_blocks", [])
+                        if _tc3:
+                            for _bd3 in _tc3:
+                                    if not isinstance(_bd3, dict):
                                         continue
-                                    _bt2 = _bd2.get("type", "text")
-                                    if _bt2 == "table":
-                                        _h2 = _bd2.get("headers", [])
-                                        _r2 = _bd2.get("rows", [])
-                                        _mc2 = _bd2.get("merge_cells", [])
-                                        _cw2 = _bd2.get("column_widths", [])
-                                        _pc2 = _bd2.get("per_cell")
-                                        if _h2 and _r2:
-                                            _t2 = document.add_table(rows=len(_r2) + 1, cols=len(_h2))
-                                            _t2.style = "Table Grid"
-                                            for _ci2, _h2v in enumerate(_h2):
-                                                _t2.rows[0].cells[_ci2].text = _h2v
-                                            for _ri2, _row2 in enumerate(_r2):
-                                                for _ci2, _cell2 in enumerate(_row2):
-                                                    if _ci2 < len(_h2):
-                                                        _t2.rows[_ri2 + 1].cells[_ci2].text = _cell2
-                                            for _mc2_item in (_mc2 or []):
+                                    _bt3 = _bd3.get("type", "text")
+                                    if _bt3 == "table":
+                                        _h3 = _bd3.get("headers", [])
+                                        _r3 = _bd3.get("rows", [])
+                                        _mc3 = _bd3.get("merge_cells", [])
+                                        if _h3 and _r3:
+                                            _t3 = document.add_table(rows=len(_r3) + 1, cols=len(_h3))
+                                            _t3.style = "Table Grid"
+                                            for _ci3, _h3v in enumerate(_h3):
+                                                _t3.rows[0].cells[_ci3].text = _h3v
+                                            for _ri3, _row3 in enumerate(_r3):
+                                                for _ci3, _cell3 in enumerate(_row3):
+                                                    if _ci3 < len(_h3):
+                                                        _t3.rows[_ri3 + 1].cells[_ci3].text = _cell3
+                                            for _mc3_item in (_mc3 or []):
                                                 try:
-                                                    _mc_t = _mc2_item.get("type", "horizontal")
-                                                    _mc_r = _mc2_item.get("row", 0)
-                                                    _mc_c = _mc2_item.get("col", 0)
-                                                    _mc_s = _mc2_item.get("span", 1)
-                                                    if _mc_t == "horizontal" and _mc_c + _mc_s - 1 < len(_h2):
-                                                        _t2.rows[_mc_r].cells[_mc_c].merge(_t2.rows[_mc_r].cells[_mc_c + _mc_s - 1])
+                                                    _mc3_t = _mc3_item.get("type", "horizontal")
+                                                    _mc3_r = _mc3_item.get("row", 0)
+                                                    _mc3_c = _mc3_item.get("col", 0)
+                                                    _mc3_s = _mc3_item.get("span", 1)
+                                                    if _mc3_t == "horizontal" and _mc3_c + _mc3_s - 1 < len(_h3):
+                                                        _t3.rows[_mc3_r].cells[_mc3_c].merge(_t3.rows[_mc3_r].cells[_mc3_c + _mc3_s - 1])
                                                 except Exception:
                                                     pass
-                                            # 设置表格字体
-                                            for _row2 in _t2.rows:
-                                                for _cell2 in _row2.cells:
-                                                    for _para2 in _cell2.paragraphs:
-                                                        for _run2 in _para2.runs:
-                                                            _run2.font.name = "仿宋"
-                                                            _run2.font.size = Pt(12)
-                                                            _run2.element.rPr.rFonts.set(qn("w:eastAsia"), "仿宋")
-                                    elif _bt2 in ("text", "paragraph"):
-                                        _p2 = document.add_paragraph(_bd2.get("text", ""))
-                                        _p2.style = document.styles["Normal"]
-                                        for _r2 in _p2.runs:
-                                            _r2.font.name = "仿宋"
-                                            _r2.font.size = Pt(12)
-                                            _r2.element.rPr.rFonts.set(qn("w:eastAsia"), "仿宋")
-                            break
+                                            for _row3 in _t3.rows:
+                                                for _cell3 in _row3.cells:
+                                                    for _para3 in _cell3.paragraphs:
+                                                        for _run3 in _para3.runs:
+                                                            _run3.font.name = "仿宋"
+                                                            _run3.font.size = Pt(12)
+                                                            _run3.element.rPr.rFonts.set(qn("w:eastAsia"), "仿宋")
+                                    elif _bt3 in ("text", "paragraph"):
+                                        _p3 = document.add_paragraph(_bd3.get("text", ""))
+                                        _p3.style = document.styles["Normal"]
+                                        for _r3 in _p3.runs:
+                                            _r3.font.name = "仿宋"
+                                            _r3.font.size = Pt(12)
+                                            _r3.element.rPr.rFonts.set(qn("w:eastAsia"), "仿宋")
                 _write_outline_item(_child, level=1)
                 document.add_page_break()
             continue

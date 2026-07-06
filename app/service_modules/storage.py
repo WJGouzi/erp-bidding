@@ -123,7 +123,11 @@ class StorageService:
         if not file_record:
             return b""
         if file_record.storage_provider in ("CHROMA", "CHROMA_MANAGED"):
-            return b""
+            raise RuntimeError(
+                f"无法读取文件字节: file_id={file_record.id}, "
+                f"storage={file_record.storage_provider}, "
+                f"CHROMA 存储不支持原始字节读取"
+            )
         if file_record.storage_provider == "MINIO":
             endpoint = current_app.config.get("MINIO_ENDPOINT")
             access_key = current_app.config.get("MINIO_ACCESS_KEY")
@@ -133,7 +137,9 @@ class StorageService:
             adapter = MinioAdapter(endpoint, access_key, secret_key, bucket_name, secure)
             return adapter.download_bytes(file_record.minio_object_name)
         # 仅支持 MINIO 存储
-        return b""
+        raise RuntimeError(
+            f"不支持的存储类型: storage_provider={file_record.storage_provider}"
+        )
 
     @staticmethod
     def read_parsed_text(file_id):

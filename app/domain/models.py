@@ -31,10 +31,9 @@ class FileStorage(db.Model):
     file_size = db.Column(db.BigInteger, nullable=False, default=0)
 
     # 物理存储位置，可落本地或 MinIO。
-    storage_provider = db.Column(db.String(32), nullable=False, default="LOCAL")
+    storage_provider = db.Column(db.String(32), nullable=False, default="MINIO")
     minio_bucket = db.Column(db.String(128), nullable=True)
     minio_object_name = db.Column(db.String(512), nullable=True)
-    local_path = db.Column(db.String(512), nullable=True)
 
     # 当文件与 Chroma 数据相关时，记录其租户与文档标识。
     chroma_tenant = db.Column(db.String(128), nullable=True)
@@ -70,7 +69,6 @@ class FileStorage(db.Model):
             "storage_provider": self.storage_provider,
             "minio_bucket": self.minio_bucket,
             "minio_object_name": self.minio_object_name,
-            "local_path": self.local_path,
             "chroma_tenant": self.chroma_tenant,
             "chroma_database": self.chroma_database,
             "chroma_collection": self.chroma_collection,
