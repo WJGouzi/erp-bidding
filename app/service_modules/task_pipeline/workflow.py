@@ -102,7 +102,7 @@ def create_original_task(file_storage, bid_type, task_name=None, chroma_tenant=N
             filename=filename,
             payload=payload,
             biz_type="BIDDING_TENDER",
-            skip_file_storage=True,
+            skip_file_storage=False,
             chroma_tenant=chroma_tenant or current_app.config.get("CHROMA_TENANT"),
             chroma_database=chroma_database or current_app.config.get("CHROMA_DATABASE"),
             chroma_collection=chroma_collection or current_app.config.get("CHROMA_COLLECTION"),
@@ -377,7 +377,7 @@ def upload_tender_attachment(task_id, file_storage):
         file_record = StorageService.save_upload(
             file_storage=file_storage,
             biz_type="BIDDING_TENDER_ATTACHMENT",
-            skip_file_storage=True,
+            skip_file_storage=False,
             chroma_tenant=current_app.config.get("CHROMA_TENANT"),
             chroma_database=current_app.config.get("CHROMA_DATABASE"),
             chroma_collection=current_app.config.get("CHROMA_COLLECTION"),

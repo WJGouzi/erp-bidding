@@ -411,7 +411,45 @@ def start_analyze_v3(task, source_texts, adapter=None):
                     shared_resource.tender_file_id)
             elif file_record.storage_provider in ("CHROMA", "CHROMA_MANAGED"):
                 # CHROMA 存储：优先从解析缓存重建文档
-                doc = _get_structured_doc_from_cache(file_record)
+                # 先尝试获取文件原始字节（用于强制重新解析）
+                _file_payload = _get_file_payload(file_record)
+                if _file_payload:
+                    # 有原始文件，可以安全删除缓存强制重新解析
+                    try:
+                        from ....domain import DocParseCache as _DPC
+                        _DPC.query.filter_by(file_id=file_record.id).delete()
+                        db.session.commit()
+                        logger.info("[analysis_v3] 删除旧解析缓存(file_id=%s)以强制重新解析", file_record.id)
+                    except Exception as _ce:
+                        logger.warning("[analysis_v3] 删除旧缓存异常: %s", _ce)
+                        db.session.rollback()
+                    # 直接解析原始文件
+                    try:
+                        doc = parser.parse_structured(file_record.file_name, _file_payload)
+                        logger.info("[analysis_v3] 重新解析成功: file=%s", file_record.file_name)
+                    except Exception as _parse_exc:
+                        logger.warning("[analysis_v3] 重新解析失败: %s，降级使用缓存", _parse_exc)
+                        doc = _get_structured_doc_from_cache(file_record)
+                    if doc:
+                        try:
+                            _backfill_merge_cells_from_tables(doc)
+                        except Exception as _bf_exc:
+                            logger.warning("[analysis_v3] 回填 merge_cells 异常: %s", _bf_exc)
+                else:
+                    # 无原始文件（仅 ChromaDB 有数据），使用缓存
+                    doc = _get_structured_doc_from_cache(file_record)
+                    if doc:
+                        # 缓存加载后：从 doc.tables（TableStub，含 merge_cells）回填到 sections 的 ContentBlock 中
+                        try:
+                            _backfill_merge_cells_from_tables(doc)
+                        except Exception as _bf_exc:
+                            logger.warning("[analysis_v3] 回填 merge_cells 异常: %s", _bf_exc)
+                    if not doc:
+                        raise RuntimeError(
+                            f"无法获取文件内容: file_id={file_record.id}, "
+                            f"storage={file_record.storage_provider}, "
+                            f"缓存不可用且无原始文件可重新解析"
+                        )
                 if not doc:
                     # 缓存不存在或已失效：回退到原始字节解析
                     logger.info("[analysis_v3] 缓存不可用，回退到原始解析: file_id=%s", file_record.id)
@@ -425,26 +463,31 @@ def start_analyze_v3(task, source_texts, adapter=None):
                             logger.warning("[analysis_v3] 回退解析失败: %s", exc2)
                     else:
                         logger.warning(
-                            "[analysis_v3] 无法读取文件内容: file_id=%s, storage=%s, local=%s",
-                            file_record.id, file_record.storage_provider,
-                            file_record.local_path)
+                            "[analysis_v3] 无法读取文件内容: file_id=%s, storage=%s",
+                            file_record.id, file_record.storage_provider)
             else:
-                # MINIO/LOCAL：读取文件原始字节后解析
+                # MINIO：读取文件原始字节后解析
                 payload = _get_file_payload(file_record)
                 if not payload:
-                    logger.warning(
-                        "[analysis_v3] 无法读取文件内容: file_id=%s, storage=%s, local=%s",
-                        file_record.id, file_record.storage_provider,
-                        file_record.local_path)
-                else:
-                    doc = parser.parse_structured(
-                        file_record.file_name, payload)
+                    raise RuntimeError(
+                        f"无法读取文件内容: file_id={file_record.id}, "
+                        f"storage={file_record.storage_provider}"
+                    )
+                doc = parser.parse_structured(
+                    file_record.file_name, payload)
+                if doc:
+                    try:
+                        _backfill_merge_cells_from_tables(doc)
+                    except Exception as _bf_exc:
+                        logger.warning("[analysis_v3] 回填 merge_cells 异常: %s", _bf_exc)
     except Exception as exc:
         logger.exception("[analysis_v3] 文档解析异常")
 
     if not doc:
-        logger.warning("[analysis_v3] 无法获取结构化文档，降级")
-        return None
+        raise RuntimeError(
+            f"[analysis_v3] 无法获取结构化文档: task_id={task.id}, "
+            f"shared_resource_id={task.shared_resource_id}"
+        )
     # ════════════════════════════════════════════
     #  第1层：元数据提取 + 生死线扫描（并行）
     # ════════════════════════════════════════════
@@ -797,12 +840,11 @@ def _extract_package_names(raw_text, package_nos):
 
 
 def _get_file_payload(file_record):
-    """读取文件原始二进制内容（MINIO / LOCAL）。
+    """读取文件原始二进制内容（仅 MINIO）。
     
-    CHROMA 存储的文档请用 _get_structured_doc_from_cache()。
+    CHROMA 存储的文档无法获取原始字节，请用 _get_structured_doc_from_cache()。
     """
     from flask import current_app
-    from pathlib import Path
 
     if not file_record:
         return None
@@ -817,13 +859,12 @@ def _get_file_payload(file_record):
         adapter = MinioAdapter(endpoint, access_key, secret_key, bucket_name, secure)
         return adapter.download_bytes(file_record.minio_object_name)
 
-    if file_record.local_path and Path(file_record.local_path).exists():
-        return Path(file_record.local_path).read_bytes()
+    # 非 MINIO 存储（如 CHROMA）无法获取原始文件字节
 
     return None
 
 
-def _get_structured_doc_from_cache(file_record, current_version="2.0"):
+def _get_structured_doc_from_cache(file_record, current_version="2.1"):
     """从 doc_parse_cache 中重建结构化文档。
     
     适用于 storage_provider == CHROMA 的场景。
@@ -861,4 +902,92 @@ def _get_structured_doc_from_cache(file_record, current_version="2.0"):
         except Exception as exc:
             logger.warning("[analysis_v3] 缓存重建失败: %s", exc)
     return None
+
+
+
+def _backfill_merge_cells_from_tables(doc):
+    """从 doc.tables（TableStub）的 merge_cells 数据回填到 sections 中 ContentBlock 表格的 merge_cells。
+    
+    当文档从 DOCX 首次解析时，_parse_table 通过 XML 提取 merge_cells。
+    但某些 WPS/OFFICE 文档的 XML 结构导致 XPath 匹配失败，merge_cells 为空。
+    且 WPS "伪合并"（相邻单元格文字相同但无 OOXML gridSpan/vMerge）也需检测。
+    
+    此函数遍历所有表格：
+      1. 优先使用 TableStub 已有的 merge_cells
+      2. 若无，则进行 WPS 伪合并检测（水平+垂直）
+      3. 将结果回填到 sections 中 ContentBlock 的 merge_cells
+    """
+    if not doc or not doc.tables or not doc.sections:
+        return
+    
+    table_stubs = doc.tables  # list of TableStub
+    table_idx = 0
+    
+    def _detect_pseudo_merges(headers, rows):
+        """WPS 伪合并检测：相邻单元格文字相同但无 OOXML gridSpan/vMerge。"""
+        merges = []
+        all_rows = [headers] + rows
+        if not all_rows:
+            return merges
+        
+        # 水平伪合并
+        for r_idx in range(len(all_rows)):
+            c = 0
+            while c < len(all_rows[r_idx]):
+                cell_text = all_rows[r_idx][c].strip()
+                if not cell_text:
+                    c += 1
+                    continue
+                span = 1
+                while c + span < len(all_rows[r_idx]) and all_rows[r_idx][c + span].strip() == cell_text:
+                    span += 1
+                if span > 1:
+                    merges.append({"type": "horizontal", "row": r_idx, "col": c, "span": span})
+                    c += span
+                else:
+                    c += 1
+        
+        # 垂直伪合并：只在有水平合并时才检测（避免噪声）
+        if merges:
+            max_cols = max(len(r) for r in all_rows) if all_rows else 0
+            for c_idx in range(max_cols):
+                r = 0
+                while r < len(all_rows):
+                    cell_text = all_rows[r][c_idx].strip() if c_idx < len(all_rows[r]) else ""
+                    if not cell_text:
+                        r += 1
+                        continue
+                    v_span = 1
+                    while r + v_span < len(all_rows):
+                        next_text = all_rows[r + v_span][c_idx].strip() if c_idx < len(all_rows[r + v_span]) else ""
+                        if next_text == cell_text:
+                            v_span += 1
+                        else:
+                            break
+                    if v_span > 1:
+                        merges.append({"type": "vertical", "row": r, "col": c_idx, "span": v_span})
+                        r += v_span
+                    else:
+                        r += 1
+        
+        return merges
+    
+    def _walk_sections(sections_list):
+        nonlocal table_idx
+        for section in sections_list:
+            for block in section.content:
+                if block.type == ContentBlock.TYPE_TABLE and table_idx < len(table_stubs):
+                    stub = table_stubs[table_idx]
+                    if stub.merge_cells:
+                        block.merge_cells = list(stub.merge_cells)
+                    # 如果 TableStub 也没有 merge_cells，进行 WPS 伪合并检测
+                    if not block.merge_cells:
+                        detected = _detect_pseudo_merges(stub.headers, stub.rows)
+                        if detected:
+                            block.merge_cells = detected
+                    table_idx += 1
+            if section.children:
+                _walk_sections(section.children)
+    
+    _walk_sections(doc.sections)
 

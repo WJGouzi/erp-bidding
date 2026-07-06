@@ -42,6 +42,7 @@ class ContentBlock:
     rows: list[list[str]] = field(default_factory=list)
     merge_cells: list[dict] = field(default_factory=list)
     column_widths: list = field(default_factory=list)
+    per_cell: Optional[dict] = None
 
     def to_dict(self) -> dict:
         d = {"type": self.type}
@@ -57,6 +58,8 @@ class ContentBlock:
             d["rows"] = self.rows
             d["merge_cells"] = self.merge_cells
             d["column_widths"] = self.column_widths
+            if self.per_cell:
+                d["per_cell"] = self.per_cell
         return d
 
     @classmethod
@@ -64,8 +67,8 @@ class ContentBlock:
         return cls(type="paragraph", text=text, placeholders=placeholders or [])
 
     @classmethod
-    def table(cls, headers: list, rows: list, merge_cells: list = None, column_widths: list = None) -> "ContentBlock":
-        return cls(type="table", headers=headers, rows=rows, merge_cells=merge_cells or [], column_widths=column_widths or [])
+    def table(cls, headers: list, rows: list, merge_cells: list = None, column_widths: list = None, per_cell: dict = None) -> "ContentBlock":
+        return cls(type="table", headers=headers, rows=rows, merge_cells=merge_cells or [], column_widths=column_widths or [], per_cell=per_cell)
 
 
 @dataclass
@@ -203,7 +206,7 @@ def bind_template(chapter_title: str, format_requirements: dict) -> TemplateBind
     for section in required_sections:
         sec_title = section.get("title", "").strip()
         sec_clean = _clean_title(sec_title)
-        if clean_title in sec_clean or sec_clean in clean_title:
+        if _fuzzy_title_match(clean_title, sec_clean):
             # 找到了匹配章节，检查是否有模板内容
             # phase1_5_format.py 使用 template_content 字段，type 为 "text" 或 "table"
             template_content = section.get("template_content", [])
@@ -233,7 +236,8 @@ def bind_template(chapter_title: str, format_requirements: dict) -> TemplateBind
                     for row in rows:
                         for cell in row:
                             all_placeholders.extend(extract_placeholders(cell))
-                    blocks.append(ContentBlock.table(headers, rows, merge_cells, block_data.get("column_widths", [])))
+                    per_cell = block_data.get("per_cell")
+                    blocks.append(ContentBlock.table(headers, rows, merge_cells, block_data.get("column_widths", []), per_cell=per_cell))
 
             return TemplateBinding(
                 chapter_title=chapter_title,
@@ -296,6 +300,39 @@ def _clean_title(title: str) -> str:
     return t.strip()
 
 
+
+
+def _fuzzy_title_match(clean_title: str, sec_clean: str) -> bool:
+    """多策略模糊标题匹配，提高模板绑定命中率。
+    
+    策略:
+      1. 直接包含匹配（原逻辑）
+      2. 去除特殊字符后包含匹配
+      3. 去除共同前缀后关键部分匹配
+    """
+    if not clean_title or not sec_clean:
+        return False
+    
+    # 策略1：直接包含（原逻辑）
+    if clean_title in sec_clean or sec_clean in clean_title:
+        return True
+    
+    # 策略2：去除空格和特殊字符后匹配
+    _strip_re = lambda s: re.sub(r'[\s★◆●■▲➢※▪▶•·❤：:（）()（）\-—]', '', s)
+    s1 = _strip_re(clean_title)
+    s2 = _strip_re(sec_clean)
+    if s1 and s2 and (s1 in s2 or s2 in s1):
+        return True
+    
+    # 策略3：提取关键部分（去除常见前缀和编号）
+    _key_re = lambda s: re.sub(r'^[一二三四五六七八九十零〇]+[、，,．.]*|[第.章节篇]+[一二三四五六七八九十零〇]+[章节篇]?|响应文件|格式|要求|模板', '', s).strip()
+    k1 = _key_re(clean_title)
+    k2 = _key_re(sec_clean)
+    if k1 and k2 and len(k1) >= 2 and len(k2) >= 2 and (k1 in k2 or k2 in k1):
+        return True
+    
+    return False
+
 def _fill_paragraph_block(block: ContentBlock, all_context: dict) -> ContentBlock:
     """填充段落块中的占位符。"""
     text = block.text
@@ -331,6 +368,7 @@ def _fill_table_block(block: ContentBlock, all_context: dict) -> ContentBlock:
         rows=new_rows,
         merge_cells=list(block.merge_cells),
         column_widths=list(block.column_widths),
+        per_cell=block.per_cell,
     )
 
 

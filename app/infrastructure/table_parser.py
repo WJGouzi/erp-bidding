@@ -166,9 +166,9 @@ def extract_preliminary_table(rows: List[List[str]], headers: List[str]) -> Dict
     if content_idx is None or value_idx is None:
         for i, h in enumerate(headers):
             h_clean = h.strip().replace(" ", "").replace("\u3000", "")
-            if "\u5185\u5bb9" in h_clean:
+            if "内容" in h_clean:
                 content_idx = i
-            elif "\u8bf4\u660e" in h_clean or "\u8981\u6c42" in h_clean:
+            elif "说明" in h_clean or "要求" in h_clean:
                 value_idx = i
 
     for row_idx, row in enumerate(rows):

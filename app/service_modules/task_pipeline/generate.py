@@ -2,7 +2,6 @@
 
 import logging; logger = logging.getLogger(__name__)
 from io import BytesIO
-from pathlib import Path
 import time
 
 from flask import current_app, send_file
@@ -595,8 +594,6 @@ def download_result_file(task_id):
         secure = current_app.config.get("MINIO_SECURE")
         adapter = MinioAdapter(endpoint, access_key, secret_key, bucket_name, secure)
         payload = adapter.download_bytes(file_record.minio_object_name)
-    elif file_record.local_path and Path(file_record.local_path).exists():
-        payload = Path(file_record.local_path).read_bytes()
     else:
         raise LookupError("结果文件物理内容不存在")
 

@@ -19,6 +19,12 @@
 """
 
 import logging
+try:
+    from app.infrastructure.table_codec import to_per_cell as _codec_to_per_cell, to_dict as _codec_to_dict
+except ImportError:
+    _codec_to_per_cell = None
+    _codec_to_dict = None
+
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -277,12 +283,13 @@ def _extract_raw_table(table) -> dict:
     """提取表格的原始行列数据（不依赖分类），含合并单元格信息。
     
     返回:
-        {"headers": [...], "rows": [[...], ...], "merges": [...]}
+        {"headers": [...], "rows": [[...], ...], "merges": [...], "column_widths": [...]}
         merges: [{"type": "horizontal"|"vertical", "row": int, "col": int, "span": int}, ...]
+        column_widths: 每列宽度（twips），空列表表示未提取到
     """
     ns = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
     if not hasattr(table, 'rows') or not table.rows:
-        return {"headers": [], "rows": [], "merges": []}
+        return {"headers": [], "rows": [], "merges": [], "column_widths": []}
     
     # 提取所有行的单元格数据（兼容 python-docx Table 和 TableStub）
     first_row = table.rows[0]
@@ -293,9 +300,16 @@ def _extract_raw_table(table) -> dict:
         # TableStub: rows[0] 是 list[str]
         headers = [str(c).strip() for c in first_row]
     rows = []
-    merges = []
+    # 优先从 TableStub 的 merge_cells 属性读取（缓存重建时需保留原始合并信息）
+    if hasattr(table, 'merge_cells') and table.merge_cells:
+        merges = list(table.merge_cells)
+    else:
+        merges = []
+    # 追踪每列已有的垂直合并范围，用于去重
+    _covered_vmerge_ranges = {}  # col -> [(start_row, span), ...]
     # 记录每行已被水平合并覆盖的列
     covered_horiz = {}  # row_idx -> set(col_idx)
+
     for r_idx, row in enumerate(table.rows):
         if hasattr(row, 'cells'):
             # python-docx Row
@@ -337,12 +351,105 @@ def _extract_raw_table(table) -> dict:
                                     else:
                                         break
                             if merge_count > 1:
-                                merges.append({"type": "vertical", "row": r_idx, "col": c_idx, "span": merge_count})
+                                # 去重：检查同一列是否已有垂直合并覆盖当前行的范围
+                                _already_covered = False
+                                for (_vr, _vspan) in _covered_vmerge_ranges.get(c_idx, []):
+                                    if _vr <= r_idx < _vr + _vspan:
+                                        _already_covered = True
+                                        break
+                                if not _already_covered:
+                                    merges.append({"type": "vertical", "row": r_idx, "col": c_idx, "span": merge_count})
+                                    _covered_vmerge_ranges.setdefault(c_idx, []).append((r_idx, merge_count))
                 except Exception:
                     pass
         rows.append(cells)
     
-    return {"headers": headers, "rows": rows, "merges": merges}
+    # 提取列宽（从 tblGrid/gridCol）
+    column_widths = []
+    try:
+        tbl = getattr(table, '_tbl', None)
+        if tbl is not None:
+            ns_short = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
+            tbl_grid = tbl.find(f'.//{ns_short}tblGrid')
+            if tbl_grid is not None:
+                for gc in tbl_grid.findall(f'{ns_short}gridCol'):
+                    w = gc.get(f'{ns_short}w')
+                    if w:
+                        column_widths.append(int(w))
+        else:
+            # TableStub 回退：从对象属性直接读取
+            stored_cw = getattr(table, 'column_widths', None) or []
+            if stored_cw:
+                column_widths = list(stored_cw)
+            # 从 TableStub 读取合并单元格信息
+            stored_merges = getattr(table, 'merge_cells', None) or []
+            if stored_merges and not merges:
+                merges = list(stored_merges)
+    except Exception:
+        # 最后回退到 table.columns 方式
+        try:
+            for col in table.columns:
+                column_widths.append(col.width)
+        except Exception:
+            pass
+    
+    # 生成 per-cell 格式（方便前端直接渲染）
+    per_cell_data = {}
+    if _codec_to_per_cell is not None and _codec_to_dict is not None:
+        try:
+            td = _codec_to_per_cell(headers, rows, merges, column_widths)
+            per_cell_data = _codec_to_dict(td)
+        except Exception:
+            pass
+    
+    
+    # ===== WPS 伪合并检测：相邻单元格文字相同但无 OOXML gridSpan/vMerge =====
+    # 仅在 XML 检测未发现任何合并时执行，避免重复
+    if not merges:
+        # 水平伪合并：逐行检测连续相同非空文本
+        all_rows_data = [headers] + rows
+        for r_idx in range(len(all_rows_data)):
+            c = 0
+            while c < len(all_rows_data[r_idx]):
+                cell_text = all_rows_data[r_idx][c].strip()
+                if not cell_text:
+                    c += 1
+                    continue
+                span = 1
+                while c + span < len(all_rows_data[r_idx]) and all_rows_data[r_idx][c + span].strip() == cell_text:
+                    span += 1
+                if span > 1:
+                    merges.append({"type": "horizontal", "row": r_idx, "col": c, "span": span})
+                    c += span
+                else:
+                    c += 1
+        
+        # 垂直伪合并：逐列检测连续相同非空文本
+        if merges:  # 只在有水平合并时才检测垂直（避免噪声）
+            all_rows_data = [headers] + rows
+            max_cols = max(len(r) for r in all_rows_data) if all_rows_data else 0
+            for c_idx in range(max_cols):
+                r = 0
+                while r < len(all_rows_data):
+                    cell_text = all_rows_data[r][c_idx].strip() if c_idx < len(all_rows_data[r]) else ""
+                    if not cell_text:
+                        r += 1
+                        continue
+                    v_span = 1
+                    while r + v_span < len(all_rows_data):
+                        next_text = all_rows_data[r + v_span][c_idx].strip() if c_idx < len(all_rows_data[r + v_span]) else ""
+                        if next_text == cell_text:
+                            v_span += 1
+                        else:
+                            break
+                    if v_span > 1:
+                        merges.append({"type": "vertical", "row": r, "col": c_idx, "span": v_span})
+                        r += v_span
+                    else:
+                        r += 1
+
+    # ===== 合并检测结束 =====
+        return {"headers": headers, "rows": rows, "merges": merges, "column_widths": column_widths, "per_cell": per_cell_data}
 
 
 def _extract_table_data(table, table_type: str) -> dict:

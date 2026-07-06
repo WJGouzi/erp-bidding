@@ -131,10 +131,16 @@ def _extract_required_sections(section) -> List[Dict]:
                 _rows = getattr(block, "rows", []) or []
                 template_content.append({
                     "type": "table",
-                    "headers": _headers[:10],
-                    "rows": _rows[:20],
-                    "merge_cells": getattr(block, "merge_cells", [])[:30],
-                    "column_widths": getattr(block, "column_widths", [])[:30],
+                    "headers": _headers,
+                    "rows": _rows,
+                    "merge_cells": getattr(block, "merge_cells", []),
+                    "column_widths": getattr(block, "column_widths", []),
+                    "per_cell": _build_per_cell(
+                        getattr(block, "headers", []),
+                        getattr(block, "rows", []),
+                        getattr(block, "merge_cells", []),
+                        getattr(block, "column_widths", []),
+                    ),
                 })
             elif txt and txt.strip() and len(txt.strip()) >= 5:
                 template_content.append({
@@ -153,10 +159,16 @@ def _extract_required_sections(section) -> List[Dict]:
                     _rows = getattr(block, "rows", []) or []
                     template_content.append({
                         "type": "table",
-                        "headers": _headers[:10],
-                        "rows": _rows[:20],
-                        "merge_cells": getattr(block, "merge_cells", [])[:30],
-                        "column_widths": getattr(block, "column_widths", [])[:30],
+                        "headers": _headers,
+                        "rows": _rows,
+                        "merge_cells": getattr(block, "merge_cells", []),
+                        "column_widths": getattr(block, "column_widths", []),
+                        "per_cell": _build_per_cell(
+                            getattr(block, "headers", []),
+                            getattr(block, "rows", []),
+                            getattr(block, "merge_cells", []),
+                            getattr(block, "column_widths", []),
+                        ),
                     })
                 elif txt and txt.strip() and len(txt.strip()) >= 5:
                     template_content.append({
@@ -164,6 +176,33 @@ def _extract_required_sections(section) -> List[Dict]:
                         "text": txt.strip()[:2000],
                     })
 
+            # 递归处理更深层子章节的内容块
+            for grandchild in getattr(sub, "children", []):
+                for block in getattr(grandchild, "content", []):
+                    _gtype = getattr(block, "type", "") or ""
+                    if _gtype == "table":
+                        _headers = getattr(block, "headers", []) or []
+                        _rows = getattr(block, "rows", []) or []
+                        template_content.append({
+                            "type": "table",
+                            "headers": _headers,
+                            "rows": _rows,
+                            "merge_cells": getattr(block, "merge_cells", []),
+                            "column_widths": getattr(block, "column_widths", []),
+                            "per_cell": _build_per_cell(
+                                getattr(block, "headers", []),
+                                getattr(block, "rows", []),
+                                getattr(block, "merge_cells", []),
+                                getattr(block, "column_widths", []),
+                            ),
+                        })
+                    else:
+                        _gtxt = getattr(block, "text", None)
+                        if _gtxt and _gtxt.strip() and len(_gtxt.strip()) >= 5:
+                            template_content.append({
+                                "type": "text",
+                                "text": _gtxt.strip()[:2000],
+                            })
         required.append({
             "title": title,
             "order": idx + 1,
@@ -268,8 +307,8 @@ def _extract_template_tables(section) -> List[Dict]:
             # 折叠水平合并列（处理 WPS 伪合并）
             headers, rows = _collapse_merged_columns(headers, rows)
             tables.append({
-                "headers": headers[:20],
-                "rows": rows[:30],
+                "headers": headers,
+                "rows": rows,
             })
     return tables
 
@@ -329,6 +368,21 @@ def _extract_fixed_texts(section) -> List[Dict]:
     return fixed_texts
 
 
+
+def _build_per_cell(headers, rows, merge_cells, column_widths):
+    """将表格数据转换为 per-cell 格式（用于前端渲染）。
+    
+    失败时返回 None，避免调用方将空 dict {} 误判为有效 per_cell。
+    """
+    try:
+        from app.infrastructure.table_codec import to_per_cell, to_dict
+        td = to_per_cell(headers, rows, merge_cells, column_widths)
+        if not td.rows:
+            return None
+        return to_dict(td)
+    except Exception as exc:
+        logger.warning("[phase1.5] _build_per_cell 失败: %s", exc)
+        return None
 def extract_format_requirements(sections) -> Optional[Dict]:
     """从文档章节树中提取格式要求。
 

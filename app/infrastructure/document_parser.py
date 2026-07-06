@@ -19,6 +19,52 @@ import fitz
 logger = logging.getLogger(__name__)
 
 
+
+# ── 表格列宽和合并单元格提取辅助函数（用于序列化/反序列化） ──
+
+
+def _extract_table_column_widths(table):
+    """从 python-docx Table 提取列宽（twips）。"""
+    ns = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
+    column_widths = []
+    try:
+        tbl = getattr(table, '_tbl', None)
+        if tbl is not None:
+            tbl_grid = tbl.find(f'.//{ns}tblGrid')
+            if tbl_grid is not None:
+                for gc in tbl_grid.findall(f'{ns}gridCol'):
+                    w = gc.get(f'{ns}w')
+                    if w:
+                        column_widths.append(int(w))
+    except Exception:
+        pass
+    return column_widths
+
+
+def _extract_table_merge_cells(table):
+    """从 python-docx Table 提取合并单元格信息。"""
+    ns = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
+    merges = []
+    try:
+        for row_idx, row in enumerate(table.rows):
+            for col_idx, cell in enumerate(row.cells):
+                try:
+                    tc = cell._tc
+                    gs = tc.find(f'.//{ns}gridSpan')
+                    vm = tc.find(f'.//{ns}vMerge')
+                    if gs is not None:
+                        span_val = int(gs.get(f'{ns}val', '1'))
+                        if span_val > 1:
+                            merges.append({"type": "horizontal", "row": row_idx, "col": col_idx, "span": span_val})
+                    if vm is not None:
+                        v_val = vm.get(f'{ns}val', 'continue')
+                        if v_val == 'restart' or v_val is None:
+                            merges.append({"type": "vertical", "row": row_idx, "col": col_idx, "span": 2})
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return merges
 class StructuredDocument:
     """结构化文档模型，统一表示 DOCX/PDF 的解析结果。"""
 
@@ -50,6 +96,16 @@ class StructuredDocument:
                         if hasattr(t, "rows") and not hasattr(t, "headers")
                         # TableStub: rows 属性直接可用
                         else [list(row) for row in t.rows]
+                    ),
+                    "column_widths": (
+                        _extract_table_column_widths(t)
+                        if hasattr(t, "_tbl")
+                        else (list(t.column_widths) if hasattr(t, "column_widths") else [])
+                    ),
+                    "merge_cells": (
+                        _extract_table_merge_cells(t)
+                        if hasattr(t, "_tbl")
+                        else (list(t.merge_cells) if hasattr(t, "merge_cells") else [])
                     ),
                 }
                 for t in self.tables
@@ -146,11 +202,19 @@ class StructuredDocument:
         table_data = data.get("tables", [])
         if table_data:
             from collections import namedtuple
-            TableStub = namedtuple("TableStub", ["headers", "rows"])
+            class TableStub:
+                """Stub for table data when loaded from cache."""
+                def __init__(self, headers, rows, column_widths=None, merge_cells=None):
+                    self.headers = headers
+                    self.rows = rows
+                    self.column_widths = column_widths or []
+                    self.merge_cells = merge_cells or []
             doc.tables = [
                 TableStub(
                     headers=t.get("headers", []),
                     rows=t.get("rows", []),
+                    column_widths=t.get("column_widths", []),
+                    merge_cells=t.get("merge_cells", []),
                 )
                 for t in table_data
             ]
@@ -263,7 +327,7 @@ def _has_real_content(entry: dict) -> bool:
 class DocumentParser:
     """版面感知的文档解析器。"""
 
-    PARSE_VERSION = "2.0"
+    PARSE_VERSION = "3.0"
 
     def __init__(self, ocr_client=None):
         self.ocr_client = ocr_client
@@ -593,6 +657,7 @@ class DocumentParser:
         block.column_widths = column_widths
         # 提取合并单元格（gridSpan / vMerge）
         _ns = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
+        _covered_vmerge_ranges = {}
         for row_idx, row in enumerate(table.rows):
             cells = []
             # 追踪每行已处理过的物理 _tc，避免同一合并区域重复提取
@@ -607,33 +672,43 @@ class DocumentParser:
                     if _tc_id in _processed_tc_ids:
                         continue
                     _processed_tc_ids.add(_tc_id)
-                    # 水平合并：gridSpan
-                    gs = tc.findall(f'{_ns}tcPr/{_ns}gridSpan')
-                    if gs:
-                        gs_val = gs[0].get(f'{_ns}val')
+                    # 水平合并：gridSpan（使用 .// 递归搜索，兼容各种 OOXML 风格）
+                    gs = tc.find(f'.//{_ns}gridSpan')
+                    if gs is not None:
+                        gs_val = gs.get(f'{_ns}val')
                         if gs_val:
                             span = int(gs_val)
                             if span > 1:
                                 merge_cells.append({"type": "horizontal", "row": row_idx, "col": col_idx, "span": span})
-                    # 垂直合并：vMerge
-                    vm = tc.findall(f'{_ns}tcPr/{_ns}vMerge')
-                    if vm:
-                        vm_val = vm[0].get(f'{_ns}val')
-                        if vm_val and vm_val == 'restart':
+                    # 垂直合并：vMerge（使用 .// 递归搜索）
+                    vm = tc.find(f'.//{_ns}vMerge')
+                    if vm is not None:
+                        vm_val = vm.get(f'{_ns}val')
+                        if vm_val is None or vm_val == 'restart':
                             merge_span = 1
                             for next_row in table.rows[row_idx + 1:]:
                                 next_tc = next_row.cells[col_idx]._tc
-                                next_vm = next_tc.findall(f'{_ns}tcPr/{_ns}vMerge')
-                                if next_vm:
-                                    next_val = next_vm[0].get(f'{_ns}val')
+                                next_vm = next_tc.find(f'.//{_ns}vMerge')
+                                if next_vm is not None:
+                                    next_val = next_vm.get(f'{_ns}val')
                                     if next_val is None or next_val == 'continue':
+                                        merge_span += 1
+                                    elif next_val == 'restart' and next_tc is tc:
                                         merge_span += 1
                                     else:
                                         break
                                 else:
                                     break
                             if merge_span > 1:
-                                merge_cells.append({"type": "vertical", "row": row_idx, "col": col_idx, "span": merge_span})
+                                # 去重：检查同一列是否已有垂直合并覆盖当前行范围
+                                _already_covered = False
+                                for (_vr, _vspan) in _covered_vmerge_ranges.get(col_idx, []):
+                                    if _vr <= row_idx < _vr + _vspan:
+                                        _already_covered = True
+                                        break
+                                if not _already_covered:
+                                    merge_cells.append({"type": "vertical", "row": row_idx, "col": col_idx, "span": merge_span})
+                                    _covered_vmerge_ranges.setdefault(col_idx, []).append((row_idx, merge_span))
                 except Exception:
                     pass
             if row_idx == 0:
@@ -641,8 +716,26 @@ class DocumentParser:
             else:
                 rows_data.append(cells)
         block.rows = rows_data
+        # ===== WPS 伪合并检测（无 OOXML gridSpan/vMerge 的合并） =====
+        if not merge_cells and rows_data:
+            # 水平伪合并：逐行检测连续相同非空文本
+            all_rows = [block.headers] + rows_data
+            for r_idx in range(len(all_rows)):
+                c = 0
+                while c < len(all_rows[r_idx]):
+                    cell_text = all_rows[r_idx][c].strip()
+                    if not cell_text:
+                        c += 1
+                        continue
+                    span = 1
+                    while c + span < len(all_rows[r_idx]) and all_rows[r_idx][c + span].strip() == cell_text:
+                        span += 1
+                    if span > 1:
+                        merge_cells.append({"type": "horizontal", "row": r_idx, "col": c, "span": span})
+                        c += span
+                    else:
+                        c += 1
         block.merge_cells = merge_cells
-
         if not doc.sections:
             s = Section(title="表格", level=1)
             s.content.append(block)

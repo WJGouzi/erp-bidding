@@ -763,7 +763,7 @@ def _count_pkg_params(text):
     starred = len(re.findall(r"[\u2605\u2b50]", text))
     important = len(re.findall(r"[\u25b2]", text))
     param_patterns = re.findall(
-        r"(?:\u53c2\u6570|\u89c4\u683c|\u578b\u53f7|\u914d\u7f6e|\u6280\u672f\u6307\u6807)[^\u3002]*?[\uff1a:][^\u3002]*?(?:\d+[.\uff0e]\d+|[\u4e00-\u9fff])",
+        r"(?:参数|规格|型号|配置|技术指标)[^\u3002]*?[\uff1a:][^\u3002]*?(?:\d+[.\uff0e]\d+|[\u4e00-\u9fff])",
         text)
     general = len(param_patterns)
     return starred, important, general

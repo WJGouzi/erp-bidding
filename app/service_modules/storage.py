@@ -72,7 +72,7 @@ class StorageService:
         db.session.add(record)
         db.session.flush()
         # 此时 record.id 可用：同步解析并缓存到 doc_parse_cache
-        if skip_file_storage and filename:
+        if filename:
             try:
                 from ..domain import DocParseCache
                 import hashlib
@@ -132,8 +132,7 @@ class StorageService:
             secure = current_app.config.get("MINIO_SECURE")
             adapter = MinioAdapter(endpoint, access_key, secret_key, bucket_name, secure)
             return adapter.download_bytes(file_record.minio_object_name)
-        if file_record.local_path and Path(file_record.local_path).exists():
-            return Path(file_record.local_path).read_bytes()
+        # 仅支持 MINIO 存储
         return b""
 
     @staticmethod
@@ -188,7 +187,5 @@ class StorageService:
                 MinioAdapter(endpoint, access_key, secret_key, bucket_name, secure).delete_object(
                     file_record.minio_object_name
                 )
-        elif file_record.local_path:
-            Path(file_record.local_path).unlink(missing_ok=True)
         file_record.deleted_flag = True
         return True

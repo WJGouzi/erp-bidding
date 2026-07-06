@@ -179,6 +179,18 @@ def ingest_file_to_chroma(
     file_sha256 = _compute_sha256(payload)
     file_record.file_sha256 = file_sha256
 
+    # 重新入库时：先删除旧缓存和旧 Chroma 数据，确保后续操作完全覆盖
+    if file_record.id:
+        try:
+            # 删除旧解析缓存
+            DocParseCache.query.filter_by(file_id=file_record.id).delete()
+            # 删除旧 MySQL doc_chunks
+            _delete_doc_chunks(file_record.id)
+            db.session.flush()
+            logger.info("[chroma] 重新入库前已清除旧缓存和切片: file_id=%s", file_record.id)
+        except Exception as _clean_exc:
+            logger.warning("[chroma] 清除旧数据异常: %s", _clean_exc)
+
     # 检查解析缓存（任务 5.5）
     cached_json = _check_parse_cache(file_record.id, file_sha256) if file_record.id else None
 

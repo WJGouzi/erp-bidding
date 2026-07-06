@@ -1,0 +1,7 @@
+- [x] 1. template_binder.ContentBlock 增加 per_cell 字段（数据类 + table() 工厂 + to_dict()）
+- [x] 2. template_binder.bind_template() 读取 block_data.per_cell 传给 ContentBlock.table()
+- [x] 3. template_binder._fill_table_block() 保留 per_cell 数据
+- [x] 4. phase1_5_format.py 子章节循环补上 per_cell
+- [x] 5. helpers.py ContentBlock 路径：优先检测 per_cell → write_table_from_data()
+- [x] 6. helpers.py 旧文本路径：优先检测 per_cell → write_table_from_data()
+- [x] 7. 编写集成测试验证 round-trip
