@@ -41,6 +41,7 @@ class ContentBlock:
     headers: list[str] = field(default_factory=list)
     rows: list[list[str]] = field(default_factory=list)
     merge_cells: list[dict] = field(default_factory=list)
+    column_widths: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         d = {"type": self.type}
@@ -55,6 +56,7 @@ class ContentBlock:
             d["headers"] = self.headers
             d["rows"] = self.rows
             d["merge_cells"] = self.merge_cells
+            d["column_widths"] = self.column_widths
         return d
 
     @classmethod
@@ -62,8 +64,8 @@ class ContentBlock:
         return cls(type="paragraph", text=text, placeholders=placeholders or [])
 
     @classmethod
-    def table(cls, headers: list, rows: list, merge_cells: list = None) -> "ContentBlock":
-        return cls(type="table", headers=headers, rows=rows, merge_cells=merge_cells or [])
+    def table(cls, headers: list, rows: list, merge_cells: list = None, column_widths: list = None) -> "ContentBlock":
+        return cls(type="table", headers=headers, rows=rows, merge_cells=merge_cells or [], column_widths=column_widths or [])
 
 
 @dataclass
@@ -179,35 +181,6 @@ def extract_placeholders(text: str) -> list[Placeholder]:
     return placeholders
 
 
-def resolve_fill(field_name: str, subject_context: dict = None,
-                 product_context: dict = None) -> str:
-    """按 field_name 从上下文中查找填充值。
-
-    Args:
-        field_name: 标准字段名
-        subject_context: 主体信息上下文
-        product_context: 产品库上下文
-
-    Returns:
-        填充值，找不到返回空字符串
-    """
-    if field_name == "company_name":
-        return (subject_context or {}).get("company_name", "")
-    if field_name == "legal_person":
-        return (subject_context or {}).get("legal_person", "")
-    if field_name == "authorized_person":
-        # 授权代表通常不在主体信息中，返回空
-        return ""
-    if field_name == "project_name":
-        return (subject_context or {}).get("project_name", "")
-    if field_name == "project_no":
-        return (subject_context or {}).get("project_no", "")
-    if field_name == "bid_date":
-        from datetime import datetime
-        return datetime.now().strftime("%Y年%m月%d日")
-    return ""
-
-
 def bind_template(chapter_title: str, format_requirements: dict) -> TemplateBinding:
     """检测章节是否有原文模板。
 
@@ -260,7 +233,7 @@ def bind_template(chapter_title: str, format_requirements: dict) -> TemplateBind
                     for row in rows:
                         for cell in row:
                             all_placeholders.extend(extract_placeholders(cell))
-                    blocks.append(ContentBlock.table(headers, rows, merge_cells))
+                    blocks.append(ContentBlock.table(headers, rows, merge_cells, block_data.get("column_widths", [])))
 
             return TemplateBinding(
                 chapter_title=chapter_title,
@@ -357,6 +330,7 @@ def _fill_table_block(block: ContentBlock, all_context: dict) -> ContentBlock:
         headers=list(block.headers),
         rows=new_rows,
         merge_cells=list(block.merge_cells),
+        column_widths=list(block.column_widths),
     )
 
 
@@ -373,40 +347,3 @@ def _resolve_from_context(placeholder: Placeholder, all_context: dict) -> str:
             from datetime import datetime
             return datetime.now().strftime("%Y年%m月%d日")
     return ""
-
-
-def build_content_blocks_from_chapter(chapter_data: dict) -> list[ContentBlock]:
-    """从章节数据构建 ContentBlock 列表。
-
-    chapter_data 结构：
-    {
-        "content_blocks": [
-            {"type": "paragraph", "text": "..."},
-            {"type": "table", "headers": [...], "rows": [[...]]}
-        ]
-    }
-
-    如果 content_blocks 不存在，则将 content 文本作为段落返回。
-    """
-    blocks_data = chapter_data.get("template_content", [])
-    if not blocks_data:
-        blocks_data = chapter_data.get("content_blocks", [])
-    if blocks_data:
-        blocks = []
-        for bd in blocks_data:
-            btype = bd.get("type", "text")
-            if btype in ("text", "paragraph"):
-                blocks.append(ContentBlock.paragraph(bd.get("text", "")))
-            elif btype == "table":
-                blocks.append(ContentBlock.table(
-                    bd.get("headers", []),
-                    bd.get("rows", []),
-                    bd.get("merge_cells", []),
-                ))
-        return blocks
-
-    # 降级：将 content 文本作为段落
-    text = chapter_data.get("content", "") or ""
-    if text.strip():
-        return [ContentBlock.paragraph(text)]
-    return []

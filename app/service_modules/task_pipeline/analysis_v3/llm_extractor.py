@@ -25,10 +25,10 @@ logger = logging.getLogger(__name__)
 
 
 def _get_llm():
-    """获取 LLMAdapter 实例。优先用 QWEN 配置（通义千问），降级到 OPENAI 配置。"""
-    api_key = current_app.config.get("QWEN_API_KEY") or current_app.config.get("OPENAI_API_KEY")
-    base_url = current_app.config.get("QWEN_BASE_URL") or current_app.config.get("OPENAI_BASE_URL")
-    model = current_app.config.get("QWEN_MODEL_NAME") or current_app.config.get("OPENAI_MODEL_NAME")
+    """获取 LLMAdapter 实例。使用 QWEN 配置（通义千问）。"""
+    api_key = current_app.config.get("QWEN_API_KEY")
+    base_url = current_app.config.get("QWEN_BASE_URL")
+    model = current_app.config.get("QWEN_MODEL_NAME")
     adapter = LLMAdapter(
         api_key=api_key,
         base_url=base_url,

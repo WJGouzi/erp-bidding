@@ -45,6 +45,7 @@ from .helpers import (
     _update_task_generate_stage,
     _validate_generate_prerequisites,
     _generate_chapter_content,
+    _is_separator_page_title,
 )
 
 
@@ -91,6 +92,7 @@ def _complete_generate(task_id, chapter_nos=None, retry_all=False, execution_id=
     catalog_record = _get_confirmed_catalog_record(task)
     product_context = _build_product_context(task)
     subject_context = _build_subject_material_context(task.subject_id)
+    logger.info("[generate] CODEX_VERSION=fix-template-gate-separator-pages-v2")
     outline = _get_catalog_outline(catalog_record) or [{"title": "综合响应", "description": ""}]
     chapter_records = _ensure_task_chapters(task, catalog_record)
     chapter_record_map = {item.chapter_no: item for item in chapter_records}
@@ -191,6 +193,41 @@ def _complete_generate(task_id, chapter_nos=None, retry_all=False, execution_id=
         _set_execution_progress(execution_id, 92)
     _maybe_fail_generate_stage_for_testing("ASSEMBLING_CONTENT")
     chapter_contents = _build_chapter_contents_from_records(chapter_records)
+
+    # 为分隔页的子节点生成内容，使其在正文中能正常渲染
+    if isinstance(outline, list):
+        # debug: 打印 outline 结构
+        for _di, _item in enumerate(outline):
+            _child_count = len(_item.get("children", []))
+            _is_sep = _is_separator_page_title(_item.get("title", ""))
+            _is_cov = _item.get("is_cover", False)
+            _title_short = _item.get("title", "")[:40] if _item.get("title") else "(无标题)"
+            logger.info("[outline] item[%d]: title='%s', is_cover=%s, is_separator=%s, children=%d",
+                        _di, _title_short, _is_cov, _is_sep, _child_count)
+            for _ci, _child in enumerate(_item.get("children", [])):
+                logger.info("[outline]   child[%d]: title='%s'", _ci, _child.get("title", "")[:40])
+        for _chapter in list(outline):
+            if _is_separator_page_title(_chapter.get("title", "")):
+                for _child in _chapter.get("children", []):
+                    try:
+                        _child_query = _child.get("title", "") + " " + (_child.get("description", "") or "")
+                        _child_kb = _build_knowledge_base_context(task, query_text=_child_query) if _child_query.strip() else {}
+                        _child_content = _generate_chapter_content(
+                            task, _child, analysis_result,
+                            subject_context=subject_context,
+                            knowledge_contexts=_child_kb,
+                            product_context=product_context,
+                        )
+                        logger.info("[generate] 分隔叶子节点内容生成完成: title='%s', content_len=%d, total_chapter_contents=%d",
+                                    _child.get("title", ""), len(_child_content or ""), len(chapter_contents) + 1)
+                        chapter_contents.append({
+                            "title": _child.get("title", ""),
+                            "content": _child_content,
+                            "content_blocks": None,
+                        })
+                    except Exception as _ce:
+                        logger.warning("[generate] 分隔叶子节点生成异常: %s", _ce)
+
     if analysis_result:
         coverage_snapshot = _build_generation_coverage_snapshot(
             outline,

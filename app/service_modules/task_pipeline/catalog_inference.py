@@ -628,11 +628,3 @@ def _has_service_content(comprehensive_json: dict) -> bool:
         if text and len(text) > 50:
             return True
     return False
-
-
-def _find_page_range(section_index: list, segment_id: str) -> list:
-    """从 section_index 中查找 segment_id 对应的页码范围。"""
-    for sec in section_index:
-        if sec.get("id") == segment_id:
-            return sec.get("page_range", [])
-    return []

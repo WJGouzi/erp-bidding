@@ -54,9 +54,9 @@ class Config:
         os.getenv("BAIDU_OCR_REQUEST_TIMEOUT_SECONDS", "30")
     )
 
-    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-    OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "")
-    OPENAI_MODEL_NAME = os.getenv("OPENAI_MODEL_NAME", "qwen-long")
+    DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+    DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+    DEEPSEEK_MODEL_NAME = os.getenv("DEEPSEEK_MODEL_NAME", "deepseek-chat")
     LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.4"))
     LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "1500"))
 
@@ -69,7 +69,7 @@ class Config:
     QWEN_API_KEY = os.getenv("QWEN_API_KEY", "")
     QWEN_BASE_URL = os.getenv("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
     QWEN_EMBEDDING_MODEL = os.getenv("QWEN_EMBEDDING_MODEL", "text-embedding-v4")
-
+    QWEN_MODEL_NAME = os.getenv("QWEN_MODEL_NAME", "qwen-plus")
     # PaddleOCR 配置
     PADDLE_OCR_JOB_URL = os.getenv("PADDLE_OCR_JOB_URL", "https://paddleocr.aistudio-app.com/api/v2/ocr/jobs")
     PADDLE_OCR_TOKEN = os.getenv("PADDLE_OCR_TOKEN", "")

@@ -38,11 +38,7 @@ from ...infrastructure.document_parser import DocumentParser
 from ...infrastructure.integrations import ChromaAdapter, LLMAdapter, MinioAdapter
 from ...infrastructure.multi_recall_engine import MultiRecallEngine
 from ..quality_assurance import (
-    build_requirement_traceability_matrix,
-    bind_requirements_to_chapters,
     inject_constraints_into_prompt,
-    post_generation_verify,
-    build_coverage_report,
 )
 from ...infrastructure.task_queue import TaskQueueManager
 from ...core.response import page_success
@@ -112,26 +108,16 @@ PRODUCT_FIELD_TO_COLUMN = {
 }
 
 
-def _map_product_headers_unified(headers):
-    """统一的表头→标准字段映射，供所有表格解析模块共用。
-    
-    Returns:
-        dict: {standard_field: col_index}
-    """
-    mapping = {}
-    for i, h in enumerate(headers):
-        h_clean = h.strip()
-        for std_field, candidates in PRODUCT_COLUMN_MAP.items():
-            if any(c in h_clean for c in candidates):
-                if std_field not in mapping:
-                    mapping[std_field] = i
-                break
-    return mapping
-
-
 _FIELD_UNSET = object()
 _EMPTY_PAGE_MARKER = "[[EMPTY_PAGE]]"
 _CONTENT_BLOCKS_PREFIX = "[[CONTENT_BLOCKS]]"
+_SEPARATOR_PAGE_PREFIX = "[[SEPARATOR_PAGE]]"
+_SEPARATOR_PAGE_EMPTY = "[[SEPARATOR_PAGE_EMPTY]]"
+_SEPARATOR_PAGE_KEYWORDS = (
+    "资格性响应文件", "符合性响应文件", "技术响应文件",
+    "商务响应文件", "其他响应文件", "其他文件",
+)
+
 _TABLE_MARKER_PREFIX = "[[TABLE:"
 _QUALIFICATION_MARKER = "[[QUALIFICATION_DOCS]]"
 
@@ -726,7 +712,7 @@ def _build_knowledge_base_context(task, query_text=None):
                 file_id=None,
             )
             # 置信度门控：召回相关性最低阈值
-            MIN_RECALL_SCORE = current_app.config.get("MIN_RECALL_CONFIDENCE", 0.3)
+            MIN_RECALL_SCORE = current_app.config.get("MIN_RECALL_CONFIDENCE", 0.01)
             for rr in recall_results:
                 if rr.get("text") and len(rr["text"].strip()) > 20:
                     # 相关性门控：score 低于阈值的片段丢弃
@@ -767,21 +753,6 @@ def _build_knowledge_base_context(task, query_text=None):
                 "snippets": snippets,
             })
     return context
-
-
-def _knowledge_base_snippet_allowed(metadata, enabled_file_ids, enabled_file_names):
-    if not metadata:
-        return False
-    file_id = metadata.get("file_id")
-    if file_id is not None:
-        try:
-            return int(file_id) in enabled_file_ids
-        except (TypeError, ValueError):
-            pass
-    file_name = str(metadata.get("file_name") or "").strip()
-    if file_name:
-        return file_name in enabled_file_names
-    return False
 
 
 def _build_product_context(task):
@@ -839,61 +810,6 @@ def _build_product_context(task):
         return {"matched_products": matched, "product_terms": terms, "snippets": [m["matched_text"] for m in matched]}
     except Exception:
         return {"snippets": [], "matched_products": [], "product_terms": terms}
-
-
-def _match_products_from_library(product_items, top_k=3):
-    """从产品库检索匹配产品信息，填充到产品列表的空白字段。
-
-    对每个产品名称做 LLM embedding 检索，从 Chroma product_library 中
-    找到最相似的产品，提取其规格参数、品牌、单价等信息。
-
-    Args:
-        product_items: list[dict] - 产品列表，每个 item 至少包含 name
-        top_k: 每个产品返回的最多匹配数
-
-    Returns:
-        dict: {product_name: {matched_text: "...", spec: "...", score: float}}
-    """
-    if not product_items:
-        return {}
-
-    try:
-        chroma_tenant = current_app.config.get("CHROMA_TENANT")
-        chroma_database = current_app.config.get("CHROMA_DATABASE")
-        engine = MultiRecallEngine()
-        results = {}
-
-        for item in product_items:
-            name = item.get("name", "") or item.get("采购产品名称", "") or ""
-            if not name or len(name) < 2:
-                continue
-
-            recall_results = engine.recall(
-                query=name,
-                collection="product_library",
-                top_k=top_k,
-                tenant=chroma_tenant,
-                database=chroma_database,
-            )
-
-            best_match = None
-            best_score = 0.0
-            for rr in recall_results:
-                score = rr.get("score", 0) or 0
-                if score > best_score and rr.get("text") and len(rr["text"].strip()) > 10:
-                    best_score = score
-                    best_match = rr["text"].strip()
-
-            if best_match:
-                results[name] = {
-                    "matched_text": best_match,
-                    "score": best_score,
-                }
-
-        return results
-    except Exception as exc:
-        logger.warning("[product] 产品库匹配异常: %s", exc)
-        return {}
 
 
 def _fetch_product_data(product_names, adapter=None):
@@ -1044,22 +960,6 @@ def _extract_product_terms(text):
     return list(dict.fromkeys(terms))[:10]
 
 
-def _get_bid_type_prompt_profile(bid_type, title):
-    """根据标书类型生成对应的提示词模板配置。"""
-    profiles = {
-        "GOODS": {
-            "fallback_focus": "重点响应产品规格参数、技术指标、供货范围、质量标准、验收方法、包装运输、售后服务等货物采购核心要素。",
-        },
-        "SERVICE": {
-            "fallback_focus": "重点响应服务范围、服务方案、实施计划、团队配置、服务承诺、SLA保障、质量控制、沟通机制等服务采购核心要素。",
-        },
-        "ENGINEERING": {
-            "fallback_focus": "重点响应施工组织设计、技术方案、资源配置、工期计划、质量安全保证措施、项目管理人员配置等工程采购核心要素。",
-        },
-    }
-    return profiles.get(bid_type, {"fallback_focus": "综合响应招标文件各项要求。"})
-
-
 def _build_subject_material_context(subject_id):
     """汇总主体资料文本，生成主体相关上下文。"""
     if not subject_id:
@@ -1204,6 +1104,20 @@ def _split_generated_sections_by_titles(content_text, titles):
 def _truncate_binding_text(text, max_length=180):
     normalized = " ".join(str(text or "").replace("\r", "\n").split())
     return normalized[:max_length].strip()
+
+
+def _is_separator_page_title(title):
+    """判断标题是否为响应文件分隔页（容器页，非具体内容章节）。
+
+    Returns:
+        bool: True 表示该标题是分隔页
+    """
+    if not title:
+        return False
+    for kw in _SEPARATOR_PAGE_KEYWORDS:
+        if kw in title:
+            return True
+    return False
 
 
 def _build_leaf_response_bindings(chapter, analysis_context, subject_context, knowledge_contexts, product_context):
@@ -1952,50 +1866,6 @@ _FORMAT_VALIDATORS = {
 }
 
 
-def _validate_field_format(field_name: str, value: str) -> tuple[bool, str]:
-    """校验字段格式是否合规。
-
-    Args:
-        field_name: 字段名（如 "credit_code", "phone"）
-        value: 待校验的值
-
-    Returns:
-        (is_valid: bool, message: str)
-    """
-    if not value or not value.strip():
-        return False, "空值"
-
-    value = value.strip()
-
-    # 按优先级尝试匹配
-    if field_name in ("credit_code", "统一社会信用代码"):
-        patterns = ["credit_code", "credit_code_loose"]
-    elif field_name in ("phone", "联系电话", "contact_phone"):
-        patterns = ["phone_mobile", "phone_landline"]
-    elif field_name in ("email",):
-        patterns = ["email"]
-    elif field_name in ("company_name", "公司名称"):
-        patterns = ["company_name"]
-    elif field_name in ("project_no", "项目编号"):
-        patterns = ["project_no"]
-    elif field_name in ("amount", "budget", "预算"):
-        patterns = ["amount"]
-    else:
-        # 未知字段，只检查非空
-        return bool(value.strip()), "未注册字段，仅非空校验"
-
-    for pname in patterns:
-        if pname not in _FORMAT_VALIDATORS:
-            continue
-        pattern, desc = _FORMAT_VALIDATORS[pname]
-        if re.match(pattern, value):
-            return True, desc
-
-    # 都不匹配
-    primary_pattern = _FORMAT_VALIDATORS.get(patterns[0], (None, "校验失败"))[0] if patterns else None
-    return False, f"格式不符（期望：{_FORMAT_VALIDATORS.get(patterns[0], ('', '无'))[1] if patterns else '未知'}）"
-
-
 def _compute_text_confidence(text: str, source: str = "ocr") -> float:
     """评估文本质量置信度（0.0 ~ 1.0）。
 
@@ -2050,111 +1920,6 @@ def _compute_text_confidence(text: str, source: str = "ocr") -> float:
         score -= 0.1
 
     return max(0.0, min(1.0, score))
-
-
-def _filter_low_confidence_kb_snippets(knowledge_contexts: dict, min_score: float = 0.3) -> dict:
-    """过滤低置信度的知识库片段。
-
-    从 knowledge_contexts 中移除置信度低于阈值的片段。
-    优先使用召回引擎的 score，降级到 _compute_text_confidence 启发式。
-
-    Args:
-        knowledge_contexts: _build_knowledge_base_context 的返回值
-        min_score: 最低保留分数（默认 0.3）
-
-    Returns:
-        过滤后的 knowledge_contexts
-    """
-    if not knowledge_contexts:
-        return knowledge_contexts
-
-    filtered = dict(knowledge_contexts)
-    kb_list = filtered.get("knowledge_list", [])
-    for kb in kb_list:
-        snippets = kb.get("snippets", [])
-        filtered_snippets = []
-        for snip in snippets:
-            if isinstance(snip, dict):
-                # 新格式：使用召回引擎的 score
-                score = snip.get("score", 0) or 0
-            else:
-                # 旧格式（纯文本）：启发式评估
-                score = _compute_text_confidence(snip, source="kb_recall")
-            if score >= min_score:
-                filtered_snippets.append(snip)
-        kb["snippets"] = filtered_snippets
-        kb["_filtered_count"] = len(snippets) - len(filtered_snippets)
-
-    return filtered
-
-
-def _filter_low_confidence_subject_materials(subject_context: dict, min_score: float = 0.5) -> dict:
-    """为主体资料打置信度标签，供下游 LLM 路径使用。
-
-    不阻断数据，不清除文本。低置信度内容由 LLM 路径自行决定是否使用。
-
-    Args:
-        subject_context: _build_subject_material_context 的返回值
-        min_score: 置信度阈值（低于此值标记为 low_confidence）
-
-    Returns:
-        打上置信度标签的 subject_context
-    """
-    if not subject_context:
-        return subject_context
-
-    filtered = dict(subject_context)
-    materials = list(filtered.get("materials", []))
-    for mat in materials:
-        excerpt = mat.get("text_excerpt", "")
-        if excerpt:
-            score = _compute_text_confidence(excerpt, source="ocr")
-            rounded = round(score, 2)
-            mat["_confidence"] = rounded
-            mat["_low_confidence"] = rounded < min_score
-            # 不清除文本，保留原文供用户参考
-
-    return filtered
-
-
-# 字段映射注册表：LLM hint 关键词 → 数据源 → 取值方法
-_TEMPLATE_FIELD_MAP = [
-    # 主体公司字段
-    (("公司名称", "申请人名称", "单位名称", "供应商名称", "投标人名称", "比选申请人名称"),
-     "subject", lambda ctx: ctx["subject"].get("company_name", "")),
-    (("统一社会信用代码", "信用代码"),
-     "subject", lambda ctx: ctx["subject"].get("credit_code", "")),
-    (("联系电话", "电话", "手机"),
-     "subject", lambda ctx: ctx["subject"].get("contact_phone", "")),
-    (("联系地址", "地址", "通讯地址"),
-     "subject", lambda ctx: ctx["subject"].get("address", "")),
-    (("联系人",),
-     "subject", lambda ctx: ctx["subject"].get("contact_person", "")),
-    # 项目字段
-    (("项目名称", "采购项目名称", "比选项目名称"),
-     "analysis", lambda ctx: ctx["analysis"].get("project_name", "")),
-    (("项目编号", "招标编号", "比选编号", "采购编号"),
-     "analysis", lambda ctx: ctx["analysis"].get("project_no", "")),
-    (("包号", "分包号"),
-     "analysis", lambda ctx: ctx["analysis"].get("package_no", "")),
-    (("采购人", "招标人", "业主"),
-     "analysis", lambda ctx: ctx["analysis"].get("bidder_name", "")),
-    (("代理机构", "采购代理机构", "招标代理"),
-     "analysis", lambda ctx: ctx["analysis"].get("agent_name", "")),
-    (("预算金额", "采购预算", "预算"),
-     "analysis", lambda ctx: ctx["analysis"].get("budget_amount", "")),
-    # 计算字段
-    (("日期", "申请日期", "报价日期", "响应日期"),
-     "calc", lambda ctx: utc_now().strftime("%Y年%m月%d日")),
-    (("年",),
-     "calc", lambda ctx: utc_now().strftime("%Y")),
-    (("月",),
-     "calc", lambda ctx: utc_now().strftime("%m")),
-    (("日",),
-     "calc", lambda ctx: utc_now().strftime("%d")),
-]
-
-
 def _build_template_field_map(subject_context, analysis_context):
     """构建模板填充用的字段值映射表。
 
@@ -3017,240 +2782,6 @@ def _generate_qualification_content(analysis_context, subject_context, knowledge
         "missing_count": sum(1 for s in status_list if s["status"] == "MISSING"),
     }
 
-    return _QUALIFICATION_MARKER + _json.dumps(data, ensure_ascii=False)
-
-
-def _generate_chapter_content_v4(task, chapter, analysis_result, subject_context, knowledge_contexts, product_context):
-    """v4 分段生成路由 — 根据 mandate_level 路由到对应引擎。
-
-    Args:
-        chapter: 目录节点，应包含以下字段（由 catalog_binder 注入）:
-            - mandate_level: "HARD"|"SOFT"|"FREE"
-            - bound_segments: list[str] (绑定的解析段 ID 列表)
-            - guardrails: list[dict] (生成约束)
-
-    路由规则:
-        HARD → 填空引擎 (原文复制 + 主体字段替换 + 原文锁定校验)
-        SOFT → 匹配引擎 (KB/产品/主体三级递进)
-        FREE → 约束LLM整理 + 后生成校验
-        无 mandate_level → 降级到原有 _generate_chapter_content
-    """
-    mandate_level = chapter.get("mandate_level")
-    if not mandate_level:
-        # 没有 mandate_level 字段，走原有逻辑
-        return _generate_chapter_content(task, chapter, analysis_result,
-                                          subject_context, knowledge_contexts,
-                                          product_context)
-
-    bound_segments = chapter.get("bound_segments", [])
-    guardrails = chapter.get("guardrails", [])
-
-    if mandate_level == "HARD":
-        return _hard_generate(task, chapter, analysis_result, subject_context)
-    elif mandate_level == "SOFT":
-        return _soft_generate(task, chapter, analysis_result, subject_context,
-                              knowledge_contexts, product_context, guardrails)
-    elif mandate_level == "FREE":
-        return _free_generate(task, chapter, analysis_result, subject_context,
-                              knowledge_contexts, product_context, guardrails)
-    else:
-        return _generate_chapter_content(task, chapter, analysis_result,
-                                          subject_context, knowledge_contexts,
-                                          product_context)
-
-
-def _hard_generate(task, chapter, analysis_result, subject_context):
-    """HARD 路径：原文复制 + 确定性填空。
-
-    不经过 LLM，纯规则操作。确保强制格式内容（声明函、承诺书、投标函等）
-    不被改写。
-    """
-    from app.infrastructure.mandate_classifier import MANDATE_HARD
-
-    chapter_title = chapter.get("title", "").strip()
-    effective_text = analysis_result.effective_text if analysis_result else ""
-
-    # 1. 从原文中找匹配章节
-    _, template_text = _detect_template_type(chapter_title, "", effective_text)
-    if not template_text:
-        # 没有匹配的原文模板 → 返回占位
-        return _EMPTY_PAGE_MARKER
-
-    # 2. 确定性填空
-    analysis_context = _extract_analysis_context(analysis_result)
-    field_map = _build_template_field_map(subject_context, analysis_context)
-    placeholders = _identify_placeholders_via_llm(template_text)
-    filled, unfilled = _fill_template(template_text, placeholders, field_map)
-
-    # 3. 原文锁定校验
-    if _template_has_meaningful_content(filled):
-        is_safe, diffs = _verify_template_diff(template_text, filled)
-        if not is_safe:
-            logger.warning("[hard] 原文锁定校验失败: %s, 保留填充后原文, %s个占位符未替换",
-                           chapter_title, len(unfilled))
-        return filled
-
-    return template_text
-
-
-def _soft_generate(task, chapter, analysis_result, subject_context,
-                   knowledge_contexts, product_context, guardrails):
-    """SOFT 路径：匹配引擎 — KB/产品/主体三级递进。
-
-    有据可依时填充，无据时留白。
-    """
-    chapter_title = chapter.get("title", "").strip()
-    analysis_context = _extract_analysis_context(analysis_result)
-    content_parts = []
-    evidence_sources = []
-
-    # 从 bound_segments 取本节的特定需求
-    segment_data = _extract_bound_segment_data(analysis_result, chapter.get("bound_segments", []))
-
-    # 收集三段证据
-    # Level 1: 主体资料
-    subject_materials = (subject_context or {}).get("materials", []) or []
-    for mat in subject_materials:
-        excerpt = (mat.get("text_excerpt") or "").strip()
-        if excerpt:
-            content_parts.append(excerpt)
-            evidence_sources.append({"source": "subject", "confidence": "EXACT"})
-
-    # Level 2: 知识库
-    for kb in (knowledge_contexts or {}).get("knowledge_list", []):
-        for snippet in kb.get("snippets", [])[:5]:
-            if isinstance(snippet, dict):
-                text = snippet.get("text", "") or ""
-                conf = snippet.get("confidence", "UNKNOWN")
-            else:
-                text = snippet or ""
-                conf = "UNKNOWN"
-            if text.strip():
-                content_parts.append(text.strip())
-                evidence_sources.append({"source": "knowledge_base", "confidence": conf})
-
-    # Level 3: 产品库
-    for product in (product_context or {}).get("matched_products", [])[:5]:
-        matched_text = (product.get("matched_text") or "").strip()
-        if matched_text:
-            content_parts.append(matched_text)
-            evidence_sources.append({"source": "product", "confidence": "HIGH"})
-
-    if not content_parts:
-        return _EMPTY_PAGE_MARKER
-
-    return "\n\n".join(content_parts)
-
-
-def _free_generate(task, chapter, analysis_result, subject_context,
-                   knowledge_contexts, product_context, guardrails):
-    """FREE 路径：约束 LLM 整理 + 后生成校验。
-
-    LLM 负责编排已有材料，不得编造。
-    生成后执行校验，未通过则降级为留白。
-    """
-    chapter_title = chapter.get("title", "").strip()
-    chapter_desc = chapter.get("description", "") or ""
-    analysis_context = _extract_analysis_context(analysis_result)
-
-    # 构建约束信息（不进 prompt，只作为约束）
-    guardrail_texts = []
-    for g in guardrails:
-        guardrail_texts.append(f"- {g.get('detail', '')}")
-    constraint_hint = "\n".join(guardrail_texts) if guardrail_texts else ""
-
-    # 收集材料
-    materials = []
-    # 分析需求
-    if analysis_context.get("technical_requirements"):
-        materials.append(f"[技术要求] {analysis_context['technical_requirements'][:500]}")
-    if analysis_context.get("business_requirements"):
-        materials.append(f"[商务要求] {analysis_context['business_requirements'][:500]}")
-    # 主体资料
-    for mat in (subject_context or {}).get("materials", [])[:5]:
-        excerpt = (mat.get("text_excerpt") or "").strip()
-        if excerpt:
-            materials.append(f"[主体资料] {excerpt[:200]}")
-    # 知识库
-    for kb in (knowledge_contexts or {}).get("knowledge_list", []):
-        for snippet in kb.get("snippets", [])[:3]:
-            if isinstance(snippet, dict):
-                text = snippet.get("text", "") or ""
-                conf = snippet.get("confidence", "UNKNOWN")
-            else:
-                text = snippet or ""
-                conf = "UNKNOWN"
-            if text.strip():
-                materials.append(f"[知识库:{conf}] {text.strip()[:200]}")
-
-    if not materials:
-        return _EMPTY_PAGE_MARKER
-
-    material_text = "\n---\n".join(materials)
-    constraint_info = f"\n生成约束：\n{constraint_hint}" if constraint_hint else ""
-
-    system_prompt = (
-        "你是一个投标文件内容编排助手，不是自由创作助手。\n\n"
-        "你的角色：只能使用「已提供」的材料编排内容，不能编造任何数据、承诺或能力。\n"
-        "必须遵守的规则：\n"
-        "1. 每段内容必须在材料中有对应依据\n"
-        "2. 如材料不足以支撑实质性承诺，仅整理已提供的要求或事实\n"
-        "3. 不得使用 Markdown 语法\n"
-        "4. 如果某个项完全没有材料支撑，标注【无匹配资料，待补充】\n"
-        "5. 材料中 [EXACT] = 确定信息可直接引用，[HIGH] = 高置信度可引用，\n"
-        "   [MEDIUM] = 中等置信度注意核实，[LOW] = 低置信度建议留白"
-    )
-    user_prompt = (
-        f"章节标题：{chapter_title}\n"
-        f"章节说明：{chapter_desc}\n"
-        f"{constraint_info}\n"
-        f"\n可用材料：\n{material_text[:3000]}\n\n"
-        "请基于以上材料生成章节正文。如果某个要点完全没有材料支撑，请标注【无匹配资料，待补充】。"
-    )
-
-    try:
-        adapter = LLMAdapter(
-            api_key=current_app.config.get("OPENAI_API_KEY"),
-            base_url=current_app.config.get("OPENAI_BASE_URL"),
-            default_model=current_app.config.get("OPENAI_MODEL_NAME"),
-        )
-        if not adapter.is_available():
-            return _EMPTY_PAGE_MARKER
-
-        result = adapter.generate_text(
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            temperature=0.1,
-            max_tokens=2000,
-        )
-        if not result or not result.strip():
-            return _EMPTY_PAGE_MARKER
-
-        # 后生成校验
-        verify_result = post_generation_verify(chapter_title, result, {
-            "chapter_title": chapter_title,
-            "hard_constraints": [
-                {"item_id": f"guard_{i}", "requirement_text": g.get("detail", "")}
-                for i, g in enumerate(guardrails)
-            ],
-            "tier3_items": [
-                {"item_id": f"mat_{i}", "requirement_text": m[:80]}
-                for i, m in enumerate(materials[:10])
-            ],
-            "tier2_items": [],
-            "tier1_items": [],
-        })
-        if verify_result and verify_result.get("overall") == "FAIL":
-            logger.warning("[free] 后生成校验失败: %s, 降级为留白", chapter_title)
-            return f"【本节无法安全生成，请人工撰写】\n\n参考材料：\n{material_text[:500]}"
-
-        return result.strip()
-
-    except Exception as exc:
-        logger.warning("[free] LLM 生成异常: %s", exc)
-        return _EMPTY_PAGE_MARKER
-
-
 def _extract_bound_segment_data(analysis_result, bound_segments):
     """从分析结果中提取与指定 segment 绑定的数据。"""
     if not bound_segments or not analysis_result:
@@ -3273,6 +2804,7 @@ def _extract_bound_segment_data(analysis_result, bound_segments):
 def _generate_chapter_content(task, chapter, analysis_result, subject_context, knowledge_contexts, product_context):
     """调用模型生成单个章节的详细正文内容。"""
     # 阶段A：尝试模板绑定 — 如果有原文模板，直接复制+填空，不走LLM
+    bid_type_label_map = {"GOODS": "货物类", "SERVICE": "服务类", "ENGINEERING": "工程类"}
     try:
         _analysis_data = analysis_result.safe_analysis_data() if analysis_result else {}
         _fmt = _analysis_data.get("format_requirements", {}) if isinstance(_analysis_data, dict) else {}
@@ -3291,8 +2823,6 @@ def _generate_chapter_content(task, chapter, analysis_result, subject_context, k
     except Exception as _exc:
         logger.warning("[template_binder] 章节「%s」模板绑定异常: %s",
                        chapter.get("title", ""), _exc)
-
-    bid_type_label_map = {"GOODS": "\u8d27\u7269\u7c7b", "SERVICE": "\u670d\u52a1\u7c7b", "ENGINEERING": "\u5de5\u7a0b\u7c7b"}
     bid_type_label = bid_type_label_map.get(task.bid_type, "\u8d27\u7269\u7c7b")
     chapter_title = chapter.get("title", "").strip()
     chapter_desc = chapter.get("description", "") or ""
@@ -3319,36 +2849,69 @@ def _generate_chapter_content(task, chapter, analysis_result, subject_context, k
     ):
         return _EMPTY_PAGE_MARKER
 
-    # ========== 填空引擎（v2）：LLM 识别占位符 + 确定性替换 ==========
+    # ===== D1a: \u6a21\u677f\u5b58\u5728\u6027\u4e8c\u6b21\u6821\u9a8c =====
+    # \u5982\u679c format_requirements \u4e2d\u5b58\u5728\u5339\u914d\u7684 section \u4e14 template_content \u975e\u7a7a\uff0c
+    # \u4f46 bind_template \u672a\u8fd4\u56de has_template=True\uff0c\u5219\u5224\u5b9a\u4e3a"\u6709\u6a21\u677f\u4f46\u7ed1\u5b9a\u5931\u8d25"\uff0c\u7559\u7a7a\u3002
+    try:
+        _secondary_fmt = _analysis_data.get("format_requirements", {}) if isinstance(_analysis_data, dict) else {}
+        if _secondary_fmt:
+            _sec_reqs = _secondary_fmt.get("required_sections", [])
+            if _sec_reqs:
+                from .template_binder import _clean_title as _tc
+                _clean_chapter = _tc(chapter_title)
+                for _sec in _sec_reqs:
+                    _sec_clean = _tc(_sec.get("title", ""))
+                    if _clean_chapter in _sec_clean or _sec_clean in _clean_chapter:
+                        _tc_content = _sec.get("template_content", []) or _sec.get("content_blocks", [])
+                        if _tc_content:
+                            logger.info("[template-gate] \u7ae0\u8282\u300c%s\u300d\u6709\u6a21\u677f\u5b9a\u4e49\u4f46\u7ed1\u5b9a\u5931\u8d25\uff0c\u7559\u7a7a", chapter_title)
+                            return _EMPTY_PAGE_MARKER
+    except Exception:
+        pass
+
+    # ===== D1b: \u5206\u9694\u9875\u68c0\u6d4b =====
+    if _is_separator_page_title(chapter_title):
+        logger.info("[separator] \u7ae0\u8282\u300c%s\u300d\u4e3a\u5206\u9694\u9875", chapter_title)
+        # \u5c1d\u8bd5\u4ece\u62db\u6807\u539f\u6587\u4e2d\u63d0\u53d6\u5206\u9694\u9875\u7684\u5bf9\u5e94\u5185\u5bb9
+        _sep_original = _extract_template_from_tender(chapter_title, effective_text)
+        if _sep_original:
+            return _SEPARATOR_PAGE_PREFIX + _sep_original
+        return _SEPARATOR_PAGE_EMPTY
+
+    # ===== D1c: \u5206\u7c7b\u5f15\u64ce =====
     chapter_type = _classify_chapter_type(chapter_title, chapter_desc)
+
     if chapter_type == CHAPTER_TYPE_TEXT_TEMPLATE:
         _, template_text = _detect_template_type(chapter_title, chapter_desc, effective_text)
         if template_text:
             field_map = _build_template_field_map(subject_context, analysis_context)
-            # 优先用 LLM 识别占位符，降级到正则
+            # \u4f18\u5148\u7528 LLM \u8bc6\u522b\u5360\u4f4d\u7b26\uff0c\u964d\u7ea7\u5230\u6b63\u5219
             placeholders = _identify_placeholders_via_llm(template_text)
             filled, unfilled = _fill_template(template_text, placeholders, field_map)
             if _template_has_meaningful_content(filled):
-                # 原文锁定校验
+                # \u539f\u6587\u9501\u5b9a\u6821\u9a8c
                 is_safe, diffs = _verify_template_diff(template_text, filled)
                 if not is_safe:
-                    # 不降级到 LLM 生成（防止改写固定格式导致废标）
-                    # 能填的填，填不了的原样保留
-                    logger.warning("[template] 章节「%s」填充后原文锁定校验失败，保留填充后原文，%s个占位符未替换",
+                    logger.warning("[template] \u7ae0\u8282\u300c%s\u300d\u586b\u5145\u540e\u539f\u6587\u9501\u5b9a\u6821\u9a8c\u5931\u8d25\uff0c\u4fdd\u7559\u586b\u5145\u540e\u539f\u6587\uff0c%s\u4e2a\u5360\u4f4d\u7b26\u672a\u66ff\u6362",
                                    chapter_title, len(unfilled))
-                logger.info("[template] 章节「%s」填空完成，占位符%s个，未填充%s个",
+                logger.info("[template] \u7ae0\u8282\u300c%s\u300d\u586b\u7a7a\u5b8c\u6210\uff0c\u5360\u4f4d\u7b26%s\u4e2a\uff0c\u672a\u586b\u5145%s\u4e2a",
                             chapter_title, len(placeholders), len(unfilled))
                 return filled
+        # TEXT_TEMPLATE \u5728\u539f\u6587\u4e2d\u627e\u4e0d\u5230\u6a21\u677f\u6587\u672c\u2192\u7559\u7a7a\uff0c\u7edd\u4e0d\u843d\u5165 LLM
+        logger.info("[template] \u7ae0\u8282\u300c%s\u300d\u4e3a\u6a21\u677f\u7c7b\u578b\u4f46\u539f\u6587\u4e2d\u672a\u627e\u5230\u6a21\u677f\u6587\u672c\uff0c\u7559\u7a7a", chapter_title)
+        return _EMPTY_PAGE_MARKER
 
-    # ========== 表格填充引擎 ==========
-    if chapter_type == CHAPTER_TYPE_TABLE_TEMPLATE:
-        logger.info("[table] 章节「%s」使用表格引擎", chapter_title)
+    elif chapter_type == CHAPTER_TYPE_TABLE_TEMPLATE:
+        logger.info("[table] \u7ae0\u8282\u300c%s\u300d\u4f7f\u7528\u8868\u683c\u5f15\u64ce", chapter_title)
         return _generate_table_content(chapter_title, chapter_desc, analysis_context, subject_context)
 
-    # ========== 资格证明文件填充引擎（三级递进：主体→知识库→留白） ==========
-    if chapter_type == CHAPTER_TYPE_QUALIFICATION:
-        logger.info("[qualification] 章节「%s」使用资格证明插入引擎（三级递进）", chapter_title)
+    elif chapter_type == CHAPTER_TYPE_QUALIFICATION:
+        logger.info("[qualification] \u7ae0\u8282\u300c%s\u300d\u4f7f\u7528\u8d44\u683c\u8bc1\u660e\u63d2\u5165\u5f15\u64ce\uff08\u4e09\u7ea7\u9012\u8fdb\uff09", chapter_title)
         return _generate_qualification_content(analysis_context, subject_context, knowledge_contexts, chapter)
+
+    else:
+        # ===== D1d: FREE_WRITE \u2014 \u4ec5\u6b64\u8def\u5f84\u53ef\u8fdb\u5165 LLM =====
+        pass
 
     system_prompt = (
         "\u4f60\u662f\u4e00\u540d\u6295\u6807\u6587\u4ef6\u5185\u5bb9\u7f16\u6392\u52a9\u624b\uff0c\u4e0d\u662f\u81ea\u7531\u521b\u4f5c\u52a9\u624b\u3002" + "\n\n"
@@ -3601,7 +3164,12 @@ def _generate_chapter_content(task, chapter, analysis_result, subject_context, k
         for kb in knowledge_contexts["knowledge_list"]:
             user_parts.append(f"\n\u77e5\u8bc6\u5e93\u53c2\u8003 [{kb.get('knowledge_base_name', '')}]:")
             for snip in kb.get("snippets", [])[:5]:
-                user_parts.append(f"  - {snip[:300]}")
+                if isinstance(snip, dict):
+                    snip_text = snip.get("text", "") or ""
+                else:
+                    snip_text = snip or ""
+                if snip_text.strip():
+                    user_parts.append(f"  - {snip_text[:300]}")
 
     if product_context:
         terms = product_context.get("product_terms", [])
@@ -3617,25 +3185,29 @@ def _generate_chapter_content(task, chapter, analysis_result, subject_context, k
         _maybe_fail_chapter_for_testing(int(chapter.get("chapter_no", 0)))
         return f"\u3010\u6d4b\u8bd5\u5185\u5bb9\u3011{chapter_title} \u7684\u6a21\u62df\u6b63\u6587\u3002"
 
-    adapter = LLMAdapter(
-        api_key=current_app.config.get("OPENAI_API_KEY"),
-        base_url=current_app.config.get("OPENAI_BASE_URL"),
-        default_model=current_app.config.get("OPENAI_MODEL_NAME"),
-    )
-    if not adapter.is_available():
-        raise RuntimeError("LLM \u670d\u52a1\u4e0d\u53ef\u7528")
+    try:
+        adapter = LLMAdapter(
+            api_key=current_app.config.get("DEEPSEEK_API_KEY"),
+            base_url=current_app.config.get("DEEPSEEK_BASE_URL"),
+            default_model=current_app.config.get("DEEPSEEK_MODEL_NAME"),
+        )
+        if not adapter.is_available():
+            logger.warning("[free] LLM 服务不可用，章节「%s」留白待补充", chapter_title)
+            return _EMPTY_PAGE_MARKER
 
-    temperature = current_app.config.get("LLM_TEMPERATURE", 0.4)
-    # \u786e\u4fdd\u6bcf\u7ae0\u81f3\u5c11\u67092000 tokens
-    max_tokens = 3000
+        temperature = current_app.config.get("LLM_TEMPERATURE", 0.4)
+        max_tokens = 3000
 
-    raw = adapter.generate_text(
-        system_prompt=system_prompt,
-        user_prompt=user_prompt,
-        temperature=float(temperature),
-        max_tokens=int(max_tokens),
-    )
-    return _normalize_chapter_content_by_bindings(raw, leaf_bindings)
+        raw = adapter.generate_text(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            temperature=float(temperature),
+            max_tokens=int(max_tokens),
+        )
+        return _normalize_chapter_content_by_bindings(raw, leaf_bindings)
+    except Exception as _exc:
+        logger.warning("[free] 章节「%s」LLM 调用异常: %s，降级为留白", chapter_title, _exc)
+        return _EMPTY_PAGE_MARKER
 
 
 def _read_file_text(file_record):
@@ -3730,13 +3302,6 @@ def _read_text_from_chroma(file_record):
     except Exception as exc:
         logger.warning("[helpers] ChromaDB 读取失败: %s", exc)
     return ""
-
-def _detect_package_info(text):
-    """判断招标文本中是否存在分包信息。"""
-    packages = _extract_package_numbers(text)
-    if packages:
-        return True, packages[0]["package_no"]
-    return False, None
 
 
 def _extract_package_numbers(text):
@@ -4286,6 +3851,24 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
 
 
 
+    def _render_separator_page(doc, outline_item, original_text=None):
+        """渲染响应文件分隔页：居中、大字号、独立一页。"""
+        from docx.shared import Pt
+        from docx.oxml.ns import qn
+        # 上方留白
+        for _ in range(6):
+            doc.add_paragraph("")
+        title = outline_item.get("title", "").strip()
+        p = doc.add_paragraph()
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        run = p.add_run(_strip_xml_control_chars(title))
+        run.font.name = "宋体"
+        run.font.size = Pt(22)  # 二号
+        run.bold = True
+        run.element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
+        if original_text:
+            _write_formatted_content(doc, original_text)
+
     def _normalize_outline_title_for_match(title):
         return re.sub(r"\s+", "", str(title or "").strip())
 
@@ -4337,40 +3920,45 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
             _cover_fmt = {}
     
     _cover_template_found = False
-    if _cover_fmt and isinstance(_cover_fmt, dict):
+    # 从 outline 中找 is_cover=True 的节点，渲染其封面内容
+    _cover_outline_items = [item for item in outline if item.get("is_cover")]
+    if _cover_outline_items and _cover_fmt and isinstance(_cover_fmt, dict):
         _cover_sections = _cover_fmt.get("required_sections", [])
-        for _sec in _cover_sections:
-            _sec_title = _sec.get("title", "").strip()
-            if "封面" in _sec_title or "封皮" in _sec_title:
-                _cover_blocks = _sec.get("content_blocks", [])
-                if _cover_blocks:
-                    for _blk in _cover_blocks:
-                        if _blk.get("type") == "paragraph":
-                            _text = _blk.get("text", "")
-                            _text = _text.replace("XXX（单位名称）", company_name or "XXX")
-                            _text = _text.replace("XXX", company_name or "XXX")
-                            _text = _text.replace("（项目名称）", cover_item_name or "（项目名称）")
-                            _text = _text.replace("（项目编号）", cover_project_no or "（项目编号）")
-                            _p = document.add_paragraph()
-                            _p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                            _r = _p.add_run(_text)
-                            _r.font.name = "宋体"
-                            _r.font.size = Pt(16)
-                            _r.element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
-                        elif _blk.get("type") == "table":
-                            _headers = _blk.get("headers", [])
-                            _rows = _blk.get("rows", [])
-                            if _headers and _rows:
-                                _t = document.add_table(rows=len(_rows), cols=len(_headers))
-                                _t.style = "Table Grid"
-                                for _ci, _h in enumerate(_headers):
-                                    _t.rows[0].cells[_ci].text = _h
-                                for _ri, _row in enumerate(_rows):
-                                    for _ci, _cell in enumerate(_row):
-                                        _filled = _cell.replace("XXX", company_name or "") if _ci == 0 else _cell
-                                        _t.rows[_ri].cells[_ci].text = _filled
-                    _cover_template_found = True
-                    break
+        for _cover_item in _cover_outline_items:
+            _cover_title = _cover_item.get("title", "").strip()
+            # 在 format_requirements 中找匹配章节
+            for _sec in _cover_sections:
+                _sec_title = _sec.get("title", "").strip()
+                if _cover_title == _sec_title or _cover_title in _sec_title or _sec_title in _cover_title:
+                    _cover_blocks = _sec.get("template_content", []) or _sec.get("content_blocks", [])
+                    if _cover_blocks:
+                        for _blk in _cover_blocks:
+                            if _blk.get("type") in ("paragraph", "text"):
+                                _text = _blk.get("text", "")
+                                _text = _text.replace("XXX（单位名称）", company_name or "XXX")
+                                _text = _text.replace("XXX", company_name or "XXX")
+                                _text = _text.replace("（项目名称）", cover_item_name or "（项目名称）")
+                                _text = _text.replace("（项目编号）", cover_project_no or "（项目编号）")
+                                _p = document.add_paragraph()
+                                _p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                                _r = _p.add_run(_text)
+                                _r.font.name = "宋体"
+                                _r.font.size = Pt(16)
+                                _r.element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
+                            elif _blk.get("type") == "table":
+                                _headers = _blk.get("headers", [])
+                                _rows = _blk.get("rows", [])
+                                if _headers and _rows:
+                                    _t = document.add_table(rows=len(_rows), cols=len(_headers))
+                                    _t.style = "Table Grid"
+                                    for _ci, _h in enumerate(_headers):
+                                        _t.rows[0].cells[_ci].text = _h
+                                    for _ri, _row in enumerate(_rows):
+                                        for _ci, _cell in enumerate(_row):
+                                            _filled = _cell.replace("XXX", company_name or "") if _ci == 0 else _cell
+                                            _t.rows[_ri].cells[_ci].text = _filled
+                        _cover_template_found = True
+                        break
     
     if not _cover_template_found:
         # 自有封面模板
@@ -4465,10 +4053,15 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                 matched_content = chapter_contents[chapter_idx].get("content", "")
 
             if not matched_content:
+                logger.info("[write] 标题匹配查找: title='%s', chapter_contents共%d条", title, len(chapter_contents))
                 for cc in chapter_contents:
-                    if title in cc.get("title", "") or cc.get("title", "") in title:
+                    _cc_title = cc.get("title", "")
+                    if title in _cc_title or _cc_title in title:
+                        logger.info("[write] 标题匹配成功: title='%s' -> cc.title='%s'", title, _cc_title)
                         matched_content = cc.get("content", "")
                         break
+                if not matched_content:
+                    logger.info("[write] 标题匹配失败: title='%s'", title)
 
         if not matched_content and inherited_child_sections:
             matched_content = inherited_child_sections.get(title)
@@ -4479,14 +4072,11 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
         child_sections = _extract_child_content_sections(matched_content, children) if matched_content and matched_content != _EMPTY_PAGE_MARKER and children else {}
 
         if matched_content == _EMPTY_PAGE_MARKER:
-            # 留白一页：分页符 + 空白说明 + 分页符
+            # 留白标记：在标题下插入提示文字，不留多余分页
             # 标题已在 _write_outline_item 开头通过 add_heading 写入
-            # 分页符确保下个章节从下一页开始
-            document.add_page_break()
-            # 空白说明
             p = document.add_paragraph()
             p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            run = p.add_run("（本节无内容）")
+            run = p.add_run("（本节无内容，待补充）")
             run.font.size = Pt(14)
             run.font.color.rgb = RGBColor(0xAA, 0xAA, 0xAA)
             run.font.name = "仿宋"
@@ -4502,11 +4092,12 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                 for run in excerpt_p.runs:
                     run.font.color.rgb = RGBColor(0x99, 0x99, 0x99)
                     run.font.size = Pt(10)
-            # 分页符 → 下一个章节从下一页开始
-            document.add_page_break()
+            # 不插入前后分页符——让主循环的 _oi_idx > 0 分页逻辑控制换页
             return
 
-        if matched_content:
+        if matched_content or (level == 1 and chapter_idx is not None 
+                               and chapter_idx < len(chapter_contents) 
+                               and chapter_contents[chapter_idx].get("content_blocks")):
             # ========== 优先处理 ContentBlock 结构化内容 ==========
             _chapter_cc = chapter_contents[chapter_idx].get("content_blocks") if level == 1 and chapter_idx is not None and chapter_idx < len(chapter_contents) else None
             if not _chapter_cc:
@@ -4531,23 +4122,49 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                             _rows = _block.get("rows", [])
                             _merge_cells = _block.get("merge_cells", [])
                             if _headers and _rows:
-                                _t = document.add_table(rows=len(_rows), cols=len(_headers))
+                                _ncols = len(_headers)
+                                _nrows = len(_rows)
+                                _t = document.add_table(rows=_nrows, cols=_ncols)
                                 _t.style = "Table Grid"
-                                # 写表头
+                                # 写表头（第一行）
                                 for _ci, _h in enumerate(_headers):
-                                    _cell = _t.rows[0].cells[_ci]
-                                    _cell.text = _h
+                                    _t.rows[0].cells[_ci].text = _h
                                 # 写数据行
                                 for _ri, _row in enumerate(_rows):
                                     for _ci, _cell_text in enumerate(_row):
-                                        if _ri + 1 < len(_t.rows) and _ci < len(_t.rows[_ri + 1].cells):
-                                            _t.rows[_ri + 1].cells[_ci].text = _cell_text
-                # ContentBlock 已处理，跳过后续文本写入
+                                        if _ci < _ncols:
+                                            _t.rows[_ri].cells[_ci].text = _cell_text
+                                # 应用合并单元格
+                                for _mc in (_merge_cells or []):
+                                    try:
+                                        _typ = _mc.get("type", "horizontal")
+                                        _row = _mc.get("row", 0)
+                                        _col = _mc.get("col", 0)
+                                        _span = _mc.get("span", 1)
+                                        if _typ == "horizontal" and _col + _span - 1 < _ncols:
+                                            _t.rows[_row].cells[_col].merge(
+                                                _t.rows[_row].cells[_col + _span - 1])
+                                        elif _typ == "vertical" and _row + _span - 1 < _nrows:
+                                            _t.rows[_row].cells[_col].merge(
+                                                _t.rows[_row + _span - 1].cells[_col])
+                                    except Exception as _mce:
+                                        logger.warning("[docx] ContentBlock 合并单元格失败: %s", _mce)
+                                # 应用列宽
+                                _column_widths = _block.get("column_widths", [])
+                                if _column_widths:
+                                    for _ci, _w in enumerate(_column_widths):
+                                        if _ci < _ncols and _w:
+                                            try:
+                                                for _row in _t.rows:
+                                                    _row.cells[_ci].width = _w
+                                            except Exception:
+                                                pass
+                # ContentBlock 已处理，跳过后续文本写入和表格标记处理
                 # 仍需要处理子章节
-                if children:
-                    pass
-                else:
-                    return
+                _write_subject_materials_for_outline_item(title, desc)
+                for _child in children:
+                    _write_outline_item(_child, level=level + 1, inherited_child_sections=child_sections, parent_title=chapter_title_for_plan)
+                return
 
             # ========== 表格标记处理 ==========
             if isinstance(matched_content, str) and matched_content.startswith(_TABLE_MARKER_PREFIX):
@@ -4697,17 +4314,42 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
         for child in children:
             _write_outline_item(child, level=level + 1, inherited_child_sections=child_sections, parent_title=chapter_title_for_plan)
 
-    # ========== \u7ed9 outline \u9876\u7ea7\u6bcf\u9879\u6ce8\u5165 chapter_idx ==========
+    # ========== \u7ed9 outline \u6240\u6709\u8282\u70b9\u6ce8\u5165 chapter_idx\uff08\u5305\u62ec\u5206\u9694\u9875\u5b50\u8282\u70b9\uff09 ==========
     for idx, item in enumerate(outline):
         item["_chapter_idx"] = idx
 
+    # ========== \u6784\u5efa\u5c01\u9762\u6807\u9898\u96c6\u5408\uff08\u5c01\u9762\u5df2\u5355\u72ec\u6e32\u67d3\uff09 ==========
+    _cover_titles = set()
+    for _sec in _cover_fmt.get("required_sections", []):
+        _t = _sec.get("title", "").strip()
+        if _t:
+            _cover_titles.add(_t)
+
     # ========== \u6309\u76ee\u5f55\u7ed3\u6784\u751f\u6210\u6b63\u6587 ==========
     for _oi_idx, item in enumerate(outline):
+        _item_title = item.get("title", "").strip()
+        # ===== \u5206\u9694\u9875\u68c0\u6d4b\uff08\u653e\u5728 is_cover \u68c0\u67e5\u4e4b\u524d\uff0c\u907f\u514d\u88ab\u5c01\u9762\u8df3\u8fc7\uff09 =====
+        if _is_separator_page_title(_item_title):
+            # \u4ece chapter_contents \u67e5\u627e\u5206\u9694\u9875\u7684\u539f\u6587\u5185\u5bb9
+            _sep_raw = None
+            _chapter_idx = item.get("_chapter_idx")
+            if _chapter_idx is not None and _chapter_idx < len(chapter_contents):
+                _sep_raw = chapter_contents[_chapter_idx].get("content", "")
+            if _sep_raw and _sep_raw.startswith(_SEPARATOR_PAGE_PREFIX):
+                _sep_raw = _sep_raw[len(_SEPARATOR_PAGE_PREFIX):]
+            elif _sep_raw and _sep_raw == _SEPARATOR_PAGE_EMPTY:
+                _sep_raw = None
+            _render_separator_page(document, item, original_text=_sep_raw)
+            document.add_page_break()
+            # \u5b50\u8282\u70b9\u4ee5 level=1 \u6e32\u67d3
+            for _child in item.get("children", []):
+                _write_outline_item(_child, level=1)
+                document.add_page_break()
+            continue
         if _oi_idx > 0:
             document.add_page_break()
         _write_outline_item(item, level=1)
 
-    _write_remaining_subject_materials()
 
     stream = BytesIO()
     document.save(stream)

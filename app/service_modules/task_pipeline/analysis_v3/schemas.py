@@ -40,36 +40,6 @@ def preprocess_json(text: str) -> str:
     return text
 
 
-def safe_json_loads(text: str, default=None, logger=logger) -> dict:
-    """安全地解析 JSON，包含预处理和一键重试。"""
-    if not text:
-        return default or {}
-    try:
-        cleaned = preprocess_json(text)
-        return json.loads(cleaned)
-    except json.JSONDecodeError as exc:
-        logger.warning("[json] JSON 解析失败，尝试深度修复: %s", exc)
-        # 更激进的修复：强制只保留 { } 之间的内容
-        try:
-            bs = text.find("{")
-            be = text.rfind("}")
-            if bs < 0 or be <= bs:
-                return default or {}
-            core = text[bs:be + 1]
-            # 移除所有不可见字符
-            core = re.sub(r"[\x00-\x1f\x7f-\x9f]", "", core)
-            # 修复 trailing comma
-            core = re.sub(r",\s*}", "}", core)
-            core = re.sub(r",\s*]", "]", core)
-            # 修复不合法的控制字符
-            core = re.sub(r"[\u0000-\u001f]", "", core)
-            result = json.loads(core)
-            return result
-        except json.JSONDecodeError:
-            logger.error("[json] 深度修复也失败")
-            return default or {}
-
-
 # Phase 1 schema
 NULL_METADATA = {
     "project_name": {"value": ""},

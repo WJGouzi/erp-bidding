@@ -136,15 +136,6 @@ def classify_table(
     return best_match if best_score >= 3 else TableType.GENERIC_TABLE
 
 
-# ──────────────────────────────────────────────
-#  阶段2：按类型策略提取
-# ──────────────────────────────────────────────
-
-def _coalesce_cells(row_cells: List[str]) -> str:
-    """合并一行中的多个单元格文本。"""
-    return " | ".join(c.strip() for c in row_cells if c.strip())
-
-
 def extract_preliminary_table(rows: List[List[str]], headers: List[str]) -> Dict[str, Any]:
     """提取前附表（3列：序号|内容|说明与要求）的键值对。
 
@@ -378,63 +369,6 @@ def _infer_category(name: str) -> Optional[str]:
         if any(kw in name for kw in keywords):
             return category
     return None
-
-
-# ──────────────────────────────────────────────
-#  阶段3：评分表增强
-# ──────────────────────────────────────────────
-
-def enhance_scoring_dimensions(
-    dimensions: List[Dict],
-    rows: List[List[str]],
-    headers: List[str],
-) -> List[Dict]:
-    """增强评分维度：子维度检测、评分标准原文保留。
-
-    用来增强已有的 parse_scoring_table 结果。
-    """
-    # 找评分项和评分标准列的索引
-    name_idx = None
-    criteria_idx = None
-    for i, h in enumerate(headers):
-        if any(kw in h for kw in ["评分因素", "评分项", "评审因素", "评审内容"]):
-            name_idx = i
-        if any(kw in h for kw in ["评分标准", "评审标准", "评审细则", "评分细则"]):
-            criteria_idx = i
-
-    if name_idx is None:
-        return dimensions  # 无法增强
-
-    for dim in dimensions:
-        dim_name = dim.get("name", "")
-        # 检查是否有子维度
-        sub_dims = dim.get("sub_dimensions", [])
-
-        # 在表格行中找该评分项的对应行
-        for row in rows:
-            if len(row) <= max(name_idx, criteria_idx or 0):
-                continue
-            row_name = row[name_idx].strip() if name_idx < len(row) else ""
-
-            # 跳过空行或序号行
-            if not row_name or row_name.isdigit():
-                continue
-
-            # 如果行名包含评分项名，则可能是子维度或评分标准
-            if row_name in dim_name or dim_name in row_name:
-                if criteria_idx is not None and criteria_idx < len(row):
-                    criteria = row[criteria_idx].strip()
-                    if criteria and len(criteria) > 10:
-                        dim["scoring_standard"] = criteria
-                        # 从评分标准提取子维度
-                        extracted_subs = _extract_sub_dims_from_text(criteria)
-                        if extracted_subs:
-                            sub_dims.extend(extracted_subs)
-
-        if sub_dims:
-            dim["sub_dimensions"] = sub_dims
-
-    return dimensions
 
 
 def _extract_sub_dims_from_text(text: str) -> List[Dict]:

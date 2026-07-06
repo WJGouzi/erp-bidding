@@ -40,22 +40,6 @@ def _build_parent_children_map(section_index):
     return mapping
 
 
-def _collect_descendant_ids(sec_id, section_index):
-    """收集指定 section 的所有后代 ID（递归）。"""
-    children_map = _build_parent_children_map(section_index)
-    ids = {sec_id}
-
-    def _walk(current_id):
-        for child in children_map.get(current_id, []):
-            cid = child["id"]
-            if cid not in ids:
-                ids.add(cid)
-                _walk(cid)
-
-    _walk(sec_id)
-    return ids
-
-
 # ═══════════════════════════════════════════════════════════════
 #  分段提取
 # ═══════════════════════════════════════════════════════════════

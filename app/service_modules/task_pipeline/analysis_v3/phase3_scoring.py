@@ -204,18 +204,6 @@ def _detect_tech_table(headers, rows):
     return matched >= 2
 
 
-def _parse_tech_table(headers, rows):
-    """将技术参数表行解析为结构化条目。"""
-    items = []
-    for row in rows:
-        cells = [cell.text.strip() if hasattr(cell, 'text') else str(cell) for cell in row]
-        entry = {}
-        for i, h in enumerate(headers):
-            entry[h] = cells[i] if i < len(cells) else ""
-        items.append(entry)
-    return items
-
-
 def _find_tech_section(sections):
     """加强版：标题匹配 → 内容表格探测 两阶段。
     
@@ -933,55 +921,6 @@ def extract_packages(sections, package_nos, metadata_budget=None, pkg_name_map=N
         packages.append(pkg_entry)
 
     return packages
-
-
-def split_content_by_package(sections, package_nos):
-    pkg_content = {pkg_no: [] for pkg_no in package_nos}
-    pkg_content["shared"] = []
-
-    if not package_nos:
-        pkg_content["shared"].extend(sections)
-        return pkg_content
-
-    def _get_pkg_no(text):
-        if not text:
-            return None
-        import re
-        m = re.search(r"第(\d+)包[：：\s]", text)
-        if m:
-            return int(m.group(1))
-        m = re.search(r"(?:采购)?包(\d+)[：：\s）)]", text)
-        if m:
-            return int(m.group(1))
-        m = re.search(r"[（(]采购包(\d+)[）)]", text)
-        if m:
-            return int(m.group(1))
-        return None
-
-    def _assign_section(section):
-        title = getattr(section, "title", "") or ""
-        pkg_no = _get_pkg_no(title)
-        if pkg_no and pkg_no in package_nos:
-            pkg_content[pkg_no].append(section)
-        else:
-            children = getattr(section, "children", [])
-            if children:
-                has_pkg_child = False
-                for child in children:
-                    child_pkg = _get_pkg_no(getattr(child, "title", "") or "")
-                    if child_pkg and child_pkg in package_nos:
-                        pkg_content[child_pkg].append(child)
-                        has_pkg_child = True
-                    else:
-                        _assign_section(child)
-                if not has_pkg_child:
-                    pkg_content["shared"].append(section)
-            else:
-                pkg_content["shared"].append(section)
-
-    for section in sections:
-        _assign_section(section)
-    return pkg_content
 
 
 def analyze_package_strategy(pkg_data):

@@ -276,7 +276,7 @@ class LLMAdapter:
         """调用模型生成文本内容。"""
 
         if not self.client:
-            raise ValueError("未配置 OPENAI_API_KEY，无法调用模型服务")
+            raise ValueError("未配置 DEEPSEEK_API_KEY，无法调用模型服务")
 
         response = self.client.chat.completions.create(
             model=model_name or self.default_model,

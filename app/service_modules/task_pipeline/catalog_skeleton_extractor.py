@@ -110,57 +110,10 @@ def find_format_section(section_index: list) -> dict | None:
     return _search(section_index)
 
 
-def extract_skeleton_from_tender(
-    section_index: list,
-    max_depth: int = 2,
-) -> list | None:
-    """从招标文件中提取目录骨架。
-
-    策略：
-    1. 找到"投标文件组成/投标文件的编制"章节
-    2. 提取其子节点的标题作为目录骨架
-    3. 如果找不到这样的章节 → 返回 None（走二级推断）
-
-    Args:
-        section_index: 章节索引
-        max_depth: 最大提取深度（默认 2 级标题）
-
-    Returns:
-        list[dict] | None: 目录骨架，每项含 title/children/source_section_id
-    """
-    fmt_section = find_format_section(section_index)
-    if not fmt_section:
-        logger.info("[skeleton] 未找到'投标文件组成'章节，返回 None")
-        return None
-
-    children = fmt_section.get("children", [])
-    if not children:
-        logger.info("[skeleton] '投标文件组成'章节无子节点，返回 None")
-        return None
-
-    skeleton = _build_skeleton_from_children(children, depth=0, max_depth=max_depth)
-    if not skeleton:
-        logger.info("[skeleton] 提取的骨架为空，返回 None")
-        return None
-
-    logger.info("[skeleton] 从招标文件提取目录骨架: %d 个顶级节点",
-                len(skeleton))
-    return skeleton
-
-
 def _is_skip_chapter(title: str) -> bool:
     """判断章节标题是否应被跳过（不属于投标书目录）。"""
     t = title.strip()
     for kw in SKIP_CHAPTER_KEYWORDS:
-        if kw in t:
-            return True
-    return False
-
-
-def _is_supplementary_section(title: str) -> bool:
-    """判断章节是否为可补充到目录中的响应式章节。"""
-    t = title.strip()
-    for kw in SUPPLEMENTARY_SECTION_KEYWORDS:
         if kw in t:
             return True
     return False

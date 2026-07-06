@@ -133,6 +133,8 @@ def _extract_required_sections(section) -> List[Dict]:
                     "type": "table",
                     "headers": _headers[:10],
                     "rows": _rows[:20],
+                    "merge_cells": getattr(block, "merge_cells", [])[:30],
+                    "column_widths": getattr(block, "column_widths", [])[:30],
                 })
             elif txt and txt.strip() and len(txt.strip()) >= 5:
                 template_content.append({
@@ -153,6 +155,8 @@ def _extract_required_sections(section) -> List[Dict]:
                         "type": "table",
                         "headers": _headers[:10],
                         "rows": _rows[:20],
+                        "merge_cells": getattr(block, "merge_cells", [])[:30],
+                        "column_widths": getattr(block, "column_widths", [])[:30],
                     })
                 elif txt and txt.strip() and len(txt.strip()) >= 5:
                     template_content.append({

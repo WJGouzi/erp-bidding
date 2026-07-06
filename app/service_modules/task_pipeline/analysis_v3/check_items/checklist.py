@@ -16,13 +16,6 @@ def _get_confirmed_status(shared_resource_id: int, check_key: str) -> bool:
     return item.confirmed_flag if item else False
 
 
-def _safe_get(obj, key, default=""):
-    """安全获取嵌套值。"""
-    if isinstance(obj, dict):
-        return obj.get(key, default)
-    return default
-
-
 def assemble_checklist(result, analysis: dict) -> list:
     """从资格/评分/废标聚合待确认项，扁平输出。"""
     items = []

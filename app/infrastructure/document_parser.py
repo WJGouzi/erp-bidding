@@ -201,6 +201,8 @@ class ContentBlock:
         # 表格专用字段
         self.headers = []
         self.rows = []
+        self.merge_cells = []
+        self.column_widths = []
 
     def to_dict(self) -> dict:
         d = {"type": self.type}
@@ -209,6 +211,8 @@ class ContentBlock:
             if self.level:
                 d["level"] = self.level
         elif self.type == self.TYPE_TABLE:
+            d["merge_cells"] = self.merge_cells
+            d["column_widths"] = self.column_widths
             d["headers"] = self.headers
             d["rows"] = self.rows
         return d
@@ -217,6 +221,8 @@ class ContentBlock:
     def from_dict(cls, data: dict) -> "ContentBlock":
         cb = cls(data.get("type", "paragraph"), data.get("text", ""), data.get("level", 0))
         cb.headers = data.get("headers", [])
+        cb.merge_cells = data.get("merge_cells", [])
+        cb.column_widths = data.get("column_widths", [])
         cb.rows = data.get("rows", [])
         return cb
 
@@ -482,6 +488,8 @@ class DocumentParser:
         _para_counter = 0  # 对应 document.paragraphs 中的索引（0-based）
         _table_counter = 0
         _current_section_for_table = doc.sections[-1] if doc.sections else None
+        # 追踪每个章节已分配元素的最后内容索引，用于表格的正确插入位置
+        _element_last_pos = {}  # id(deep_section) -> last content index
 
         try:
             body = document.element.body
@@ -494,12 +502,41 @@ class DocumentParser:
                             if _bidx <= _para_counter + 1:
                                 _current_section_for_table = _sec
                                 break
+                    # 更新章节的最后元素索引（段落已在第1遍加入 content，需追踪其在 content 中的位置）
+                    if _current_section_for_table:
+                        _deep = _current_section_for_table
+                        while _deep and _deep.children:
+                            _deep = _deep.children[-1]
+                        if _deep:
+                            _sec_key = id(_deep)
+                            # 段落已在 content 中，需找到其当前位置
+                            # 但由于表格可能已插入，段落索引会偏移，用 _last_appended_count 追踪
+                            _cur = _element_last_pos.get(_sec_key, -1)
+                            _element_last_pos[_sec_key] = _cur + 1
                     _para_counter += 1
                 elif tag == "tbl":
                     if _table_counter < len(document.tables):
+                        # 计算此表格的插入位置：在此章节上一个已分配元素的后面
+                        _insert_pos = -1
+                        if _current_section_for_table:
+                            _deep = _current_section_for_table
+                            while _deep and _deep.children:
+                                _deep = _deep.children[-1]
+                            if _deep:
+                                _sec_key = id(_deep)
+                                _insert_pos = _element_last_pos.get(_sec_key, -1) + 1
                         self._parse_table(document.tables[_table_counter], doc,
                                           table_index=_table_counter, docx_document=document,
-                                          _position_hint=_current_section_for_table)
+                                          _position_hint=_current_section_for_table,
+                                          _insert_position=_insert_pos)
+                        # 更新章节的最后元素索引
+                        if _insert_pos >= 0 and _current_section_for_table:
+                            _deep = _current_section_for_table
+                            while _deep and _deep.children:
+                                _deep = _deep.children[-1]
+                            if _deep:
+                                _sec_key = id(_deep)
+                                _element_last_pos[_sec_key] = _insert_pos
                         _table_counter += 1
         except Exception:
             logger.warning("[parser] 直接 body 遍历失败，使用降级定位: %s", exc_info=True)
@@ -534,7 +571,7 @@ class DocumentParser:
                 if root.content or root.children:
                     doc.sections = [root]
 
-    def _parse_table(self, table, doc: StructuredDocument, table_index: int = 0, docx_document=None, _position_hint=None):
+    def _parse_table(self, table, doc: StructuredDocument, table_index: int = 0, docx_document=None, _position_hint=None, _insert_position=-1):
         """从 python-docx Table 对象提取结构化表格，并尝试分配到正确的章节。
 
         Args:
@@ -545,13 +582,66 @@ class DocumentParser:
         """
         block = ContentBlock(ContentBlock.TYPE_TABLE)
         rows_data = []
+        merge_cells = []
+        column_widths = []
+        # 提取列宽
+        try:
+            for col in table.columns:
+                column_widths.append(col.width)
+        except Exception:
+            column_widths = []
+        block.column_widths = column_widths
+        # 提取合并单元格（gridSpan / vMerge）
+        _ns = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
         for row_idx, row in enumerate(table.rows):
-            cells = [cell.text.strip() for cell in row.cells]
+            cells = []
+            # 追踪每行已处理过的物理 _tc，避免同一合并区域重复提取
+            _processed_tc_ids = set()
+            for col_idx, cell in enumerate(row.cells):
+                text = cell.text.strip()
+                cells.append(text)
+                try:
+                    tc = cell._tc
+                    _tc_id = id(tc)
+                    # 该物理单元格已处理过（水平合并的虚拟单元格共享同一 _tc），跳过合并提取
+                    if _tc_id in _processed_tc_ids:
+                        continue
+                    _processed_tc_ids.add(_tc_id)
+                    # 水平合并：gridSpan
+                    gs = tc.findall(f'{_ns}tcPr/{_ns}gridSpan')
+                    if gs:
+                        gs_val = gs[0].get(f'{_ns}val')
+                        if gs_val:
+                            span = int(gs_val)
+                            if span > 1:
+                                merge_cells.append({"type": "horizontal", "row": row_idx, "col": col_idx, "span": span})
+                    # 垂直合并：vMerge
+                    vm = tc.findall(f'{_ns}tcPr/{_ns}vMerge')
+                    if vm:
+                        vm_val = vm[0].get(f'{_ns}val')
+                        if vm_val and vm_val == 'restart':
+                            merge_span = 1
+                            for next_row in table.rows[row_idx + 1:]:
+                                next_tc = next_row.cells[col_idx]._tc
+                                next_vm = next_tc.findall(f'{_ns}tcPr/{_ns}vMerge')
+                                if next_vm:
+                                    next_val = next_vm[0].get(f'{_ns}val')
+                                    if next_val is None or next_val == 'continue':
+                                        merge_span += 1
+                                    else:
+                                        break
+                                else:
+                                    break
+                            if merge_span > 1:
+                                merge_cells.append({"type": "vertical", "row": row_idx, "col": col_idx, "span": merge_span})
+                except Exception:
+                    pass
             if row_idx == 0:
                 block.headers = cells
             else:
                 rows_data.append(cells)
         block.rows = rows_data
+        block.merge_cells = merge_cells
 
         if not doc.sections:
             s = Section(title="表格", level=1)
@@ -599,7 +689,10 @@ class DocumentParser:
         target = target_section
         while target.children:
             target = target.children[-1]
-        target.content.append(block)
+        if _insert_position >= 0 and _insert_position < len(target.content):
+            target.content.insert(_insert_position, block)
+        else:
+            target.content.append(block)
 
     def _find_section_by_text(self, doc, text: str):
         """根据文本片段找到包含它的章节。"""

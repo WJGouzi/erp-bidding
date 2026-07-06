@@ -1,6 +1,7 @@
 """标书任务后台执行相关逻辑，包括执行记录、取消、失败收敛与线程池提交。"""
 
-import logging; logger = logging.getLogger(__name__)
+import logging
+import traceback; logger = logging.getLogger(__name__)
 import json
 import re
 import time
@@ -325,7 +326,7 @@ def cancel_task_execution(task_id):
 # 后台任务提交与失败收敛处理。
 def _finalize_background_failure(task_id, execution_id, execution_type, exc):
     """统一处理后台执行失败后的任务与执行状态。"""
-    logger.error("[task] 后台执行失败 type=%s task=%s exec=%s err=%s", execution_type, task_id, execution_id, exc)
+    logger.error("[task] 后台执行失败 type=%s task=%s exec=%s err=%s\n%s", execution_type, task_id, execution_id, exc, traceback.format_exc())
     execution = BiddingTaskExecution.query.filter_by(id=execution_id).first()
     task = BiddingTask.query.filter_by(id=task_id, deleted_flag=False).first()
     if isinstance(exc, TaskExecutionCancelledError):

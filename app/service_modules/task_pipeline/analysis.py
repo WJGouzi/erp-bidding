@@ -36,81 +36,10 @@ def _get_packages_from_analysis_data(analysis_result):
 
 from .helpers import (
     _build_shared_resource_analysis_text,
-    _detect_package_info,
     _extract_effective_text,
     _extract_package_numbers,
     _read_file_text,
 )
-
-
-def _split_analysis_units(text):
-    """将文本拆分为适合规则提取的语义片段。"""
-
-    if not text:
-        return []
-    raw_units = re.split(r"[\r\n]+|(?<=[。；;])", text)
-    units = []
-    for item in raw_units:
-        normalized = re.sub(r"\s+", " ", (item or "").strip())
-        if normalized:
-            units.append(normalized)
-    return units
-
-
-def _collect_matching_units(units, keywords, limit=4):
-    """按关键字筛选片段，并保持原始顺序去重。"""
-
-    matched = []
-    seen = set()
-    for unit in units:
-        if not any(keyword in unit for keyword in keywords):
-            continue
-        if unit in seen:
-            continue
-        matched.append(unit)
-        seen.add(unit)
-        if len(matched) >= limit:
-            break
-    return matched
-
-
-def _join_analysis_units(units, fallback_text="", max_length=500):
-    """将片段列表拼接为稳定文本，并在缺失时回退。"""
-
-    values = [item.strip() for item in units if item and item.strip()]
-    if not values and fallback_text:
-        values = [fallback_text.strip()]
-    text = "\n".join(values).strip()
-    if max_length and len(text) > max_length:
-        return text[:max_length].rstrip()
-    return text
-
-
-
-def _build_check_items(shared_resource_id, analysis_payload):
-    """基于结构化分析结果生成待人工确认的核对项。"""
-
-    BiddingCheckItem.query.filter_by(shared_resource_id=shared_resource_id).delete()
-    items = [
-        ("overview", "项目概述", analysis_payload.get("overview", ""), 1),
-        ("requirements", "招标要求", analysis_payload.get("requirements", ""), 2),
-        ("business_requirements", "商务要求", analysis_payload.get("business_requirements", ""), 3),
-        ("qualification_requirements", "资质要求", analysis_payload.get("qualification_requirements", ""), 4),
-        ("technical_requirements", "技术要求", analysis_payload.get("technical_requirements", ""), 5),
-        ("scoring_items", "评分点", analysis_payload.get("scoring_items", ""), 6),
-        ("disqualification_items", "废标项", analysis_payload.get("disqualification_items", ""), 7),
-    ]
-    for check_key, check_label, check_value, sort_no in items:
-        db.session.add(
-            BiddingCheckItem(
-                shared_resource_id=shared_resource_id,
-                check_key=check_key,
-                check_label=check_label,
-                check_value=check_value,
-                confirmed_flag=False,
-                sort_no=sort_no,
-            )
-        )
 
 
 

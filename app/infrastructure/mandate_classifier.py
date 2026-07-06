@@ -182,9 +182,9 @@ def _llm_fallback(title: str, text_excerpt: str) -> dict:
         from app.infrastructure.integrations import LLMAdapter
 
         adapter = LLMAdapter(
-            api_key=current_app.config.get("OPENAI_API_KEY"),
-            base_url=current_app.config.get("OPENAI_BASE_URL"),
-            default_model=current_app.config.get("OPENAI_MODEL_NAME"),
+            api_key=current_app.config.get("DEEPSEEK_API_KEY"),
+            base_url=current_app.config.get("DEEPSEEK_BASE_URL"),
+            default_model=current_app.config.get("DEEPSEEK_MODEL_NAME"),
         )
         if not adapter.is_available():
             return {
@@ -246,29 +246,3 @@ def _llm_fallback(title: str, text_excerpt: str) -> dict:
             "reason": f"LLM 异常，默认 FREE",
             "source": "default:llm_error",
         }
-
-
-def batch_classify(sections: list) -> list:
-    """批量识别多个章节的强制级别。
-
-    Args:
-        sections: 章节列表，每个元素需包含：
-            - title: str
-            - text: str (可选)
-            - parent_title_chain: list[str] (可选)
-            - table_types: list[str] (可选)
-
-    Returns:
-        每个元素新增 mandate 字段
-    """
-    results = []
-    for sec in sections:
-        result = classify_mandate(
-            title=sec.get("title", ""),
-            text=sec.get("text", ""),
-            parent_title_chain=sec.get("parent_title_chain"),
-            table_types=sec.get("table_types"),
-        )
-        sec["mandate"] = result
-        results.append(sec)
-    return results
