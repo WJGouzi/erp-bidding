@@ -64,6 +64,8 @@ from .pipeline import (
     start_analyze,
     start_generate,
     upload_tender_attachment,
+    get_task_documents,
+    download_task_document,
 )
 from .storage import StorageService
 
@@ -108,6 +110,8 @@ class BiddingTaskService:
     get_generate_progress = staticmethod(get_generate_progress)
     get_generate_chapters = staticmethod(get_generate_chapters)
     download_result_file = staticmethod(download_result_file)
+    get_task_documents = staticmethod(get_task_documents)
+    download_task_document = staticmethod(download_task_document)
     get_task_stats = staticmethod(get_task_stats)
 
     get_subject_material_completeness = staticmethod(get_subject_material_completeness)

@@ -497,3 +497,23 @@ class TaskSubjectTemplatesResource(Resource):
         """返回模板库中与当前任务标书类型匹配的模板列表。"""
 
         return success(BiddingTaskService.get_subject_templates(task_id))
+
+
+@task_ns.route("/<int:task_id>/documents")
+class TaskDocumentsResource(Resource):
+    """获取任务关联的所有原始文件列表。"""
+
+    def get(self, task_id):
+        """返回招标文件和附件列表，每个文件包含下载 URL。"""
+
+        return success(BiddingTaskService.get_task_documents(task_id))
+
+
+@task_ns.route("/<int:task_id>/documents/<int:file_id>/file")
+class TaskDocumentFileResource(Resource):
+    """下载任务关联的原始文件。"""
+
+    def get(self, task_id, file_id):
+        """返回文件二进制流。前端根据 file_ext 决定渲染方式。"""
+
+        return BiddingTaskService.download_task_document(task_id, file_id)

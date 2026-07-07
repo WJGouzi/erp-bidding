@@ -2,7 +2,8 @@
 
 import logging; logger = logging.getLogger(__name__)
 from datetime import datetime
-from flask import current_app
+from io import BytesIO
+from flask import current_app, send_file
 from sqlalchemy.exc import SQLAlchemyError
 from werkzeug.utils import secure_filename
 
@@ -83,6 +84,37 @@ def _async_ingest_to_chroma(app, tender_record_id, payload, filename, bid_type, 
             logger.info("[task] 后台 ChromaDB 入库完成: file=%s", filename)
         except Exception as exc:
             logger.error("[task] 后台 ChromaDB 入库失败: file=%s, %s", filename, exc)
+
+
+def _async_ingest_attachment(app, file_record_id, payload, filename, bid_type):
+    """后台异步将附件入库 ChromaDB。"""
+    with app.app_context():
+        try:
+            file_record = db.session.get(FileStorage, file_record_id)
+            if not file_record:
+                logger.error("[chroma] 附件文件记录不存在: id=%s", file_record_id)
+                return
+            from flask import current_app as _ca
+            ingest_file_to_chroma(
+                file_record,
+                filename=filename,
+                payload=payload,
+                chunk_id_prefix="attachment",
+                chroma_tenant=_ca.config.get("CHROMA_TENANT"),
+                chroma_database=_ca.config.get("CHROMA_DATABASE"),
+                chroma_collection=_ca.config.get("CHROMA_COLLECTION"),
+                metadata_builder=lambda index, chunk: {
+                    "biz_type": "BIDDING_TENDER_ATTACHMENT",
+                    "file_id": file_record_id,
+                    "file_name": filename,
+                    "bid_type": bid_type,
+                    "chunk_index": index,
+                },
+            )
+            db.session.commit()
+            logger.info("[chroma] 附件 ChromaDB 入库完成: file=%s", filename)
+        except Exception as exc:
+            logger.error("[chroma] 附件 ChromaDB 入库失败: file=%s, %s", filename, exc)
 
 
 def create_original_task(file_storage, bid_type, task_name=None, chroma_tenant=None, chroma_database=None, chroma_collection=None):
@@ -374,13 +406,16 @@ def upload_tender_attachment(task_id, file_storage):
         raise LookupError("共享资源不存在")
 
     try:
-        file_record = StorageService.save_upload(
-            file_storage=file_storage,
+        payload = file_storage.read()
+        file_record = StorageService.save_bytes(
+            filename=file_storage.filename or "uploaded_file",
+            payload=payload,
             biz_type="BIDDING_TENDER_ATTACHMENT",
             skip_file_storage=False,
             chroma_tenant=current_app.config.get("CHROMA_TENANT"),
             chroma_database=current_app.config.get("CHROMA_DATABASE"),
             chroma_collection=current_app.config.get("CHROMA_COLLECTION"),
+            content_type=file_storage.mimetype or "application/octet-stream",
         )
         attachment = BiddingTenderAttachment(
             shared_resource_id=shared_resource.id,
@@ -398,6 +433,18 @@ def upload_tender_attachment(task_id, file_storage):
             detail={"task_id": task.id, "shared_resource_id": shared_resource.id, "file_name": file_record.file_name},
         )
         db.session.commit()
+        # 后台异步 ChromaDB 入库
+        import threading
+        _app = current_app._get_current_object()
+        _bid_type = task.bid_type
+        _file_id = file_record.id
+        _filename = file_record.file_name
+        t = threading.Thread(
+            target=_async_ingest_attachment,
+            args=(_app, _file_id, payload, _filename, _bid_type),
+            daemon=True,
+        )
+        t.start()
         return {
             "task_id": task.id,
             "shared_resource_id": shared_resource.id,
@@ -620,6 +667,100 @@ def batch_delete_tasks(task_ids):
         raise RuntimeError(f"批量删除标书任务失败: {exc}") from exc
 
 
+MIME_MAP = {
+    "pdf": "application/pdf",
+    "doc": "application/msword",
+    "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "xls": "application/vnd.ms-excel",
+    "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "ppt": "application/vnd.ms-powerpoint",
+    "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "gif": "image/gif",
+    "bmp": "image/bmp",
+    "zip": "application/zip",
+    "rar": "application/vnd.rar",
+    "txt": "text/plain",
+}
+
+
+def get_task_documents(task_id):
+    """获取任务关联的所有原始文件列表（含下载URL）。"""
+    task = BiddingTask.query.filter_by(id=task_id, deleted_flag=False).first()
+    if not task:
+        raise LookupError("标书任务不存在")
+
+    shared_resource = BiddingSharedResource.query.filter_by(id=task.shared_resource_id).first()
+    if not shared_resource:
+        raise LookupError("共享资源不存在")
+
+    # 招标文件
+    tender_record = FileStorage.query.filter_by(id=shared_resource.tender_file_id, deleted_flag=False).first()
+    tender_data = None
+    if tender_record:
+        tender_data = {
+            "file_id": tender_record.id,
+            "file_name": tender_record.file_name,
+            "file_ext": tender_record.file_ext,
+            "file_size": tender_record.file_size,
+            "url": f"/api/bidding/tasks/{task_id}/documents/{tender_record.id}/file",
+        }
+
+    # 附件列表
+    attachment_records = _list_tender_attachments_by_shared_resource(task.shared_resource_id)
+    attachments = []
+    for item in attachment_records:
+        f = item.get("file")
+        if f:
+            attachments.append({
+                "file_id": f["id"],
+                "file_name": f["file_name"],
+                "file_ext": f["file_ext"],
+                "file_size": f["file_size"],
+                "url": f"/api/bidding/tasks/{task_id}/documents/{f['id']}/file",
+            })
+
+    return {
+        "tender_file": tender_data,
+        "attachments": attachments,
+    }
+
+
+def download_task_document(task_id, file_id):
+    """下载任务关联的原始文件字节流。"""
+    task = BiddingTask.query.filter_by(id=task_id, deleted_flag=False).first()
+    if not task:
+        raise LookupError("标书任务不存在")
+
+    shared_resource = BiddingSharedResource.query.filter_by(id=task.shared_resource_id).first()
+    if not shared_resource:
+        raise LookupError("共享资源不存在")
+
+    file_record = FileStorage.query.filter_by(id=file_id, deleted_flag=False).first()
+    if not file_record:
+        raise LookupError("文件不存在")
+
+    # 验证文件属于该任务（招标文件或附件）
+    is_tender = file_record.id == shared_resource.tender_file_id
+    is_attachment = BiddingTenderAttachment.query.filter_by(
+        shared_resource_id=shared_resource.id, file_id=file_id
+    ).first() is not None
+    if not is_tender and not is_attachment:
+        raise LookupError("文件不属于该任务")
+
+    payload = StorageService.read_bytes(file_record)
+    mime = MIME_MAP.get(file_record.file_ext or "", "application/octet-stream")
+
+    return send_file(
+        BytesIO(payload),
+        mimetype=mime,
+        as_attachment=False,
+        download_name=file_record.file_name,
+    )
+
+
 __all__ = [
     "_complete_analysis",
     "_complete_generate",
@@ -653,4 +794,6 @@ __all__ = [
     "start_analyze",
     "start_generate",
     "upload_tender_attachment",
+    "get_task_documents",
+    "download_task_document",
 ]

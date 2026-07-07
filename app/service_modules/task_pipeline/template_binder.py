@@ -343,8 +343,102 @@ def _fill_paragraph_block(block: ContentBlock, all_context: dict) -> ContentBloc
     return ContentBlock.paragraph(text)
 
 
+_HEADER_FILL_MAP = [
+    # 更长/更具体的关键词优先匹配
+    (("法定代表人", "法人代表"), "legal_person", "subject"),
+    (("货物名称", "产品名称", "项目名称", "采购项目名称", "标的名称"), "project_name", "subject"),
+    (("项目编号", "采购编号"), "project_no", "subject"),
+    (("联系电话",), "contact_phone", "subject"),
+    (("单位名称",), "company_name", "subject"),
+    (("投标人", "比选申请人", "供应商名称"), "company_name", "subject"),
+    (("生产厂家", "制造商"), "manufacturer", "product"),
+    (("规格型号", "技术参数"), "specification", "product"),
+    (("品牌", "产地"), "product", "product"),
+    (("品名", "试剂", "耗材", "名称"), "product_name", "product"),
+    (("规格", "型号"), "specification", "product"),
+    (("数量",), "quantity", "product"),
+    (("单价", "总价", "价格", "金额"), "price", "product"),
+    (("报价",), "price", "product"),
+    (("供应商",), "company_name", "subject"),
+    (("法人",), "legal_person", "subject"),
+    (("联系人",), "contact_person", "subject"),
+    (("电话", "手机"), "contact_phone", "subject"),
+    (("地址",), "address", "subject"),
+]
+
+
+def _infer_fill_type_from_header(header: str) -> tuple:
+    """根据表头推断单元格的填充类型。
+
+    Returns:
+        tuple: (field_name, source_type) 或 (None, None)。
+        source_type: "subject" | "product" | None
+    """
+    for keywords, field, source in _HEADER_FILL_MAP:
+        if any(kw in header for kw in keywords):
+            return (field, source)
+    return (None, None)
+
+
+def _get_row_header(block: "ContentBlock", col_idx: int) -> str:
+    """获取指定列的表头文本。"""
+    if block.headers and col_idx < len(block.headers):
+        return block.headers[col_idx]
+    if block.rows and len(block.rows) > 0 and col_idx < len(block.rows[0]):
+        return block.rows[0][col_idx]
+    return ""
+
+
+def _resolve_cell(value: str, header: str, all_context: dict) -> str:
+    """尝试根据表头推断并填充单元格。
+
+    策略：
+      1. 占位符替换（XXX, ___ 等）
+      2. 按表头关键词推断数据源
+      3. 查不到则留空
+    """
+    # 1. 占位符替换
+    phs = extract_placeholders(value)
+    for ph in phs:
+        resolved = _resolve_from_context(ph, all_context)
+        if resolved:
+            value = value.replace(ph.marker, resolved, 1)
+
+    # 2. 如果仍是空/占位符，尝试按表头推断
+    state = classify_content_state(value)
+    if state in ("EMPTY", "PLACEHOLDER"):
+        field, source = _infer_fill_type_from_header(header)
+        if source == "subject":
+            ctx = all_context.get("subject", {})
+            val = ctx.get(field, "")
+            if val:
+                value = val
+        elif source == "product":
+            ctx = all_context.get("product", {})
+            val = ctx.get(field, "")
+            if val:
+                value = val
+
+    return value
+
+
 def _fill_table_block(block: ContentBlock, all_context: dict) -> ContentBlock:
-    """填充表格块中的空缺单元格。"""
+    """填充表格块中的空缺单元格（含智能表头推断）。"""
+    new_rows = []
+    for row_idx, row in enumerate(block.rows):
+        new_row = []
+        for col_idx, cell in enumerate(row):
+            header = _get_row_header(block, col_idx)
+            filled = _resolve_cell(cell, header, all_context)
+            new_row.append(filled)
+        new_rows.append(new_row)
+    return ContentBlock.table(
+        headers=list(block.headers),
+        rows=new_rows,
+        merge_cells=list(block.merge_cells),
+        column_widths=list(block.column_widths),
+        per_cell=block.per_cell,
+    )
     new_rows = []
     for row in block.rows:
         new_row = []

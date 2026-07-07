@@ -478,12 +478,31 @@ def parse_all_tables(docx_tables) -> Dict[str, Any]:
             result["product_lists"].append(parsed)
 
         else:
-            # 通用/其他表格：flatten 为文本
-            flat_lines = []
-            if headers:
-                flat_lines.append(" | ".join(headers))
-            for row in data_rows[:50]:
-                flat_lines.append(" | ".join(row))
-            result["generic_tables"].append("\n".join(flat_lines))
+            # 通用/其他表格：保留完整结构和元数据（不再展平为文本）
+            # 提取合并和列宽信息
+            _t_merges = []
+            _t_widths = []
+            if hasattr(table, "merge_cells"):
+                _t_merges = list(table.merge_cells)
+            elif hasattr(table, "_tbl"):
+                from app.infrastructure.document_parser import _extract_table_merge_cells
+                try:
+                    _t_merges = _extract_table_merge_cells(table)
+                except Exception:
+                    pass
+            if hasattr(table, "column_widths"):
+                _t_widths = list(table.column_widths)
+            elif hasattr(table, "_tbl"):
+                from app.infrastructure.document_parser import _extract_table_column_widths
+                try:
+                    _t_widths = _extract_table_column_widths(table)
+                except Exception:
+                    pass
+            result["generic_tables"].append({
+                "headers": headers,
+                "rows": data_rows,
+                "merge_cells": _t_merges,
+                "column_widths": _t_widths,
+            })
 
     return result

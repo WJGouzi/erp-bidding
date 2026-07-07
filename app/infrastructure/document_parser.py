@@ -41,27 +41,101 @@ def _extract_table_column_widths(table):
     return column_widths
 
 
+def _extract_table_row_heights(table):
+    """从 python-docx Table 提取每行高度。
+
+    Returns:
+        list[dict]: [{"val": int, "rule": str}, ...]
+        val=0 表示行高未指定，rule 通常为 'atLeast' 或 'exactly'
+    """
+    ns = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
+    heights = []
+    for row in table.rows:
+        try:
+            tr_pr = row._tr.find(f'{ns}trPr')
+            if tr_pr is not None:
+                tr_height = tr_pr.find(f'{ns}trHeight')
+                if tr_height is not None:
+                    heights.append({
+                        "val": int(tr_height.get(f'{ns}val', 0)),
+                        "rule": tr_height.get(f'{ns}rule', 'atLeast'),
+                    })
+                    continue
+        except Exception:
+            pass
+        heights.append({"val": 0, "rule": "atLeast"})
+    return heights
+
+
 def _extract_table_merge_cells(table):
-    """从 python-docx Table 提取合并单元格信息。"""
+    """从 python-docx Table 提取合并单元格信息（基于 XML <tc> 直接遍历，无重复记录）。
+
+    直接遍历 <w:tr> 下的 <w:tc> XML 元素，而非 python-docx 虚拟单元格。
+    每个物理 <w:tc> 只出现一次，避免 gridSpan 被虚拟单元格重复读取。
+    """
     ns = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
     merges = []
+    _covered_vmerge_ranges = {}
     try:
         for row_idx, row in enumerate(table.rows):
-            for col_idx, cell in enumerate(row.cells):
+            tr = row._tr
+            tc_elements = tr.findall(f'{ns}tc')
+            col_idx = 0
+            for tc in tc_elements:
                 try:
-                    tc = cell._tc
-                    gs = tc.find(f'.//{ns}gridSpan')
-                    vm = tc.find(f'.//{ns}vMerge')
+                    tcPr = tc.find(f'{ns}tcPr')
+                    if tcPr is None:
+                        col_idx += 1
+                        continue
+
+                    gs = tcPr.find(f'{ns}gridSpan')
+                    span_val = int(gs.get(f'{ns}val', '1')) if gs is not None else 1
+
                     if gs is not None:
-                        span_val = int(gs.get(f'{ns}val', '1'))
                         if span_val > 1:
                             merges.append({"type": "horizontal", "row": row_idx, "col": col_idx, "span": span_val})
+
+                    vm = tcPr.find(f'{ns}vMerge')
                     if vm is not None:
                         v_val = vm.get(f'{ns}val', 'continue')
                         if v_val == 'restart' or v_val is None:
-                            merges.append({"type": "vertical", "row": row_idx, "col": col_idx, "span": 2})
+                            merge_count = 1
+                            cell_text = table.rows[row_idx].cells[col_idx].text.strip()
+                            for nr in range(row_idx + 1, len(table.rows)):
+                                _vstop = False
+                                try:
+                                    next_cell = table.rows[nr].cells[col_idx]
+                                    nv = next_cell._tc.find(f'.//{ns}vMerge')
+                                    if nv is not None:
+                                        nv_val = nv.get(f'{ns}val', 'continue')
+                                        if nv_val == 'continue':
+                                            merge_count += 1
+                                        elif nv_val == 'restart':
+                                            if next_cell.text.strip() == cell_text:
+                                                merge_count += 1
+                                            else:
+                                                _vstop = True
+                                        else:
+                                            _vstop = True
+                                    else:
+                                        _vstop = True
+                                except Exception:
+                                    _vstop = True
+                                if _vstop:
+                                    break
+                            if merge_count > 1:
+                                already_covered = False
+                                for vr, vspan in _covered_vmerge_ranges.get(col_idx, []):
+                                    if vr <= row_idx < vr + vspan:
+                                        already_covered = True
+                                        break
+                                if not already_covered:
+                                    merges.append({"type": "vertical", "row": row_idx, "col": col_idx, "span": merge_count})
+                                    _covered_vmerge_ranges.setdefault(col_idx, []).append((row_idx, merge_count))
+
+                    col_idx += span_val
                 except Exception:
-                    pass
+                    col_idx += 1
     except Exception:
         pass
     return merges
@@ -106,6 +180,11 @@ class StructuredDocument:
                         _extract_table_merge_cells(t)
                         if hasattr(t, "_tbl")
                         else (list(t.merge_cells) if hasattr(t, "merge_cells") else [])
+                    ),
+                    "row_heights": (
+                        _extract_table_row_heights(t)
+                        if hasattr(t, "_tbl")
+                        else (list(t.row_heights) if hasattr(t, "row_heights") else [])
                     ),
                 }
                 for t in self.tables
@@ -204,17 +283,19 @@ class StructuredDocument:
             from collections import namedtuple
             class TableStub:
                 """Stub for table data when loaded from cache."""
-                def __init__(self, headers, rows, column_widths=None, merge_cells=None):
+                def __init__(self, headers, rows, column_widths=None, merge_cells=None, row_heights=None):
                     self.headers = headers
                     self.rows = rows
                     self.column_widths = column_widths or []
                     self.merge_cells = merge_cells or []
+                    self.row_heights = row_heights or []
             doc.tables = [
                 TableStub(
                     headers=t.get("headers", []),
                     rows=t.get("rows", []),
                     column_widths=t.get("column_widths", []),
                     merge_cells=t.get("merge_cells", []),
+                    row_heights=t.get("row_heights", []),
                 )
                 for t in table_data
             ]
@@ -263,10 +344,156 @@ class ContentBlock:
         self.text = text
         self.level = level  # 列表缩进层级
         # 表格专用字段
-        self.headers = []
-        self.rows = []
-        self.merge_cells = []
-        self.column_widths = []
+        self.row_heights = []
+        self.per_cell_data = None  # 唯一存储：per_cell 模型数据
+
+    # -----------------------------------------------------------
+    #  Stage 2: aggregated column widths / merge_map / cell bounds
+    # -----------------------------------------------------------
+
+    @property
+    def actual_column_widths(self):
+        if not self.column_widths:
+            return []
+        if not self.merge_cells:
+            return list(self.column_widths)
+
+        h_merges = [m for m in self.merge_cells if m['type'] == 'horizontal']
+        if not h_merges:
+            return list(self.column_widths)
+
+        row0_h = sorted([m for m in h_merges if m['row'] == 0], key=lambda x: x['col'])
+        if not row0_h:
+            return list(self.column_widths)
+
+        widths = []
+        ci = 0
+        merged_idx = 0
+        while ci < len(self.column_widths):
+            if merged_idx < len(row0_h) and ci == row0_h[merged_idx]['col']:
+                span = row0_h[merged_idx]['span']
+                widths.append(sum(self.column_widths[ci:ci + span]))
+                ci += span
+                merged_idx += 1
+            else:
+                widths.append(self.column_widths[ci])
+                ci += 1
+        return widths
+
+    @property
+    def merge_map(self):
+        mm = {}
+        for m in self.merge_cells:
+            key = (m['row'], m['col'])
+            if m['type'] == 'horizontal':
+                mm.setdefault(key, {})['h_span'] = m['span']
+            elif m['type'] == 'vertical':
+                mm.setdefault(key, {})['v_span'] = m['span']
+        return mm
+
+    def get_cell_bounds(self, row, col):
+        mm = self.merge_map
+        key = (row, col)
+        info = mm.get(key, {})
+
+        col_span = info.get('h_span', 1)
+        row_span = info.get('v_span', 1)
+
+        cw = self.column_widths or []
+        actual_w = sum(cw[col:col + col_span]) if col < len(cw) else 0
+
+        rh = []
+        for h in (self.row_heights or []):
+            if isinstance(h, dict):
+                rh.append(h.get('val', 0))
+            else:
+                rh.append(h if isinstance(h, int) else 0)
+        actual_h = sum(rh[row:row + row_span]) if row < len(rh) else 0
+
+        return {
+            'col_span': col_span,
+            'row_span': row_span,
+            'width': actual_w,
+            'height': actual_h,
+            'is_hidden': col_span == 0 and row_span == 0,
+        }
+
+    def get_width_matrix(self):
+        if not self.rows:
+            return []
+        nrows = len(self.rows)
+        ncols = max(len(r) for r in self.rows) if self.rows else 0
+        mm = self.merge_map
+        cw = self.actual_column_widths
+
+        matrix = []
+        for r in range(nrows):
+            row_w = []
+            col_idx = 0
+            while col_idx < min(ncols, len(cw)):
+                info = mm.get((r, col_idx), {})
+                span = info.get('h_span', 1)
+                w = sum(cw[col_idx:col_idx + span]) if col_idx < len(cw) else 0
+                row_w.append(w)
+                col_idx += span
+            matrix.append(row_w)
+        return matrix
+
+    # ──────────────────────────────────────────────────────
+    #  向后兼容属性：优先从 per_cell_data 读取，降级到内部 _storage
+    # ──────────────────────────────────────────────────────
+
+    @property
+    def headers(self):
+        if self.per_cell_data:
+            rows = self.per_cell_data.get('rows', [])
+            if rows:
+                return [c.get('text', '') for c in rows[0].get('cells', [])]
+        return getattr(self, '_headers', [])
+
+    @headers.setter
+    def headers(self, value):
+        self._headers = value
+
+    @property
+    def rows(self):
+        if self.per_cell_data:
+            rows = self.per_cell_data.get('rows', [])
+            return [[c.get('text', '') for c in r.get('cells', [])] for r in rows[1:]]
+        return getattr(self, '_rows', [])
+
+    @rows.setter
+    def rows(self, value):
+        self._rows = value
+
+    @property
+    def merge_cells(self):
+        if self.per_cell_data:
+            return self.per_cell_data.get('merge_cells', [])
+        return getattr(self, '_merge_cells', [])
+
+    @merge_cells.setter
+    def merge_cells(self, value):
+        self._merge_cells = value
+
+    @property
+    def column_widths(self):
+        if self.per_cell_data:
+            return self.per_cell_data.get('gridCols', [])
+        return getattr(self, '_column_widths', [])
+
+    @column_widths.setter
+    def column_widths(self, value):
+        self._column_widths = value
+
+    @property
+    def grid_col_count(self):
+        return len(self.actual_column_widths)
+
+    def to_per_cell(self):
+        if self.type != self.TYPE_TABLE or not self.per_cell_data:
+            return None
+        return self.per_cell_data
 
     def to_dict(self) -> dict:
         d = {"type": self.type}
@@ -275,19 +502,37 @@ class ContentBlock:
             if self.level:
                 d["level"] = self.level
         elif self.type == self.TYPE_TABLE:
-            d["merge_cells"] = self.merge_cells
-            d["column_widths"] = self.column_widths
-            d["headers"] = self.headers
-            d["rows"] = self.rows
+            d["row_heights"] = self.row_heights
+            if self.per_cell_data:
+                d["per_cell_data"] = self.per_cell_data
+            else:
+                # 降级：从属性重建（兼容未迁移的场景）
+                d["merge_cells"] = self.merge_cells
+                d["column_widths"] = self.column_widths
+                d["headers"] = self.headers
+                d["rows"] = self.rows
         return d
 
     @classmethod
     def from_dict(cls, data: dict) -> "ContentBlock":
         cb = cls(data.get("type", "paragraph"), data.get("text", ""), data.get("level", 0))
-        cb.headers = data.get("headers", [])
-        cb.merge_cells = data.get("merge_cells", [])
-        cb.column_widths = data.get("column_widths", [])
-        cb.rows = data.get("rows", [])
+        cb.row_heights = data.get("row_heights", [])
+        # 优先从 per_cell_data 还原，降级到旧字段
+        pcd = data.get("per_cell_data")
+        if pcd:
+            cb.per_cell_data = pcd
+        else:
+            # 重建 per_cell_data（旧格式兼容）
+            from app.infrastructure.table_codec import to_per_cell, to_dict
+            hd = data.get("headers", [])
+            rw = data.get("rows", [])
+            mc = data.get("merge_cells", [])
+            cw = data.get("column_widths", [])
+            try:
+                td = to_per_cell(hd, rw, mc, cw)
+                cb.per_cell_data = to_dict(td)
+            except Exception:
+                cb.per_cell_data = None
         return cb
 
 
@@ -679,52 +924,68 @@ class DocumentParser:
         except Exception:
             column_widths = []
         block.column_widths = column_widths
-        # 提取合并单元格（gridSpan / vMerge）
+
+        # 提取行高
+        block.row_heights = _extract_table_row_heights(table)
+
+        # 提取合并单元格（gridSpan / vMerge）— 基于 XML <tc> 直接遍历，无重复
         _ns = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
         _covered_vmerge_ranges = {}
         for row_idx, row in enumerate(table.rows):
             cells = []
-            # 追踪每行已处理过的物理 _tc，避免同一合并区域重复提取
-            _processed_tc_ids = set()
+            # 第1遍：通过 python-docx 虚拟单元格提取文本（正确展开合并格的文本）
             for col_idx, cell in enumerate(row.cells):
                 text = cell.text.strip()
                 cells.append(text)
+
+            # 第2遍：通过 XML <tc> 元素遍历检测合并（避免虚拟单元格导致重复）
+            tr = row._tr
+            tc_elements = tr.findall(f'{_ns}tc')
+            col_idx = 0
+            for tc in tc_elements:
                 try:
-                    tc = cell._tc
-                    _tc_id = id(tc)
-                    # 该物理单元格已处理过（水平合并的虚拟单元格共享同一 _tc），跳过合并提取
-                    if _tc_id in _processed_tc_ids:
+                    tcPr = tc.find(f'{_ns}tcPr')
+                    if tcPr is None:
+                        col_idx += 1
                         continue
-                    _processed_tc_ids.add(_tc_id)
-                    # 水平合并：gridSpan（使用 .// 递归搜索，兼容各种 OOXML 风格）
-                    gs = tc.find(f'.//{_ns}gridSpan')
-                    if gs is not None:
-                        gs_val = gs.get(f'{_ns}val')
-                        if gs_val:
-                            span = int(gs_val)
-                            if span > 1:
-                                merge_cells.append({"type": "horizontal", "row": row_idx, "col": col_idx, "span": span})
-                    # 垂直合并：vMerge（使用 .// 递归搜索）
-                    vm = tc.find(f'.//{_ns}vMerge')
+
+                    # 水平合并
+                    gs = tcPr.find(f'{_ns}gridSpan')
+                    span_val = int(gs.get(f'{_ns}val', '1')) if gs is not None else 1
+                    if gs is not None and span_val > 1:
+                        merge_cells.append({"type": "horizontal", "row": row_idx, "col": col_idx, "span": span_val})
+
+                    # 垂直合并
+                    vm = tcPr.find(f'{_ns}vMerge')
                     if vm is not None:
                         vm_val = vm.get(f'{_ns}val')
                         if vm_val is None or vm_val == 'restart':
                             merge_span = 1
-                            for next_row in table.rows[row_idx + 1:]:
-                                next_tc = next_row.cells[col_idx]._tc
-                                next_vm = next_tc.find(f'.//{_ns}vMerge')
-                                if next_vm is not None:
-                                    next_val = next_vm.get(f'{_ns}val')
-                                    if next_val is None or next_val == 'continue':
-                                        merge_span += 1
-                                    elif next_val == 'restart' and next_tc is tc:
-                                        merge_span += 1
+                            cell_text = table.rows[row_idx].cells[col_idx].text.strip()
+                            for nr in range(row_idx + 1, len(table.rows)):
+                                _vstop = False
+                                try:
+                                    next_cell = table.rows[nr].cells[col_idx]
+                                    next_tc = next_cell._tc
+                                    next_vm = next_tc.find(f'.//{_ns}vMerge')
+                                    if next_vm is not None:
+                                        next_val = next_vm.get(f'{_ns}val')
+                                        if next_val is None or next_val == 'continue':
+                                            merge_span += 1
+                                        elif next_val == 'restart':
+                                            if next_cell.text.strip() == cell_text:
+                                                merge_span += 1
+                                            else:
+                                                _vstop = True
+                                        else:
+                                            _vstop = True
                                     else:
-                                        break
-                                else:
+                                        _vstop = True
+                                except Exception:
+                                    _vstop = True
+                                if _vstop:
                                     break
                             if merge_span > 1:
-                                # 去重：检查同一列是否已有垂直合并覆盖当前行范围
                                 _already_covered = False
                                 for (_vr, _vspan) in _covered_vmerge_ranges.get(col_idx, []):
                                     if _vr <= row_idx < _vr + _vspan:
@@ -733,13 +994,26 @@ class DocumentParser:
                                 if not _already_covered:
                                     merge_cells.append({"type": "vertical", "row": row_idx, "col": col_idx, "span": merge_span})
                                     _covered_vmerge_ranges.setdefault(col_idx, []).append((row_idx, merge_span))
+
+                    col_idx += span_val
                 except Exception:
-                    pass
+                    col_idx += 1
+
             if row_idx == 0:
-                block.headers = cells
+                _header_cells = cells
             else:
                 rows_data.append(cells)
-        block.rows = rows_data
+
+        # Stage 5: 构建 per_cell_data 作为唯一存储
+        from app.infrastructure.table_codec import to_per_cell, to_dict
+        try:
+            td = to_per_cell(_header_cells, rows_data, merge_cells, column_widths, block.row_heights)
+            block.per_cell_data = to_dict(td)
+        except Exception:
+            # 降级：直接存储旧格式
+            if row_idx == 0:
+                block.per_cell_data = None
+            pass
         # ===== WPS 伪合并检测（无 OOXML gridSpan/vMerge 的合并） =====
         if not merge_cells and rows_data:
             # 水平伪合并：逐行检测连续相同非空文本
@@ -759,7 +1033,6 @@ class DocumentParser:
                         c += span
                     else:
                         c += 1
-        block.merge_cells = merge_cells
         if not doc.sections:
             s = Section(title="表格", level=1)
             s.content.append(block)

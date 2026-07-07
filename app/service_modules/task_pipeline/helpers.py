@@ -119,6 +119,7 @@ _SEPARATOR_PAGE_KEYWORDS = (
 )
 
 _TABLE_MARKER_PREFIX = "[[TABLE:"
+_TABLE_JSON_PREFIX = "[[TABLE_JSON:"
 _QUALIFICATION_MARKER = "[[QUALIFICATION_DOCS]]"
 
 
@@ -329,6 +330,8 @@ def _extract_analysis_context(analysis_result):
                         "headers": rt["headers"],
                         "rows": rt["rows"],
                         "merges": rt.get("merges", []),
+                        "column_widths": rt.get("column_widths", []),
+                        "row_heights": rt.get("row_heights", []),
                         "text_before": rt.get("text_before", ""),
                         "text_after": rt.get("text_after", ""),
                     })
@@ -949,6 +952,225 @@ def _fill_table_from_original(original_headers, original_rows):
 
     return filled_rows
 
+
+
+def _build_coverage_matrix(nrows, ncols, merges):
+    """建立合并覆盖矩阵，标记每个单元格是实格还是虚拟格。
+
+    Returns:
+        list[list[str]]: "real" | "h_virtual" | "v_continue"
+    """
+    matrix = [["real"] * ncols for _ in range(nrows)]
+    for m in merges:
+        if m.get("type") == "horizontal":
+            r, c, s = m["row"], m["col"], m["span"]
+            for cc in range(c + 1, min(c + s, ncols)):
+                if r < nrows and cc < ncols:
+                    matrix[r][cc] = "h_virtual"
+        elif m.get("type") == "vertical":
+            r, c, s = m["row"], m["col"], m["span"]
+            for rr in range(r + 1, min(r + s, nrows)):
+                if rr < nrows and c < ncols:
+                    if matrix[rr][c] != "h_virtual":
+                        matrix[rr][c] = "v_continue"
+    return matrix
+
+
+def _detect_fillable_columns(nrows, ncols, coverage, merged_rows):
+    """检测哪些列是投标人填写列（原文中空率 > 70% 的真实单元格列）。
+
+    排除合并虚拟格后，统计每列的空率。
+    """
+    if nrows <= 1:
+        return set()
+    col_empty_count = [0] * ncols
+    col_real_count = [0] * ncols
+    for ri in range(1, nrows):  # 从第二行开始（跳过表头）
+        row = merged_rows[ri] if ri < len(merged_rows) else []
+        for ci in range(ncols):
+            if coverage[ri][ci] != "real":
+                continue
+            col_real_count[ci] += 1
+            cell_val = (row[ci] if ci < len(row) else "").strip()
+            if not cell_val:
+                col_empty_count[ci] += 1
+
+    fillable = set()
+    for ci in range(ncols):
+        if col_real_count[ci] == 0:
+            continue
+        empty_rate = col_empty_count[ci] / col_real_count[ci]
+        if empty_rate >= 0.7:
+            fillable.add(ci)
+    return fillable
+
+
+# 要求关键词 → 主体资料类型 映射（用于响应表/资格表的填充匹配）
+_REQUIREMENT_TO_MATERIAL = [
+    ("营业执照", "BUSINESS_LICENSE", "\u5df2\u63d0\u4f9b\u7ecf\u5546\u90e8\u95e8\u6838\u51c6\u767b\u8bb0\u7684\u6709\u6548\u8425\u4e1a\u6267\u7167\uff0c\u8be6\u89c1\u9644\u4ef6"),
+    ("\u6cd5\u5b9a\u4ee3\u8868", ("LEGAL_PERSON_STATEMENT", "LEGAL_PERSON_ID_CARD"), "\u5df2\u63d0\u4f9b\u6cd5\u5b9a\u4ee3\u8868\u4eba\u8eab\u4efd\u8bc1\u660e\u53ca\u76f8\u5173\u6750\u6599\uff0c\u8be6\u89c1\u9644\u4ef6"),
+    ("\u6388\u6743", "AUTHORIZATION_LETTER", "\u5df2\u63d0\u4f9b\u6388\u6743\u59d4\u6258\u4e66\u53ca\u88ab\u6388\u6743\u4eba\u8eab\u4efd\u8bc1\u660e\uff0c\u8be6\u89c1\u9644\u4ef6"),
+    ("\u8d22\u52a1", "FINANCIAL_STATEMENT", "\u5df2\u63d0\u4f9b\u8fd1\u4e09\u5e74\u8d22\u52a1\u62a5\u8868\uff0c\u8be6\u89c1\u9644\u4ef6"),
+    ("\u7eb3\u7a0e", "FINANCIAL_STATEMENT", "\u5df2\u63d0\u4f9b\u7eb3\u7a0e\u8bc1\u660e\u6750\u6599\uff0c\u8be6\u89c1\u9644\u4ef6"),
+    ("\u793e\u4fdd", "FINANCIAL_STATEMENT", "\u5df2\u63d0\u4f9b\u793e\u4f1a\u4fdd\u9669\u7f34\u7eb3\u8bc1\u660e\uff0c\u8be6\u89c1\u9644\u4ef6"),
+    ("\u8d44\u8d28", ("QUALIFICATION_FILE", "QUALIFICATION_DECLARATION"), "\u5df2\u63d0\u4f9b\u76f8\u5173\u8d44\u8d28\u8bc1\u4e66\u53ca\u8d44\u8d28\u58f0\u660e\u6750\u6599\uff0c\u8be6\u89c1\u9644\u4ef6"),
+    ("健康", ("INTEGRITY_COMMITMENT",), "已提供健康承诺书，详见附件"),
+    ("廉洁", ("INTEGRITY_COMMITMENT",), "已提供相关承诺书，详见附件"),
+    ("\u4fe1\u7528", "QUALIFICATION_FILE", "\u5df2\u63d0\u4f9b\u4fe1\u7528\u8bc1\u660e\u6750\u6599\uff0c\u8be6\u89c1\u9644\u4ef6"),
+]
+
+
+def _match_row_text_to_material(row_text, subject_context):
+    """将行文本中的要求关键词匹配到主体资料，返回填充文本或 None。"""
+    if not row_text or not subject_context:
+        return None
+    materials = subject_context.get("materials", [])
+    if not materials:
+        return None
+    material_types = {m.get("material_type", "") for m in materials if m.get("material_type")}
+    if not material_types:
+        return None
+
+    for keyword, mat_type, fill_text in _REQUIREMENT_TO_MATERIAL:
+        if keyword in row_text:
+            if isinstance(mat_type, tuple):
+                matched_types = {t for t in mat_type if t in material_types}
+            else:
+                matched_types = {mat_type} if mat_type in material_types else set()
+            if matched_types:
+                return fill_text
+    return None
+
+
+def _match_row_text_to_requirement(row_text, analysis_context):
+    """检查行文本是否匹配已识别的资格/商务/技术要求。
+
+    如果能匹配到已识别的 requirement 条目，检查对应条目在分析结果中的"满足状态"。
+    暂返回通用填充文本。
+    """
+    if not row_text or not analysis_context:
+        return None
+    # 获取资格要求列表
+    eligibility = analysis_context.get("_eligibility", {}) or {}
+    quals = eligibility.get("qualifications", []) or []
+    for q in quals:
+        req = q.get("requirement", "") or ""
+        if len(req) >= 4 and any(kw in row_text for kw in [req[:8]]):
+            pass  # 关键词匹配成功
+    # 兜底：不填写具体匹配文本，让调用方走默认逻辑
+    return None
+
+
+def _smart_fill_table(table_dict, analysis_context, subject_context):
+    """通用表格填充引擎。
+
+    核心逻辑：
+    1. 构建合并覆盖矩阵，区分实格和虚拟格
+    2. 检测填充列（原文空率 > 70% 的列）
+    3. 对填充列中的空实格，用同行非空文本匹配数据源
+    4. 匹配不到 → 留空
+
+    Args:
+        table_dict: {"headers": [...], "rows": [[...], ...], "merges": [...], ...}
+        analysis_context: 分析上下文（含资格/商务/技术要求）
+        subject_context: 主体资料上下文（含上传材料清单）
+
+    Returns:
+        list[list[str]]: 填充后的数据行（不含表头）
+    """
+    headers = table_dict.get("headers", [])
+    original_rows = table_dict.get("rows", [])
+    merges = table_dict.get("merges", [])
+
+    if not headers or not original_rows:
+        return original_rows
+
+    ncols = len(headers)
+    nrows_data = len(original_rows)
+
+    # 构建完整矩阵（含表头行）
+    all_rows = [headers] + original_rows
+    nrows = nrows_data + 1
+
+    # 1. 构建合并覆盖矩阵
+    coverage = _build_coverage_matrix(nrows, ncols, merges)
+
+    # 2. 检测填充列
+    fillable_cols = _detect_fillable_columns(nrows, ncols, coverage, all_rows)
+
+    if not fillable_cols:
+        return original_rows
+
+    # 3. 逐行填充
+    filled_rows = [list(row) for row in original_rows]
+    for ri in range(nrows_data):
+        data_row_idx = ri + 1  # 跳过表头行
+        for ci in fillable_cols:
+            # 跳过虚拟格
+            if coverage[data_row_idx][ci] != "real":
+                continue
+            # 跳过已有内容的格
+            current = (filled_rows[ri][ci] if ci < len(filled_rows[ri]) else "").strip()
+            if current:
+                continue
+
+            # 收集当前行所有非空文本作为行上下文
+            row_context = ""
+            for j in range(ncols):
+                if j != ci:
+                    val = (all_rows[data_row_idx][j] if j < len(all_rows[data_row_idx]) else "").strip()
+                    if val:
+                        row_context += val + " "
+
+            row_context = row_context.strip()
+            if not row_context:
+                continue
+
+            # 4. 尝试匹配
+            fill_val = None
+
+            # 4a. 尝试匹配主体资料
+            fill_val = _match_row_text_to_material(row_context, subject_context)
+
+            # 4b. 如果没有匹配到，检查是否是产品表，尝试匹配产品库
+            if not fill_val:
+                # 检查此行是否包含产品名
+                product_name = None
+                for j in range(ncols):
+                    val = (original_rows[ri][j] if j < len(original_rows[ri]) else "").strip()
+                    if val:
+                        product_name = val
+                        break
+                if product_name:
+                    try:
+                        product_data = _fetch_product_data([product_name])
+                    except Exception:
+                        product_data = None
+                    if product_data and product_data.get(product_name):
+                        p_info = product_data[product_name]
+                        # 检测当前列应该匹配哪个产品字段
+                        header_text = headers[ci] if ci < len(headers) else ""
+                        for std_field, candidates in PRODUCT_FIELD_TO_COLUMN.items():
+                            if any(c in header_text for c in candidates):
+                                p_val = p_info.get(std_field, "")
+                                if p_val:
+                                    fill_val = str(p_val)[:100]
+                                break
+
+            # 4c. 对技术偏离表，默认填"完全响应"
+            if not fill_val:
+                for kw in ["\u504f\u79bb", "\u54cd\u5e94"]:
+                    if kw in headers[ci] if ci < len(headers) else "":
+                        fill_val = "\u5b8c\u5168\u54cd\u5e94\uff0c\u65e0\u504f\u79bb"
+                        break
+
+            if fill_val:
+                while ci >= len(filled_rows[ri]):
+                    filled_rows[ri].append("")
+                filled_rows[ri][ci] = fill_val
+            # 没匹配到 → 留空
+
+    return filled_rows
 
 def _extract_product_terms(text):
     """从当前有效分析文本中抽取产品项关键词。"""
@@ -2278,6 +2500,23 @@ def _detect_template_type(chapter_title, chapter_desc, tender_text):
 # 路径 B：表格填充引擎
 # ============================================================================
 # 常见表格模板的列结构定义
+
+def _normalize_row_heights(raw_heights, n_headers, n_data_rows):
+    """确保 row_heights 长度与总行数（表头 + 数据）匹配。
+    
+    旧缓存可能缺少表头行高，此时在前面补一条默认值。
+    """
+    expected = n_headers + n_data_rows
+    if len(raw_heights) == expected:
+        return list(raw_heights)
+    if len(raw_heights) == n_data_rows:
+        # 缺少表头行高 → 在前面补一条
+        return [{"val": 0, "rule": "atLeast"}] + list(raw_heights)
+    # 长度仍然不匹配 → 返回默认全零
+    return [{"val": 0, "rule": "atLeast"}] * expected
+
+
+
 _TABLE_COLUMNS = {
     "报价一览表": ["序号", "标的名称", "规格型号", "数量", "单价（元）", "总价（元）", "备注"],
     "报价表": ["序号", "标的名称", "规格型号", "数量", "单价（元）", "总价（元）", "备注"],
@@ -2494,73 +2733,83 @@ def _match_raw_table(chapter_title, chapter_desc, raw_tables):
 
 
 def _generate_table_content(chapter_title, chapter_desc, analysis_context, subject_context):
-    """生成表格模板的填充内容（tab 分隔的文本格式）。
+    """生成表格模板的填充内容（JSON 格式，携带完整结构信息）。
 
-    策略变更：
-    1. 优先使用原始表格框架（招标文件原表复制），只从产品库填充空白单元格
-    2. 没有原始表时降级到关键词匹配的硬编码逻辑
-    3. 所有类型的原始表格都会被保留和匹配（不限于产品表）
+    策略：
+    1. 优先匹配原始表格（宽/高/合并全部保留）
+    2. 产品表从产品库填充空白单元格
+    3. 无原始表时降级到关键词匹配的硬编码逻辑
 
     返回:
-        str: 包含表格数据的文本（_table_marker 开头）
+        str: 以 _TABLE_JSON_PREFIX 开头的 JSON 文本
     """
+    import json as _json
     table_type = chapter_title
     raw_tables = analysis_context.get("_raw_product_tables", [])
 
-    # ========== 新路径：原始表复用+填空（所有类型） ==========
+    # ========== 主路径：原始表复用+填空（所有类型） ==========
     matched_table = _match_raw_table(chapter_title, chapter_desc, raw_tables)
     if matched_table:
         original_headers = matched_table.get("headers", [])
         original_rows = matched_table.get("rows", [])
         if original_headers and original_rows:
-            columns = list(original_headers)
-            # 对产品报价表尝试填充空白单元格
+            # 通用智能填充（所有表类型）
+            merged_rows = list(original_rows)
+            # 构建临时 table_dict 供填充引擎使用
+            table_dict = {
+                "headers": list(original_headers),
+                "rows": merged_rows,
+                "merges": matched_table.get("merges", []),
+                "column_widths": matched_table.get("column_widths", []),
+                "row_heights": _normalize_row_heights(
+                    matched_table.get("row_heights", []),
+                    len(original_headers), len(filled_rows[data_start:])
+                ),
+            }
+            filled_rows = _smart_fill_table(table_dict, analysis_context, subject_context)
+            # 对于产品表，额外用产品库填充（优先级更高，覆盖 smart_fill 的结果）
             source_type = matched_table.get("source_type", "")
             if source_type == "product_list":
-                filled_rows = _fill_table_from_original(original_headers, original_rows)
-            else:
-                filled_rows = list(original_rows)
-            # 去重：rows[0] 和 headers 可能是同一行（_extract_raw_table 的设计）
+                product_filled = _fill_table_from_original(original_headers, original_rows)
+                # 只在产品库有数据时才合并（优先产品库填充，保留 smart_fill 的兜底）
+                if any(any(c.strip() for c in row) for row in product_filled):
+                    filled_rows = product_filled
             data_start = 0
             if filled_rows and original_headers and filled_rows[0] == original_headers:
                 data_start = 1
-            lines = []
-            lines.append("\t".join(columns))
-            for row in filled_rows[data_start:]:
-                padded = row + [""] * (len(columns) - len(row))
-                lines.append("\t".join(padded[:len(columns)]))
-            marker = f"{_TABLE_MARKER_PREFIX}{table_type}]]"
-            # 附带合并单元格信息
-            merges = matched_table.get("merges", [])
-            merge_line = "" 
-            if merges:
-                merge_parts = []
-                for m in merges:
-                    merge_parts.append(f"{m.get('type','')}:{m.get('row',0)}:{m.get('col',0)}:{m.get('span',1)}")
-                merge_line = "\n--MERGES--\n" + "\n".join(merge_parts)
-            # 附带表格前后段落文本
-            text_before = matched_table.get("text_before", "").strip()
-            text_after = matched_table.get("text_after", "").strip()
-            extras = ""
-            if text_before:
-                extras += "\n--TEXT-BEFORE--\n" + text_before
-            if text_after:
-                extras += "\n--TEXT-AFTER--\n" + text_after
-            return marker + "\n" + "\n".join(lines) + merge_line + extras
+            ncols = len(original_headers)
+            for i in range(len(filled_rows)):
+                while len(filled_rows[i]) < ncols:
+                    filled_rows[i].append("")
+            table_package = {
+                "headers": list(original_headers),
+                "rows": filled_rows[data_start:],
+                "column_widths": matched_table.get("column_widths", []),
+                "row_heights": matched_table.get("row_heights", []),
+                "merges": matched_table.get("merges", []),
+                "text_before": (matched_table.get("text_before", "") or "").strip(),
+                "text_after": (matched_table.get("text_after", "") or "").strip(),
+            }
+            marker = f"{_TABLE_JSON_PREFIX}{table_type}]]"
+            return marker + "\n" + _json.dumps(table_package, ensure_ascii=False, default=str)
 
-    # ========== 旧路径：硬编码表格（无原始表时兜底） ==========
+    # ========== 降级路径：硬编码表格（无原始表时兜底） ==========
     columns, found = _detect_table_columns(chapter_title, chapter_desc)
     data_rows = _extract_table_data_from_analysis(table_type, analysis_context, subject_context)
 
-    lines = []
-    lines.append("\t".join(columns))
-    for row in data_rows:
-        padded = row + [""] * (len(columns) - len(row))
-        lines.append("\t".join(padded[:len(columns)]))
-
-    marker = f"{_TABLE_MARKER_PREFIX}{table_type}]]"
-    return marker + "\n" + "\n".join(lines)
-
+    table_package = {
+        "headers": list(columns),
+        "rows": data_rows,
+        "column_widths": [],
+        "row_heights": _normalize_row_heights(
+            [], len(columns), len(data_rows)
+        ),
+        "merges": [],
+        "text_before": "",
+        "text_after": "",
+    }
+    marker = f"{_TABLE_JSON_PREFIX}{table_type}]]"
+    return marker + "\n" + _json.dumps(table_package, ensure_ascii=False, default=str)
 
 # ============================================================================
 # 路径 C：资格证明文件插入引擎
@@ -3557,121 +3806,6 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
         cleaned = _strip_xml_control_chars(cleaned)
         return cleaned.strip()
 
-    def _write_table_from_lines(doc, lines, merges=None):
-        """从文本行创建表格，支持合并单元格（直接 XML 构建）。"""
-        table_rows = []
-        for _line in lines:
-            _stripped = _line.strip()
-            if not _stripped:
-                continue
-            if '\t' in _stripped:
-                _cells = [c.strip() for c in _stripped.split('\t')]
-            else:
-                _cells = [c.strip() for c in re.split(r'\s{3,}|\|', _stripped) if c.strip()]
-            if len(_cells) >= 1:
-                table_rows.append(_cells)
-        if not table_rows:
-            return
-
-        _max_cols = max(len(r) for r in table_rows)
-        _ns = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
-        _cw = 9072 // max(1, _max_cols)
-
-        # 构建垂直合并查找（支持每列多个非重叠合并区域）
-        _v_merges = {}  # col -> [{"row": start, "span": n}, ...]
-        for _m in (merges or []):
-            if _m.get("type") == "vertical":
-                _col = _m.get("col", 0)
-                _entry = {"row": _m.get("row", 0), "span": _m.get("span", 1)}
-                _v_merges.setdefault(_col, []).append(_entry)
-
-        # 创建表格 XML
-        _tbl = etree.SubElement(doc.element.body, _ns + 'tbl')
-        _tblPr = etree.SubElement(_tbl, _ns + 'tblPr')
-        _tblW = etree.SubElement(_tblPr, _ns + 'tblW')
-        _tblW.set(_ns + 'w', '9072')
-        _tblW.set(_ns + 'type', 'dxa')
-        _tblStyle = etree.SubElement(_tblPr, _ns + 'tblStyle')
-        _tblStyle.set(_ns + 'val', 'Table Grid')
-        _tblGrid = etree.SubElement(_tbl, _ns + 'tblGrid')
-        for _ in range(_max_cols):
-            _gc = etree.SubElement(_tblGrid, _ns + 'gridCol')
-            _gc.set(_ns + 'w', str(_cw))
-
-        # 构建每行的 col→tc 映射
-        def _build_map(_ri, _ncols):
-            _h = [m for m in (merges or []) if m.get("type") == "horizontal" and m.get("row") == _ri]
-            _h.sort(key=lambda x: x.get("col", 0))
-            _map = {}
-            _ci = 0
-            _tci = 0
-            while _ci < _ncols:
-                _match = [m for m in _h if m.get("col") == _ci]
-                if _match:
-                    _span = _match[0].get("span", 1)
-                    _text = table_rows[_ri][_ci] if _ci < len(table_rows[_ri]) else ""
-                    _map[_ci] = (_tci, _span, _text)
-                    _tci += 1
-                    _ci += _span
-                else:
-                    _text = table_rows[_ri][_ci] if _ci < len(table_rows[_ri]) else ""
-                    _map[_ci] = (_tci, 1, _text)
-                    _tci += 1
-                    _ci += 1
-            return _map
-
-        for _ri in range(len(table_rows)):
-            _mapping = _build_map(_ri, _max_cols)
-            _tr = etree.SubElement(_tbl, _ns + 'tr')
-            # 按 tc 分组
-            _tc_groups = {}
-            for _ci, (_tci, _span, _text) in _mapping.items():
-                if _tci not in _tc_groups:
-                    _tc_groups[_tci] = (_ci, _span, _text)
-            for _ci, _span, _text in [_tc_groups[k] for k in sorted(_tc_groups.keys())]:
-                _tc = etree.SubElement(_tr, _ns + 'tc')
-                _tcPr = etree.SubElement(_tc, _ns + 'tcPr')
-                _tcW = etree.SubElement(_tcPr, _ns + 'tcW')
-                _tcW.set(_ns + 'w', str(_cw * _span))
-                _tcW.set(_ns + 'type', 'dxa')
-                if _span > 1:
-                    _gs = etree.SubElement(_tcPr, _ns + 'gridSpan')
-                    _gs.set(_ns + 'val', str(_span))
-                if _ci in _v_merges:
-                    # 查找当前行所属的垂直合并条目
-                    _vm_found = None
-                    for _vm_candidate in _v_merges[_ci]:
-                        if _ri >= _vm_candidate["row"] and _ri < _vm_candidate["row"] + _vm_candidate["span"]:
-                            _vm_found = _vm_candidate
-                            break
-                    if _vm_found:
-                        _vm_info = _vm_found
-                        if _ri == _vm_info["row"]:
-                            _vm = etree.SubElement(_tcPr, _ns + 'vMerge')
-                            _vm.set(_ns + 'val', 'restart')
-                        elif _ri > _vm_info["row"] and _ri < _vm_info["row"] + _vm_info["span"]:
-                            _vm = etree.SubElement(_tcPr, _ns + 'vMerge')
-                            _vm.set(_ns + 'val', 'continue')
-                if _text:
-                    _p = etree.SubElement(_tc, _ns + 'p')
-                    _r_elem = etree.SubElement(_p, _ns + 'r')
-                    _t = etree.SubElement(_r_elem, _ns + 't')
-                    _t.text = _strip_xml_control_chars(_text)
-                    _t.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
-                    # 字体格式
-                    _rPr = etree.SubElement(_r_elem, _ns + 'rPr')
-                    _rFonts = etree.SubElement(_rPr, _ns + 'rFonts')
-                    _rFonts.set(_ns + 'ascii', '仿宋')
-                    _rFonts.set(_ns + 'hAnsi', '仿宋')
-                    _rFonts.set(_ns + 'eastAsia', '仿宋')
-                    _sz = etree.SubElement(_rPr, _ns + 'sz')
-                    _sz.set(_ns + 'val', '24')  # 小四 = 12pt = 24 half-pts
-                    _szCs = etree.SubElement(_rPr, _ns + 'szCs')
-                    _szCs.set(_ns + 'val', '24')
-                    if _ri == 0:
-                        _b = etree.SubElement(_rPr, _ns + 'b')
-        return
-    
 
     def _build_subject_declaration_text():
         materials = subject_context.get("materials", []) if subject_context else []
@@ -4177,179 +4311,101 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                                 _r.font.size = Pt(12)
                                 _r.element.rPr.rFonts.set(qn("w:eastAsia"), "仿宋")
                         elif _block.get("type") == "table":
-                            # 始终使用 document.add_table() 在光标位置插入表格，
-                            # 不调用 write_table_from_data（它用 ET.SubElement 追加到 body 末尾）
-                            _headers = _block.get("headers", [])
-                            _rows = _block.get("rows", [])
-                            _merge_cells = _block.get("merge_cells", [])
-                            if _headers and _rows:
-                                _ncols = len(_headers)
-                                _nrows = len(_rows)
-                                _t = document.add_table(rows=_nrows + 1, cols=_ncols)
-                                _t.style = "Table Grid"
-                                for _ci, _h in enumerate(_headers):
-                                    _t.rows[0].cells[_ci].text = _h
-                                for _ri, _row in enumerate(_rows):
-                                    for _ci, _cell_text in enumerate(_row):
-                                        if _ci < _ncols:
-                                            _t.rows[_ri + 1].cells[_ci].text = _cell_text
-                                # 矩形合并法：将相同 (row,col) 的 horizontal+vertical 合并整合为单个矩形合并
-                                # 避免重叠合并导致的 "requested span not rectangular" 异常
-                                _merge_map = {}
-                                for _mc in (_merge_cells or []):
-                                    _mk = (_mc.get("row", 0), _mc.get("col", 0))
-                                    if _mk not in _merge_map:
-                                        _merge_map[_mk] = {"v_span": 1, "h_span": 1}
-                                    if _mc.get("type") == "vertical":
-                                        _merge_map[_mk]["v_span"] = max(_merge_map[_mk]["v_span"], _mc.get("span", 1))
-                                    elif _mc.get("type") == "horizontal":
-                                        _merge_map[_mk]["h_span"] = max(_merge_map[_mk]["h_span"], _mc.get("span", 1))
-                                _consumed_cells = set()
-                                for (_mrow, _mcol), _mspans in _merge_map.items():
-                                    _mvspan = _mspans["v_span"]
-                                    _mhspan = _mspans["h_span"]
-                                    if _mvspan == 1 and _mhspan == 1:
-                                        continue
-                                    _mend_row = _mrow + _mvspan - 1
-                                    _mend_col = _mcol + _mhspan - 1
-                                    if _mend_row >= _nrows + 1 or _mend_col >= _ncols:
-                                        continue
-                                    # 检查此矩形区域是否已被之前的合并消耗
-                                    _mrange = set((_mr, _mc3) for _mr in range(_mrow, _mend_row + 1) for _mc3 in range(_mcol, _mend_col + 1))
-                                    if _consumed_cells.intersection(_mrange):
-                                        _consumed_cells.update(_mrange)
-                                        continue
-                                    # 合并前清空被消耗单元格的文本，避免文本重复
-                                    for _cr in range(_mrow, _mend_row + 1):
-                                        for _cc in range(_mcol, _mend_col + 1):
-                                            if _cr == _mrow and _cc == _mcol:
-                                                continue
-                                            try:
-                                                _t.rows[_cr].cells[_cc].text = ""
-                                            except Exception:
-                                                pass
-                                    try:
-                                        _t.rows[_mrow].cells[_mcol].merge(_t.rows[_mend_row].cells[_mend_col])
-                                        _consumed_cells.update(_mrange)
-                                    except Exception as _mce:
-                                        logger.warning("[docx] ContentBlock 合并单元格失败: %s", _mce)
-                                _column_widths = _block.get("column_widths", [])
-                                if _column_widths:
-                                    for _ci, _w in enumerate(_column_widths):
-                                        if _ci < _ncols and _w:
-                                            try:
-                                                for _row in _t.rows:
-                                                    _row.cells[_ci].width = _w
-                                            except Exception:
-                                                pass
-                                    # 禁用 autoFit 并设置表格固定宽度
-                                    _valid_widths = [w for w in _column_widths if w]
-                                    if _valid_widths:
-                                        _total_w = int(sum(_valid_widths) / 635)
-                                        from docx.oxml import OxmlElement
-                                        _tbl_elem = _t._tbl
-                                        _tblPr = _tbl_elem.find(qn('w:tblPr'))
-                                        if _tblPr is None:
-                                            _tblPr = OxmlElement('w:tblPr')
-                                            _tbl_elem.insert(0, _tblPr)
-                                        # tblW = 固定宽度 (twip)
-                                        _existing_tblW = _tblPr.find(qn('w:tblW'))
-                                        if _existing_tblW is not None:
-                                            _tblPr.remove(_existing_tblW)
-                                        _tblW = OxmlElement('w:tblW')
-                                        _tblW.set(qn('w:w'), str(_total_w))
-                                        _tblW.set(qn('w:type'), 'dxa')
-                                        _tblPr.append(_tblW)
-                                        # tblLayout = fixed (禁用 autoFit)
-                                        _existing_layout = _tblPr.find(qn('w:tblLayout'))
-                                        if _existing_layout is not None:
-                                            _tblPr.remove(_existing_layout)
-                                        _tblLayout = OxmlElement('w:tblLayout')
-                                        _tblLayout.set(qn('w:type'), 'fixed')
-                                        _tblPr.append(_tblLayout)
-                                # 设置表格内文字为仿宋小四
-                                for _t_row in _t.rows:
-                                    for _t_cell in _t_row.cells:
-                                        for _t_para in _t_cell.paragraphs:
-                                            _t_para.style = document.styles["Normal"]
-                                            for _t_run in _t_para.runs:
-                                                    _t_run.font.name = "仿宋"
-                                                    _t_run.font.size = Pt(12)
-                                                    _t_run.element.rPr.rFonts.set(qn("w:eastAsia"), "仿宋")
-                # ContentBlock 已处理，跳过后续文本写入和表格标记处理
+                            # 统一渲染：通过 per_cell_data → write_table_from_data
+                            _pcd = _block.get("per_cell_data")
+                            if _pcd:
+                                from app.infrastructure.table_codec import from_dict, write_table_from_data
+                                td = from_dict(_pcd)
+                            else:
+                                from app.infrastructure.table_codec import to_per_cell, write_table_from_data
+                                _hd = _block.get("headers", [])
+                                _rw = _block.get("rows", [])
+                                _mc = _block.get("merge_cells", [])
+                                _cw = _block.get("column_widths", [])
+                                _all_rows = [_hd] + _rw if _hd else _rw
+                                td = to_per_cell(_hd, _all_rows, _mc, _cw)
+                            # 注入默认格式
+                            for _row in td.rows:
+                                for _cell in _row.cells:
+                                    if not _cell.font_name:
+                                        _cell.font_name = "仿宋"
+                                    if not _cell.font_size_half_pt:
+                                        _cell.font_size_half_pt = 24
+                            write_table_from_data(document, td)
+                                # ContentBlock 已处理，跳过后续文本写入和表格标记处理
                 # 仍需要处理子章节
                 _write_subject_materials_for_outline_item(title, desc)
                 for _child in children:
                     _write_outline_item(_child, level=level + 1, inherited_child_sections=child_sections, parent_title=chapter_title_for_plan)
                 return
 
-            # ========== 表格标记处理 ==========
-            if isinstance(matched_content, str) and matched_content.startswith(_TABLE_MARKER_PREFIX):
-                # 先写入章节描述文字（表格前可能有文字段落）
+            # ========== JSON 表格标记处理（携带宽/高/合并信息） ==========
+            if isinstance(matched_content, str) and matched_content.startswith(_TABLE_JSON_PREFIX):
                 if desc and desc not in title:
                     desc_p = document.add_paragraph(_strip_xml_control_chars(desc))
                     desc_p.style = document.styles["Normal"]
                     for run in desc_p.runs:
-                        run.font.name = "仿宋"
+                        run.font.name = "\u4eff\u5b8b"
                         run.font.size = Pt(12)
-                        run.element.rPr.rFonts.set(qn("w:eastAsia"), "仿宋")
-                # 提取表格类型和 tab 分隔数据
+                        run.element.rPr.rFonts.set(qn("w:eastAsia"), "\u4eff\u5b8b")
                 end_marker = matched_content.find("]]\n")
                 if end_marker > 0:
-                    table_data = matched_content[end_marker + 3:].strip()
-                    if table_data:
-                        # 分离：合并信息、前后段落、表格数据
-                        merge_lines = []
-                        text_before_block = ""
-                        text_after_block = ""
-                        table_lines = table_data.split("\n")
-                        # 检查是否有 --TEXT-BEFORE--
-                        if "--TEXT-BEFORE--" in table_lines:
-                            tb_idx = table_lines.index("--TEXT-BEFORE--")
-                            text_before_block = table_lines[tb_idx + 1] if tb_idx + 1 < len(table_lines) else ""
-                            # 移除 TEXT-BEFORE 行
-                            table_lines = table_lines[:tb_idx] + table_lines[tb_idx + 2:]
-                        # 检查是否有 --TEXT-AFTER--
-                        if "--TEXT-AFTER--" in table_lines:
-                            ta_idx = table_lines.index("--TEXT-AFTER--")
-                            text_after_block = table_lines[ta_idx + 1] if ta_idx + 1 < len(table_lines) else ""
-                            table_lines = table_lines[:ta_idx] + table_lines[ta_idx + 2:]
-                        # 分离合并单元格信息
-                        if "--MERGES--" in table_lines:
-                            idx = table_lines.index("--MERGES--")
-                            merge_data_lines = table_lines[idx+1:]
-                            table_lines = table_lines[:idx]
-                            for ml in merge_data_lines:
-                                parts = ml.split(":")
-                                if len(parts) == 4:
-                                    merge_lines.append({"type": parts[0], "row": int(parts[1]), "col": int(parts[2]), "span": int(parts[3])})
-                        # 写入表格前的段落
-                        if text_before_block:
-                            tb_p = document.add_paragraph(_strip_xml_control_chars(text_before_block))
-                            tb_p.style = document.styles["Normal"]
-                            for run in tb_p.runs:
-                                run.font.name = "仿宋"
-                                run.font.size = Pt(12)
-                                run.element.rPr.rFonts.set(qn("w:eastAsia"), "仿宋")
-                        # 写入表格
-                        _write_table_from_lines(document, table_lines, merges=merge_lines)
-                        # 写入表格后的段落
-                        if text_after_block:
-                            ta_p = document.add_paragraph(_strip_xml_control_chars(text_after_block))
-                            ta_p.style = document.styles["Normal"]
-                            for run in ta_p.runs:
-                                run.font.name = "仿宋"
-                                run.font.size = Pt(12)
-                                run.element.rPr.rFonts.set(qn("w:eastAsia"), "仿宋")
+                    json_str = matched_content[end_marker + 3:].strip()
+                    if json_str:
+                        try:
+                            import json as _json
+                            table_dict = _json.loads(json_str)
+                            headers = table_dict.get("headers", [])
+                            rows = table_dict.get("rows", [])
+                            column_widths = table_dict.get("column_widths", [])
+                            row_heights = table_dict.get("row_heights", [])
+                            merges = table_dict.get("merges", [])
+                            text_before = table_dict.get("text_before", "")
+                            text_after = table_dict.get("text_after", "")
+
+                            # 写入表格前段落
+                            if text_before:
+                                tb_p = document.add_paragraph(_strip_xml_control_chars(text_before))
+                                tb_p.style = document.styles["Normal"]
+                                for run in tb_p.runs:
+                                    run.font.name = "\u4eff\u5b8b"
+                                    run.font.size = Pt(12)
+                                    run.element.rPr.rFonts.set(qn("w:eastAsia"), "\u4eff\u5b8b")
+
+                            # 统一通过 to_per_cell() 构建 TableData
+                            from app.infrastructure.table_codec import to_per_cell, write_table_from_data
+                            all_rows = [headers] + rows
+                            td = to_per_cell(headers, all_rows, merges, column_widths, row_heights)
+                            # 注入默认格式
+                            for _row in td.rows:
+                                for _cell in _row.cells:
+                                    if not _cell.font_name:
+                                        _cell.font_name = "仿宋"
+                                    if not _cell.font_size_half_pt:
+                                        _cell.font_size_half_pt = 24
+                            write_table_from_data(document, td)
+
+                            # 写入表格后段落
+                            if text_after:
+                                ta_p = document.add_paragraph(_strip_xml_control_chars(text_after))
+                                ta_p.style = document.styles["Normal"]
+                                for run in ta_p.runs:
+                                    run.font.name = "\u4eff\u5b8b"
+                                    run.font.size = Pt(12)
+                                    run.element.rPr.rFonts.set(qn("w:eastAsia"), "\u4eff\u5b8b")
+                        except Exception as exc:
+                            logger.warning("[docx] JSON 表格渲染失败, 降级到旧格式: %s", exc)
+                            document.add_paragraph("（此处为表格模板，请根据实际情况填写）")
                 else:
-                    # 如果只有标记没有数据，写入说明
                     document.add_paragraph("（此处为表格模板，请根据实际情况填写）")
                 _write_subject_materials_for_outline_item(title, desc)
-                # 继续处理子项但不处理当前文本
                 children = outline_item.get("children", [])
                 for child in children:
                     _write_outline_item(child, level=level + 1, inherited_child_sections=child_sections, parent_title=chapter_title_for_plan)
                 return
+
+            # ========== 表格标记处理已迁移到 JSON 路径 ==========
+            # 不再使用 _TABLE_MARKER_PREFIX 路径，统一走 JSON 表格路径
 
             # ========== 资格证明文件标记处理（三级递进：主体→知识库→留白） ==========
             if isinstance(matched_content, str) and matched_content.startswith(_QUALIFICATION_MARKER):
@@ -4401,32 +4457,9 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
             if title in first_line or first_line in title:
                 content_text = "\n".join(content_text.split("\n")[1:]).strip()
 
-            # 改进的段落/表格混合渲染：仅使用制表符检测表格，避免管道符误判
-            table_lines = []
-            normal_lines = []
-            in_table_block = False
-            for line in content_text.split("\n"):
-                stripped = line.strip()
-                if not stripped:
-                    if in_table_block:
-                        _write_table_from_lines(document, table_lines, merges=[])
-                        table_lines = []
-                        in_table_block = False
-                    continue
-                if "\t" in stripped:
-                    in_table_block = True
-                    table_lines.append(stripped)
-                else:
-                    if in_table_block:
-                        _write_table_from_lines(document, table_lines, merges=[])
-                        table_lines = []
-                        in_table_block = False
-                    normal_lines.append(stripped)
-            if in_table_block and table_lines:
-                _write_table_from_lines(document, table_lines, merges=[])
-            if normal_lines:
-                _write_formatted_content(document, "\n".join(normal_lines))
-
+            # 渲染纯文本内容（表格已通过上层 JSON/ContentBlock 路径处理）
+            if content_text.strip():
+                _write_formatted_content(document, content_text.strip())
         _write_subject_materials_for_outline_item(title, desc)
 
         for child in children:

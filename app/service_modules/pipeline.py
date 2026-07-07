@@ -80,4 +80,6 @@ from .task_pipeline.workflow import (
     start_analyze,
     start_generate,
     upload_tender_attachment,
+    get_task_documents,
+    download_task_document,
 )

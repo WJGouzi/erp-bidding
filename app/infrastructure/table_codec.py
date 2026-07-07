@@ -59,6 +59,7 @@ class TableData:
     table_width: int = 9072
     rows: List[TableRow] = field(default_factory=list)
     borders: bool = True
+    row_heights: List[dict] = field(default_factory=list)
 
     def row_count(self) -> int:
         return len(self.rows)
@@ -115,6 +116,7 @@ def to_dict(td: TableData) -> dict:
         "gridCols": td.grid_cols,
         "tableWidth": td.table_width,
         "borders": td.borders,
+        "rowHeights": td.row_heights,
         "rows": [
             {
                 "cells": [_cell_to_dict(c) for c in row.cells],
@@ -131,6 +133,7 @@ def from_dict(d: dict) -> TableData:
         grid_cols=d.get("gridCols", []),
         table_width=d.get("tableWidth", 9072),
         borders=d.get("borders", True),
+        row_heights=list(d.get("rowHeights", [])),
         rows=[
             TableRow(
                 cells=[_cell_from_dict(c) for c in row.get("cells", [])],
@@ -150,6 +153,7 @@ def to_per_cell(
     rows: List[List[str]],
     merges: List[dict],
     column_widths: Optional[List[int]] = None,
+    row_heights: Optional[List[dict]] = None,
 ) -> TableData:
     """将当前三角格式 {headers, rows, merges} 转换为 Per-Cell TableData。
 
@@ -261,10 +265,16 @@ def to_per_cell(
         for ri in range(nrows)
     ]
 
+    # 注入行高
+    if row_heights:
+        for ri in range(min(nrows, len(row_heights))):
+            rh_val = row_heights[ri].get("val", 0) if isinstance(row_heights[ri], dict) else int(row_heights[ri] or 0)
+            table_rows[ri].height = rh_val
+
     # 列宽
     cols = list(column_widths) if column_widths else []
 
-    return TableData(grid_cols=cols, rows=table_rows)
+    return TableData(grid_cols=cols, rows=table_rows, row_heights=list(row_heights) if row_heights else [])
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -352,6 +362,12 @@ def write_table_from_data(doc, table_data: TableData) -> None:
     # 逐行
     for ri, row in enumerate(table_data.rows):
         tr = ET.SubElement(tbl, _ns + 'tr')
+        # 写行高
+        if row.height > 0:
+            trPr = ET.SubElement(tr, _ns + 'trPr')
+            trHeight = ET.SubElement(trPr, _ns + 'trHeight')
+            trHeight.set(_ns + 'val', str(row.height))
+            trHeight.set(_ns + 'rule', 'atLeast')
         cells_list = row.cells if hasattr(row, 'cells') else []
 
         ci = 0

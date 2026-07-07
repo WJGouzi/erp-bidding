@@ -280,16 +280,18 @@ def _extract_scoring(table) -> dict:
 
 
 def _extract_raw_table(table) -> dict:
-    """提取表格的原始行列数据（不依赖分类），含合并单元格信息。
+    """提取表格的原始行列数据（不依赖分类），含合并单元格与行高信息。
     
     返回:
-        {"headers": [...], "rows": [[...], ...], "merges": [...], "column_widths": [...]}
+        {"headers": [...], "rows": [[...], ...], "merges": [...],
+         "column_widths": [...], "row_heights": [...]}
         merges: [{"type": "horizontal"|"vertical", "row": int, "col": int, "span": int}, ...]
         column_widths: 每列宽度（twips），空列表表示未提取到
+        row_heights: 每行高度 [{"val": int, "rule": str}, ...]
     """
     ns = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
     if not hasattr(table, 'rows') or not table.rows:
-        return {"headers": [], "rows": [], "merges": [], "column_widths": []}
+        return {"headers": [], "rows": [], "merges": [], "column_widths": [], "row_heights": []}
     
     # 提取所有行的单元格数据（兼容 python-docx Table 和 TableStub）
     first_row = table.rows[0]
@@ -392,6 +394,27 @@ def _extract_raw_table(table) -> dict:
                 column_widths.append(col.width)
         except Exception:
             pass
+    # 提取行高
+    row_heights = []
+    if hasattr(table, 'row_heights') and table.row_heights:
+        row_heights = list(table.row_heights)
+    else:
+        try:
+            for row in table.rows:
+                if hasattr(row, '_tr'):
+                    ns_short = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
+                    tr_pr = row._tr.find(f'{ns_short}trPr')
+                    if tr_pr is not None:
+                        tr_height = tr_pr.find(f'{ns_short}trHeight')
+                        if tr_height is not None:
+                            row_heights.append({
+                                "val": int(tr_height.get(f'{ns_short}val', 0)),
+                                "rule": tr_height.get(f'{ns_short}rule', 'atLeast'),
+                            })
+                            continue
+                row_heights.append({"val": 0, "rule": "atLeast"})
+        except Exception:
+            row_heights = []
     
     # 生成 per-cell 格式（方便前端直接渲染）
     per_cell_data = {}
@@ -449,7 +472,9 @@ def _extract_raw_table(table) -> dict:
                         r += 1
 
     # ===== 合并检测结束 =====
-        return {"headers": headers, "rows": rows, "merges": merges, "column_widths": column_widths, "per_cell": per_cell_data}
+
+    # 最终返回（无论是否有合并都要执行）
+    return {"headers": headers, "rows": rows, "merges": merges, "column_widths": column_widths, "row_heights": row_heights, "per_cell": per_cell_data}
 
 
 def _extract_table_data(table, table_type: str) -> dict:
