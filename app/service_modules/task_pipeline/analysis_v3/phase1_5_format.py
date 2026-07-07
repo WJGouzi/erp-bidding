@@ -85,8 +85,16 @@ def _find_format_chapter(sections) -> Optional[object]:
 def _extract_required_sections(section) -> List[Dict]:
     """从格式章节中提取必选文件清单。
 
+    关键改进:
+      1. 章节-内容绑定: 每个章节的 template_content **仅包含该章节直接归属**的内容块，
+         子章节的内容仅在子章节自身生成条目，不上浮到父章节。
+      2. 顺序保留: template_content 中的段落和表格严格按 Section.content 中的出场顺序排列。
+      3. 章节层级: 子章节也会作为独立条目展开到 required 列表，保持层级可追溯。
+      4. each section's own content is separately bound - tables/text don't leak across sections.
+
     Returns:
-        List[Dict]: [{"title": ..., "required": True, "has_template": False, "order": 1}]
+        List[Dict]: [{"title": ..., "required": True, "has_template": False, 
+                       "order": 1, "template_content": [...], "children": [...]}, ...]
     """
     required = []
     children = getattr(section, "children", [])
@@ -96,19 +104,18 @@ def _extract_required_sections(section) -> List[Dict]:
         if not title:
             continue
 
-        # 检查是否有模板表格
+        # 检查是否有模板表格 → 仅检查当前章节的直接内容
         has_template = False
         for block in getattr(child, "content", []):
             if getattr(block, "type", "") == "table":
                 has_template = True
                 break
-        # 递归检查子章节
+        # 递归检查子章节的模板表格（仅用于标记父章节有模板）
         if not has_template:
             for sub in getattr(child, "children", []):
-                for block in getattr(sub, "content", []):
-                    if getattr(block, "type", "") == "table":
-                        has_template = True
-                        break
+                if _check_descendant_has_template(sub, False):
+                    has_template = True
+                    break
 
         # 识别文件类型
         file_type = "unknown"
@@ -117,18 +124,22 @@ def _extract_required_sections(section) -> List[Dict]:
                 file_type = ftype
                 break
 
-        # 提取固定文本内容（即使没有表格，也要捕获内容）
+        # 提取固定文本内容
         template_texts = []
-        # 新增：有序内容列表，保留文本与表格的原始顺序
+        # 有序内容列表：仅包含当前章节直接归属的内容块
+        # 子章节的内容由子章节自己的条目管理
         template_content = []
         for block in getattr(child, "content", []):
             txt = getattr(block, "text", None)
-            if txt and txt.strip() and len(txt.strip()) >= 10:
+            if txt and txt.strip() and len(txt.strip()) >= 5:
                 template_texts.append(txt.strip())
             _type = getattr(block, "type", "") or ""
             if _type == "table":
                 _headers = getattr(block, "headers", []) or []
                 _rows = getattr(block, "rows", []) or []
+                # 跳过完全空的表
+                if not _headers and not _rows:
+                    continue
                 template_content.append({
                     "type": "table",
                     "headers": _headers,
@@ -147,62 +158,10 @@ def _extract_required_sections(section) -> List[Dict]:
                     "type": "text",
                     "text": txt.strip()[:2000],
                 })
-        # 也检查子章节的内容
-        for sub in getattr(child, "children", []):
-            for block in getattr(sub, "content", []):
-                txt = getattr(block, "text", None)
-                if txt and txt.strip() and len(txt.strip()) >= 10:
-                    template_texts.append(txt.strip())
-                _type = getattr(block, "type", "") or ""
-                if _type == "table":
-                    _headers = getattr(block, "headers", []) or []
-                    _rows = getattr(block, "rows", []) or []
-                    template_content.append({
-                        "type": "table",
-                        "headers": _headers,
-                        "rows": _rows,
-                        "merge_cells": getattr(block, "merge_cells", []),
-                        "column_widths": getattr(block, "column_widths", []),
-                        "per_cell": _build_per_cell(
-                            getattr(block, "headers", []),
-                            getattr(block, "rows", []),
-                            getattr(block, "merge_cells", []),
-                            getattr(block, "column_widths", []),
-                        ),
-                    })
-                elif txt and txt.strip() and len(txt.strip()) >= 5:
-                    template_content.append({
-                        "type": "text",
-                        "text": txt.strip()[:2000],
-                    })
 
-            # 递归处理更深层子章节的内容块
-            for grandchild in getattr(sub, "children", []):
-                for block in getattr(grandchild, "content", []):
-                    _gtype = getattr(block, "type", "") or ""
-                    if _gtype == "table":
-                        _headers = getattr(block, "headers", []) or []
-                        _rows = getattr(block, "rows", []) or []
-                        template_content.append({
-                            "type": "table",
-                            "headers": _headers,
-                            "rows": _rows,
-                            "merge_cells": getattr(block, "merge_cells", []),
-                            "column_widths": getattr(block, "column_widths", []),
-                            "per_cell": _build_per_cell(
-                                getattr(block, "headers", []),
-                                getattr(block, "rows", []),
-                                getattr(block, "merge_cells", []),
-                                getattr(block, "column_widths", []),
-                            ),
-                        })
-                    else:
-                        _gtxt = getattr(block, "text", None)
-                        if _gtxt and _gtxt.strip() and len(_gtxt.strip()) >= 5:
-                            template_content.append({
-                                "type": "text",
-                                "text": _gtxt.strip()[:2000],
-                            })
+        # 递归处理子章节：子章节的内容归属到子章节自身，不上浮到父章节
+        child_sub_entries = _extract_required_sections(child)
+
         required.append({
             "title": title,
             "order": idx + 1,
@@ -212,9 +171,41 @@ def _extract_required_sections(section) -> List[Dict]:
             "template_texts": template_texts,
             "template_content": template_content,
             "file_type": file_type,
+            "children": child_sub_entries,
         })
 
+        # 子章节作为独立条目也加入 required（保持递归展开）
+        required.extend(child_sub_entries)
+
     return required
+
+
+
+
+def _check_descendant_has_template(section, current_has_template: bool) -> bool:
+    """递归检查子章节及当前章节自身是否包含模板表格。
+
+    先检查当前章节的 content（自身表格），再递归检查子章节（后代表格）。
+    用于 _extract_required_sections 中检测父章节是否应标记 has_template=True。
+
+    Args:
+        section: 当前章节对象
+        current_has_template: 当前已确定的模板标记
+
+    Returns:
+        bool: 当前或任意子章节有模板时返回 True
+    """
+    if current_has_template:
+        return True
+    # 1. 检查当前章节自身的 content
+    for block in getattr(section, "content", []):
+        if getattr(block, "type", "") == "table":
+            return True
+    # 2. 递归检查子章节
+    for sub in getattr(section, "children", []):
+        if _check_descendant_has_template(sub, False):
+            return True
+    return False
 
 
 def _collapse_merged_columns(headers: List[str], rows: List[List[str]], cell_index: int = 0) -> tuple:
@@ -450,11 +441,17 @@ def extract_format_requirements(sections) -> Optional[Dict]:
     if any(rs["has_template"] for rs in required_sections):
         confidence = min(confidence + 0.1, 0.95)
     # 构建 section_lookup：清洗后的标题 → section dict，用于生成阶段精确匹配
+    # 递归展开所有层级的子章节，确保每个章节都能通过 section_lookup 精确命中
     section_lookup = {}
-    for rs in required_sections:
-        key = _clean_section_title(rs.get("title", ""))
-        if key:
-            section_lookup[key] = rs
+    def _build_lookup_recursive(sec_list):
+        for rs in sec_list:
+            key = _clean_section_title(rs.get("title", ""))
+            if key:
+                section_lookup[key] = rs
+            children = rs.get("children", [])
+            if children:
+                _build_lookup_recursive(children)
+    _build_lookup_recursive(required_sections)
 
 
     logger.info(

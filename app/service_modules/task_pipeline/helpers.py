@@ -1278,8 +1278,15 @@ def _build_generation_coverage_snapshot(
     chapter_map = {}
     for chapter in chapter_contents or []:
         chapter_title = (chapter.get("title") or "").strip()
-        if chapter_title:
-            chapter_map[chapter_title] = (chapter.get("content") or "").strip()
+        if not chapter_title:
+            continue
+        chapter_text = (chapter.get("content") or "").strip()
+        # 兼容 content_blocks 模式：模板章节的内容存储在 content_blocks 中，
+        # content 字段为空。只要有 content_blocks 就视为已覆盖。
+        chapter_blocks = chapter.get("content_blocks")
+        if not chapter_text and chapter_blocks:
+            chapter_text = "__CONTENT_BLOCKS_PRESENT__"
+        chapter_map[chapter_title] = chapter_text
 
     plan_lookup = {}
     for item in (generation_plan or {}).get("plan_items", []) or []:
@@ -4115,7 +4122,8 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                         _chapter_cc = _cc.get("content_blocks")
                         if _chapter_cc:
                             break
-                # 分隔页子节点：直接从 analysis_data 查找模板内容
+                # 深度后备：直接从 analysis_data 的 section_lookup 查找模板内容
+                # 用于 level >= 2 的子章节（非顶级 outline 节点，没有独立的 content_blocks）
                 if not _chapter_cc:
                     try:
                         _ad_raw3 = getattr(analysis_result, "analysis_data", None) if analysis_result else None
@@ -4124,16 +4132,15 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                             _ad3 = _json3.loads(_ad_raw3) if isinstance(_ad_raw3, str) else (_ad_raw3 or {})
                             _fmt3 = _ad3.get("format_requirements", {}) if isinstance(_ad3, dict) else {}
                             _sec_lookup3 = _fmt3.get("section_lookup", {}) if isinstance(_fmt3, dict) else {}
-                            from .template_binder import _clean_title as _fmt_clean3
-                            _clean_t3 = _fmt_clean3(title)
+                            # 使用与 section_lookup 构建时一致的 _clean_section_title
+                            from .analysis_v3.phase1_5_format import _clean_section_title as _lookup_clean3
+                            _clean_t3 = _lookup_clean3(title)
                             _sec3 = _sec_lookup3.get(_clean_t3) if isinstance(_sec_lookup3, dict) else None
                             if not _sec3:
-                                _secs3 = _fmt3.get("required_sections", []) if isinstance(_fmt3, dict) else []
-                                for _s in _secs3:
-                                    _st = _s.get("title", "").strip()
-                                    _sc = _fmt_clean3(_st)
-                                    if _clean_t3 in _sc or _sc in _clean_t3:
-                                        _sec3 = _s
+                                # 降级：尝试前缀匹配（兼容含编号前缀的标题）
+                                for _lk, _lv in _sec_lookup3.items():
+                                    if _clean_t3 in _lk or _lk in _clean_t3:
+                                        _sec3 = _lv
                                         break
                             if _sec3:
                                 _tc3 = _sec3.get("template_content", []) or _sec3.get("content_blocks", [])
@@ -4170,59 +4177,102 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                                 _r.font.size = Pt(12)
                                 _r.element.rPr.rFonts.set(qn("w:eastAsia"), "仿宋")
                         elif _block.get("type") == "table":
-                            _per_cell = _block.get("per_cell")
-                            if _per_cell:
-                                try:
-                                    from ...infrastructure.table_codec import from_dict as _tfd, write_table_from_data as _twt
-                                    _td = _tfd(_per_cell)
-                                    _twt(document, _td)
-                                except Exception as _pe:
-                                    logger.warning("[docx] per_cell 写入失败降级旧路径: %s", _pe)
-                                    _per_cell = None
-                            if not _per_cell:
-                                _headers = _block.get("headers", [])
-                                _rows = _block.get("rows", [])
-                                _merge_cells = _block.get("merge_cells", [])
-                                if _headers and _rows:
-                                    _ncols = len(_headers)
-                                    _nrows = len(_rows)
-                                    _t = document.add_table(rows=_nrows + 1, cols=_ncols)
-                                    _t.style = "Table Grid"
-                                    for _ci, _h in enumerate(_headers):
-                                        _t.rows[0].cells[_ci].text = _h
-                                    for _ri, _row in enumerate(_rows):
-                                        for _ci, _cell_text in enumerate(_row):
-                                            if _ci < _ncols:
-                                                _t.rows[_ri + 1].cells[_ci].text = _cell_text
-                                    for _mc in (_merge_cells or []):
-                                        try:
-                                            _typ = _mc.get("type", "horizontal")
-                                            _row = _mc.get("row", 0)
-                                            _col = _mc.get("col", 0)
-                                            _span = _mc.get("span", 1)
-                                            if _typ == "horizontal" and _col + _span - 1 < _ncols:
-                                                _t.rows[_row].cells[_col].merge(
-                                                    _t.rows[_row].cells[_col + _span - 1])
-                                            elif _typ == "vertical" and _row + _span - 1 < _nrows + 1:
-                                                _t.rows[_row].cells[_col].merge(
-                                                    _t.rows[_row + _span - 1].cells[_col])
-                                        except Exception as _mce:
-                                            logger.warning("[docx] ContentBlock 合并单元格失败: %s", _mce)
-                                    _column_widths = _block.get("column_widths", [])
-                                    if _column_widths:
-                                        for _ci, _w in enumerate(_column_widths):
-                                            if _ci < _ncols and _w:
-                                                try:
-                                                    for _row in _t.rows:
-                                                        _row.cells[_ci].width = _w
-                                                except Exception:
-                                                    pass
-                                    # 设置表格内文字为仿宋小四
-                                    for _t_row in _t.rows:
-                                        for _t_cell in _t_row.cells:
-                                            for _t_para in _t_cell.paragraphs:
-                                                _t_para.style = document.styles["Normal"]
-                                                for _t_run in _t_para.runs:
+                            # 始终使用 document.add_table() 在光标位置插入表格，
+                            # 不调用 write_table_from_data（它用 ET.SubElement 追加到 body 末尾）
+                            _headers = _block.get("headers", [])
+                            _rows = _block.get("rows", [])
+                            _merge_cells = _block.get("merge_cells", [])
+                            if _headers and _rows:
+                                _ncols = len(_headers)
+                                _nrows = len(_rows)
+                                _t = document.add_table(rows=_nrows + 1, cols=_ncols)
+                                _t.style = "Table Grid"
+                                for _ci, _h in enumerate(_headers):
+                                    _t.rows[0].cells[_ci].text = _h
+                                for _ri, _row in enumerate(_rows):
+                                    for _ci, _cell_text in enumerate(_row):
+                                        if _ci < _ncols:
+                                            _t.rows[_ri + 1].cells[_ci].text = _cell_text
+                                # 矩形合并法：将相同 (row,col) 的 horizontal+vertical 合并整合为单个矩形合并
+                                # 避免重叠合并导致的 "requested span not rectangular" 异常
+                                _merge_map = {}
+                                for _mc in (_merge_cells or []):
+                                    _mk = (_mc.get("row", 0), _mc.get("col", 0))
+                                    if _mk not in _merge_map:
+                                        _merge_map[_mk] = {"v_span": 1, "h_span": 1}
+                                    if _mc.get("type") == "vertical":
+                                        _merge_map[_mk]["v_span"] = max(_merge_map[_mk]["v_span"], _mc.get("span", 1))
+                                    elif _mc.get("type") == "horizontal":
+                                        _merge_map[_mk]["h_span"] = max(_merge_map[_mk]["h_span"], _mc.get("span", 1))
+                                _consumed_cells = set()
+                                for (_mrow, _mcol), _mspans in _merge_map.items():
+                                    _mvspan = _mspans["v_span"]
+                                    _mhspan = _mspans["h_span"]
+                                    if _mvspan == 1 and _mhspan == 1:
+                                        continue
+                                    _mend_row = _mrow + _mvspan - 1
+                                    _mend_col = _mcol + _mhspan - 1
+                                    if _mend_row >= _nrows + 1 or _mend_col >= _ncols:
+                                        continue
+                                    # 检查此矩形区域是否已被之前的合并消耗
+                                    _mrange = set((_mr, _mc3) for _mr in range(_mrow, _mend_row + 1) for _mc3 in range(_mcol, _mend_col + 1))
+                                    if _consumed_cells.intersection(_mrange):
+                                        _consumed_cells.update(_mrange)
+                                        continue
+                                    # 合并前清空被消耗单元格的文本，避免文本重复
+                                    for _cr in range(_mrow, _mend_row + 1):
+                                        for _cc in range(_mcol, _mend_col + 1):
+                                            if _cr == _mrow and _cc == _mcol:
+                                                continue
+                                            try:
+                                                _t.rows[_cr].cells[_cc].text = ""
+                                            except Exception:
+                                                pass
+                                    try:
+                                        _t.rows[_mrow].cells[_mcol].merge(_t.rows[_mend_row].cells[_mend_col])
+                                        _consumed_cells.update(_mrange)
+                                    except Exception as _mce:
+                                        logger.warning("[docx] ContentBlock 合并单元格失败: %s", _mce)
+                                _column_widths = _block.get("column_widths", [])
+                                if _column_widths:
+                                    for _ci, _w in enumerate(_column_widths):
+                                        if _ci < _ncols and _w:
+                                            try:
+                                                for _row in _t.rows:
+                                                    _row.cells[_ci].width = _w
+                                            except Exception:
+                                                pass
+                                    # 禁用 autoFit 并设置表格固定宽度
+                                    _valid_widths = [w for w in _column_widths if w]
+                                    if _valid_widths:
+                                        _total_w = int(sum(_valid_widths) / 635)
+                                        from docx.oxml import OxmlElement
+                                        _tbl_elem = _t._tbl
+                                        _tblPr = _tbl_elem.find(qn('w:tblPr'))
+                                        if _tblPr is None:
+                                            _tblPr = OxmlElement('w:tblPr')
+                                            _tbl_elem.insert(0, _tblPr)
+                                        # tblW = 固定宽度 (twip)
+                                        _existing_tblW = _tblPr.find(qn('w:tblW'))
+                                        if _existing_tblW is not None:
+                                            _tblPr.remove(_existing_tblW)
+                                        _tblW = OxmlElement('w:tblW')
+                                        _tblW.set(qn('w:w'), str(_total_w))
+                                        _tblW.set(qn('w:type'), 'dxa')
+                                        _tblPr.append(_tblW)
+                                        # tblLayout = fixed (禁用 autoFit)
+                                        _existing_layout = _tblPr.find(qn('w:tblLayout'))
+                                        if _existing_layout is not None:
+                                            _tblPr.remove(_existing_layout)
+                                        _tblLayout = OxmlElement('w:tblLayout')
+                                        _tblLayout.set(qn('w:type'), 'fixed')
+                                        _tblPr.append(_tblLayout)
+                                # 设置表格内文字为仿宋小四
+                                for _t_row in _t.rows:
+                                    for _t_cell in _t_row.cells:
+                                        for _t_para in _t_cell.paragraphs:
+                                            _t_para.style = document.styles["Normal"]
+                                            for _t_run in _t_para.runs:
                                                     _t_run.font.name = "仿宋"
                                                     _t_run.font.size = Pt(12)
                                                     _t_run.element.rPr.rFonts.set(qn("w:eastAsia"), "仿宋")
@@ -4409,76 +4459,143 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                 _sep_raw = None
             _render_separator_page(document, item, original_text=_sep_raw)
             document.add_page_break()
-            # 子节点以 level=1 渲染（先写入格式要求中的模板表格，再写子章节）
+            # 子节点渲染：优先使用格式要求中的模板内容（有序的段落+表格），
+            # 若有模板则直接渲染模板内容（不重复写子章节），无模板时退回到 write_outline_item
+            # 获取section_lookup（使用 _clean_section_title 保持key一致性）
+            _sec_lookup_global = {}
+            _ad_raw4 = getattr(analysis_result, "analysis_data", None) if analysis_result else None
+            if _ad_raw4:
+                try:
+                    import json as _json4
+                    _ad4 = _json4.loads(_ad_raw4) if isinstance(_ad_raw4, str) else (_ad_raw4 or {})
+                    _fmt4 = _ad4.get("format_requirements", {}) if isinstance(_ad4, dict) else {}
+                    _sec_lookup_global = _fmt4.get("section_lookup", {}) or {}
+                except Exception:
+                    _sec_lookup_global = {}
             for _child in item.get("children", []):
                 _child_title = _child.get("title", "").strip()
-                # 从 analysis_data 中获取 format_requirements（含 section_lookup 精确匹配）
-                _ad_raw2 = getattr(analysis_result, "analysis_data", None) if analysis_result else None
-                if _ad_raw2:
-                    import json as _json2
-                    try:
-                        _ad2 = _json2.loads(_ad_raw2) if isinstance(_ad_raw2, str) else (_ad_raw2 or {})
-                    except Exception:
-                        _ad2 = {}
-                    _fmt2 = _ad2.get("format_requirements", {}) if isinstance(_ad2, dict) else {}
-                    _sec_lookup2 = _fmt2.get("section_lookup", {}) if isinstance(_fmt2, dict) else {}
-                    from .template_binder import _clean_title as _fmt_clean3
-                    _child_clean2 = _fmt_clean3(_child_title)
-                    # 使用 section_lookup 精确匹配（清洗后的标题 → section dict）
-                    _sec3 = _sec_lookup2.get(_child_clean2) if isinstance(_sec_lookup2, dict) else None
-                    if not _sec3:
-                        # 降级：遍历所有 required_sections 用子串匹配（兼容旧数据不含 section_lookup）
-                        _req_secs2 = _fmt2.get("required_sections", []) if isinstance(_fmt2, dict) else []
-                        for _s in _req_secs2:
-                            _st = _s.get("title", "").strip()
-                            _sc = _fmt_clean3(_st)
-                            if _child_clean2 in _sc or _sc in _child_clean2:
-                                _sec3 = _s
-                                break
-                    if _sec3:
-                        _tc3 = _sec3.get("template_content", []) or _sec3.get("content_blocks", [])
-                        if _tc3:
-                            for _bd3 in _tc3:
-                                    if not isinstance(_bd3, dict):
-                                        continue
-                                    _bt3 = _bd3.get("type", "text")
-                                    if _bt3 == "table":
-                                        _h3 = _bd3.get("headers", [])
-                                        _r3 = _bd3.get("rows", [])
-                                        _mc3 = _bd3.get("merge_cells", [])
-                                        if _h3 and _r3:
-                                            _t3 = document.add_table(rows=len(_r3) + 1, cols=len(_h3))
-                                            _t3.style = "Table Grid"
-                                            for _ci3, _h3v in enumerate(_h3):
-                                                _t3.rows[0].cells[_ci3].text = _h3v
-                                            for _ri3, _row3 in enumerate(_r3):
-                                                for _ci3, _cell3 in enumerate(_row3):
-                                                    if _ci3 < len(_h3):
-                                                        _t3.rows[_ri3 + 1].cells[_ci3].text = _cell3
-                                            for _mc3_item in (_mc3 or []):
+                if not _child_title:
+                    continue
+                # 使用与 section_lookup 构建时一致的 _clean_section_title 清洗函数
+                from .analysis_v3.phase1_5_format import _clean_section_title as _lookup_clean
+                _child_clean2 = _lookup_clean(_child_title)
+                # 精确匹配 section_lookup（清洗后的标题 → section dict）
+                _sec3 = _sec_lookup_global.get(_child_clean2) if isinstance(_sec_lookup_global, dict) else None
+                if _sec3:
+                    _tc3 = _sec3.get("template_content", [])
+                    if _tc3:
+                        # 渲染有序的段落+表格内容
+                        for _bd3 in _tc3:
+                            if not isinstance(_bd3, dict):
+                                continue
+                            _bt3 = _bd3.get("type", "text")
+                            if _bt3 == "table":
+                                _h3 = _bd3.get("headers", [])
+                                _r3 = _bd3.get("rows", [])
+                                _mc3 = _bd3.get("merge_cells", [])
+                                _cw3 = _bd3.get("column_widths", [])
+                                if _h3 and _r3:
+                                    _t3 = document.add_table(rows=len(_r3) + 1, cols=len(_h3))
+                                    _t3.style = "Table Grid"
+                                    # 设置 tblGrid 列宽（匹配原始文档）
+                                    if _cw3:
+                                        try:
+                                            _tbl_grid3 = _t3._tbl.find(qn('w:tblGrid'))
+                                            if _tbl_grid3 is not None:
+                                                _grid_cols3 = _tbl_grid3.findall(qn('w:gridCol'))
+                                                for _gci3, _gcw3 in enumerate(_cw3):
+                                                    if _gci3 < len(_grid_cols3) and _gcw3:
+                                                        _grid_cols3[_gci3].set(qn("w:w"), str(int(_gcw3 / 635)))
+                                        except Exception:
+                                            pass
+                                    for _ci3, _h3v in enumerate(_h3):
+                                        _t3.rows[0].cells[_ci3].text = _h3v
+                                    for _ri3, _row3 in enumerate(_r3):
+                                        for _ci3, _cell3 in enumerate(_row3):
+                                            if _ci3 < len(_h3):
+                                                _t3.rows[_ri3 + 1].cells[_ci3].text = _cell3
+                                    # 矩形合并法：处理 horizontal+vertical 合并
+                                    _merge_map3 = {}
+                                    for _mc3_item in (_mc3 or []):
+                                        _mk3 = (_mc3_item.get("row", 0), _mc3_item.get("col", 0))
+                                        if _mk3 not in _merge_map3:
+                                            _merge_map3[_mk3] = {"v_span": 1, "h_span": 1}
+                                        if _mc3_item.get("type") == "vertical":
+                                            _merge_map3[_mk3]["v_span"] = max(_merge_map3[_mk3]["v_span"], _mc3_item.get("span", 1))
+                                        elif _mc3_item.get("type") == "horizontal":
+                                            _merge_map3[_mk3]["h_span"] = max(_merge_map3[_mk3]["h_span"], _mc3_item.get("span", 1))
+                                    _consumed3 = set()
+                                    for (_mr3, _mc3_pos), _ms3 in _merge_map3.items():
+                                        _mv3 = _ms3["v_span"]
+                                        _mh3 = _ms3["h_span"]
+                                        if _mv3 == 1 and _mh3 == 1:
+                                            continue
+                                        _mer3 = _mr3 + _mv3 - 1
+                                        _mec3 = _mc3_pos + _mh3 - 1
+                                        if _mer3 >= len(_r3) + 1 or _mec3 >= len(_h3):
+                                            continue
+                                        _mrange3 = set((_r, _c) for _r in range(_mr3, _mer3 + 1) for _c in range(_mc3_pos, _mec3 + 1))
+                                        if _consumed3.intersection(_mrange3):
+                                            _consumed3.update(_mrange3)
+                                            continue
+                                        # 合并前清空被消耗单元格的文本，避免文本重复
+                                        for _cr3 in range(_mr3, _mer3 + 1):
+                                            for _cc3 in range(_mc3_pos, _mec3 + 1):
+                                                if _cr3 == _mr3 and _cc3 == _mc3_pos:
+                                                    continue
                                                 try:
-                                                    _mc3_t = _mc3_item.get("type", "horizontal")
-                                                    _mc3_r = _mc3_item.get("row", 0)
-                                                    _mc3_c = _mc3_item.get("col", 0)
-                                                    _mc3_s = _mc3_item.get("span", 1)
-                                                    if _mc3_t == "horizontal" and _mc3_c + _mc3_s - 1 < len(_h3):
-                                                        _t3.rows[_mc3_r].cells[_mc3_c].merge(_t3.rows[_mc3_r].cells[_mc3_c + _mc3_s - 1])
+                                                    _t3.rows[_cr3].cells[_cc3].text = ""
                                                 except Exception:
                                                     pass
-                                            for _row3 in _t3.rows:
-                                                for _cell3 in _row3.cells:
-                                                    for _para3 in _cell3.paragraphs:
-                                                        for _run3 in _para3.runs:
-                                                            _run3.font.name = "仿宋"
-                                                            _run3.font.size = Pt(12)
-                                                            _run3.element.rPr.rFonts.set(qn("w:eastAsia"), "仿宋")
-                                    elif _bt3 in ("text", "paragraph"):
-                                        _p3 = document.add_paragraph(_bd3.get("text", ""))
-                                        _p3.style = document.styles["Normal"]
-                                        for _r3 in _p3.runs:
-                                            _r3.font.name = "仿宋"
-                                            _r3.font.size = Pt(12)
-                                            _r3.element.rPr.rFonts.set(qn("w:eastAsia"), "仿宋")
+                                        try:
+                                            _t3.rows[_mr3].cells[_mc3_pos].merge(_t3.rows[_mer3].cells[_mec3])
+                                            _consumed3.update(_mrange3)
+                                        except Exception:
+                                            pass
+                                    for _row3 in _t3.rows:
+                                        for _cell3 in _row3.cells:
+                                            for _para3 in _cell3.paragraphs:
+                                                for _run3 in _para3.runs:
+                                                    _run3.font.name = "仿宋"
+                                                    _run3.font.size = Pt(12)
+                                                    _run3.element.rPr.rFonts.set(qn("w:eastAsia"), "仿宋")
+                                    # 禁用 autoFit 并设置表格固定宽度
+                                    if _cw3:
+                                        _valid_widths3 = [w for w in _cw3 if w]
+                                        if _valid_widths3:
+                                            try:
+                                                _total_w3 = int(sum(_valid_widths3) / 635)
+                                                _tblPr3 = _t3._tbl.find(qn('w:tblPr'))
+                                                if _tblPr3 is None:
+                                                    _tblPr3 = OxmlElement('w:tblPr')
+                                                    _t3._tbl.insert(0, _tblPr3)
+                                                _existing_tblW3 = _tblPr3.find(qn('w:tblW'))
+                                                if _existing_tblW3 is not None:
+                                                    _tblPr3.remove(_existing_tblW3)
+                                                _tblW3 = OxmlElement('w:tblW')
+                                                _tblW3.set(qn('w:w'), str(_total_w3))
+                                                _tblW3.set(qn('w:type'), 'dxa')
+                                                _tblPr3.append(_tblW3)
+                                                _existing_layout3 = _tblPr3.find(qn('w:tblLayout'))
+                                                if _existing_layout3 is not None:
+                                                    _tblPr3.remove(_existing_layout3)
+                                                _tblLayout3 = OxmlElement('w:tblLayout')
+                                                _tblLayout3.set(qn('w:type'), 'fixed')
+                                                _tblPr3.append(_tblLayout3)
+                                            except Exception:
+                                                pass
+                            elif _bt3 in ("text", "paragraph"):
+                                _p3 = document.add_paragraph(_bd3.get("text", ""))
+                                _p3.style = document.styles["Normal"]
+                                for _r3 in _p3.runs:
+                                    _r3.font.name = "仿宋"
+                                    _r3.font.size = Pt(12)
+                                    _r3.element.rPr.rFonts.set(qn("w:eastAsia"), "仿宋")
+                        # 模板内容已渲染，跳过子章节的 _write_outline_item 调用
+                        # 避免模板内容被重复渲染（content_blocks 中的同份模板会导致重复）
+                        document.add_page_break()
+                        continue
+                # 无模板内容：回退到 write_outline_item
                 _write_outline_item(_child, level=1)
                 document.add_page_break()
             continue

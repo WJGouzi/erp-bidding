@@ -567,16 +567,40 @@ class DocumentParser:
                                 _current_section_for_table = _sec
                                 break
                     # 更新章节的最后元素索引（段落已在第1遍加入 content，需追踪其在 content 中的位置）
+                    # 注意：仅计数实际产生 ContentBlock 的段落（非 heading、非空段）
+                    # heading 段落和空段在 Pass 1 中不会添加到 section.content，因此不应影响 _insert_pos
                     if _current_section_for_table:
-                        _deep = _current_section_for_table
-                        while _deep and _deep.children:
-                            _deep = _deep.children[-1]
-                        if _deep:
-                            _sec_key = id(_deep)
-                            # 段落已在 content 中，需找到其当前位置
-                            # 但由于表格可能已插入，段落索引会偏移，用 _last_appended_count 追踪
-                            _cur = _element_last_pos.get(_sec_key, -1)
-                            _element_last_pos[_sec_key] = _cur + 1
+                        # 判断此段落是否会产生 ContentBlock
+                        _is_content_paragraph = True
+                        _para_texts = [t.text for t in child.findall('.//{http://schemas.openxmlformats.org/wordprocessingml/2006/main}t') if t.text]
+                        _para_text = ''.join(_para_texts).strip()
+                        # 空段不产生 ContentBlock
+                        if not _para_text:
+                            _is_content_paragraph = False
+                        else:
+                            # style 标题不产生 ContentBlock
+                            _pPr = child.find('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}pPr')
+                            if _pPr is not None:
+                                _pStyle = _pPr.find('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}pStyle')
+                                if _pStyle is not None:
+                                    _pStyle_val = _pStyle.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}val', '')
+                                    if _pStyle_val in heading_map:
+                                        _is_content_paragraph = False
+                            # 文本模式标题不产生 ContentBlock
+                            if _is_content_paragraph:
+                                _stripped = strip_heading_prefix(_para_text) if _para_text else _para_text
+                                for _tl, _tp in text_heading_patterns:
+                                    if re.match(_tp, _stripped):
+                                        _is_content_paragraph = False
+                                        break
+                        if _is_content_paragraph:
+                            _deep = _current_section_for_table
+                            while _deep and _deep.children:
+                                _deep = _deep.children[-1]
+                            if _deep:
+                                _sec_key = id(_deep)
+                                _cur = _element_last_pos.get(_sec_key, -1)
+                                _element_last_pos[_sec_key] = _cur + 1
                     _para_counter += 1
                 elif tag == "tbl":
                     if _table_counter < len(document.tables):
