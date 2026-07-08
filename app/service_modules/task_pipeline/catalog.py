@@ -102,13 +102,14 @@ def _parse_format_tree(required_sections):
     def _build_node(item, children=None):
         title = item.get("title", "")
         p_texts = item.get("template_texts", [])
+        is_cover = item.get("is_cover", False) or "封面" in title or "封皮" in title
         return {
             "source": "format_requirements",
             "title": title,
             "has_template": item.get("has_template", False),
             "children": children if children is not None else [],
             "description": p_texts[0] if p_texts else "",
-            "is_cover": "封面" in title or "封皮" in title,
+            "is_cover": is_cover,
         }
 
     tree = []
@@ -123,6 +124,10 @@ def _parse_format_tree(required_sections):
                 # 紧跟在封面之后的非编号项 → 合并到封面（封面内页）
                 if tree and tree[-1].get("is_cover") and not node.get("is_cover"):
                     tree[-1].setdefault("template_texts", []).extend(node.get("template_texts", []))
+                    # 携带 template_content
+                    _item_tc = node.get("template_content", [])
+                    if _item_tc:
+                        tree[-1].setdefault("template_content", []).extend(_item_tc)
                     # 把内页标题也记入封面模板文本
                     cover_title = tree[-1].get("title", "")
                     inner_title = node.get("title", "")
@@ -138,7 +143,9 @@ def _parse_format_tree(required_sections):
         children = [c for c in required_sections[p_idx + 1:next_p]
                     if not _score_keywords.search(c.get("title", ""))]
         tree.append(_build_node(parent, [
-            {"source": "format_requirements", "title": c.get("title", "")}
+            {"source": "format_requirements", "title": c.get("title", ""),
+             "template_texts": c.get("template_texts", []),
+             "template_content": c.get("template_content", [])}
             for c in children
         ]))
         processed_up_to = p_idx + 1
@@ -151,6 +158,10 @@ def _parse_format_tree(required_sections):
             # 紧跟在封面之后的非编号项 → 合并到封面
             if tree and tree[-1].get("is_cover") and not node.get("is_cover"):
                 tree[-1].setdefault("template_texts", []).extend(node.get("template_texts", []))
+                # 携带 template_content
+                _item_tc = node.get("template_content", [])
+                if _item_tc:
+                    tree[-1].setdefault("template_content", []).extend(_item_tc)
                 inner_title = node.get("title", "")
                 if inner_title and inner_title not in tree[-1].get("title", ""):
                     tree[-1].setdefault("template_texts", []).insert(0, inner_title)
@@ -605,51 +616,8 @@ def enrich_section_details(skeleton, analysis_data, classified_items):
     if technical_items or packages:
         _fill_tech_description(skeleton, technical_items, packages)
     
-    # 3.3 资格项填充：如果骨架无资格节点但文档有资格章节+资格项，新增
+    # 3.3 资格项填充
     _fill_qualification(skeleton, classified_items)
-    qual_items = classified_items.get("qualification", [])
-    chapters = analysis_data.get("document_chapters", [])
-    has_qual_node = any("资格" in n.get("title", "") for n in skeleton)
-    if qual_items and not has_qual_node:
-        # 插入资格节点（比选函之后，即 index 1）
-        import re as _re2
-
-        def _gv(item, key):
-            if isinstance(item, dict):
-                return item.get(key, "") or ""
-            _m = {"requirement": "check_label", "material": "check_value",
-                  "check_label": "check_label", "check_value": "check_value"}
-            return getattr(item, _m.get(key, key), "") or ""
-
-        def _strip_num_prefix(text):
-            t = text.strip()
-            t = _re2.sub(r'^[\d一二三四五六七八九十]+[、\.．）\)\s]*', '', t)
-            t = _re2.sub(r'^[（(][\d一二三四五六七八九十]+[）)]\s*', '', t)
-            return t[:60]
-
-        # 去重后再插入
-        _seen_titles = set()
-        _deduped_qual = []
-        for item in qual_items:
-            _t = _strip_num_prefix(_gv(item, "requirement") or _gv(item, "check_label"))
-            if _t not in _seen_titles:
-                _seen_titles.add(_t)
-                _deduped_qual.append(item)
-        skeleton.insert(1, {
-            "source": "qualification",
-            "title": "资格证明文件",
-            "description": "根据招标文件要求提供以下资格证明材料",
-            "children": [
-                {
-                    "source": "qualification",
-                    "title": _refine_qual_title(_gv(item, "requirement") or _gv(item, "check_label")),
-                    "description": (_gv(item, "material") or "")[:100],
-                }
-                for item in _deduped_qual
-            ],
-        })
-
-    # 3.4 实质性要求填充
     _fill_compliance(skeleton, classified_items)
 
 def validate_completeness(outline, document_chapters):

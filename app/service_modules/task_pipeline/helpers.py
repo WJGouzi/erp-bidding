@@ -3719,57 +3719,113 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
         return sections
 
         # ========== 第二页封面（优先使用招标文件封面模板） ==========
-    _cover_analysis_data = None
-    _cover_fmt = {}
-    if analysis_result:
-        try:
-            _ad = analysis_result.safe_analysis_data()
-            if isinstance(_ad, dict):
-                _cover_fmt = _ad.get("format_requirements", {}) or {}
-        except Exception:
-            _cover_fmt = {}
-    
-    _cover_template_found = False
     # 从 outline 中找 is_cover=True 的节点，渲染其封面内容
+    # outline 节点现在自带 template_content（含 font 信息和占位符标记）
     _cover_outline_items = [item for item in outline if item.get("is_cover")]
-    if _cover_outline_items and _cover_fmt and isinstance(_cover_fmt, dict):
-        _cover_sections = _cover_fmt.get("required_sections", [])
-        for _cover_item in _cover_outline_items:
-            _cover_title = _cover_item.get("title", "").strip()
-            # 在 format_requirements 中找匹配章节
-            for _sec in _cover_sections:
-                _sec_title = _sec.get("title", "").strip()
-                if _cover_title == _sec_title or _cover_title in _sec_title or _sec_title in _cover_title:
-                    _cover_blocks = _sec.get("template_content", []) or _sec.get("content_blocks", [])
-                    if _cover_blocks:
-                        for _blk in _cover_blocks:
-                            if _blk.get("type") in ("paragraph", "text"):
-                                _text = _blk.get("text", "")
-                                _text = _text.replace("XXX（单位名称）", company_name or "XXX")
-                                _text = _text.replace("XXX", company_name or "XXX")
-                                _text = _text.replace("（项目名称）", cover_item_name or "（项目名称）")
-                                _text = _text.replace("（项目编号）", cover_project_no or "（项目编号）")
-                                _p = document.add_paragraph()
-                                _p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                                _r = _p.add_run(_text)
-                                _r.font.name = "宋体"
-                                _r.font.size = Pt(16)
-                                _r.element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
-                            elif _blk.get("type") == "table":
-                                _headers = _blk.get("headers", [])
-                                _rows = _blk.get("rows", [])
-                                if _headers and _rows:
-                                    _t = document.add_table(rows=len(_rows), cols=len(_headers))
-                                    _t.style = "Table Grid"
-                                    _apply_black_solid_borders(_t)
-                                    for _ci, _h in enumerate(_headers):
-                                        _t.rows[0].cells[_ci].text = _h
-                                    for _ri, _row in enumerate(_rows):
-                                        for _ci, _cell in enumerate(_row):
-                                            _filled = _cell.replace("XXX", company_name or "") if _ci == 0 else _cell
-                                            _t.rows[_ri].cells[_ci].text = _filled
-                        _cover_template_found = True
-                        break
+    _cover_template_found = False
+    
+    # ====== 占位符填充辅助函数 ======
+    def _fill_placeholder_text(text):
+        """对封面文本进行占位符填充。"""
+        # 仅第一个封面做全文替换，后续封面只替换可识别的占位符
+        result = text
+        # 常见占位符替换（按优先级）
+        result = result.replace("XXX（单位名称）", company_name or "XXX（单位名称）")
+        result = result.replace("XXX", company_name or "XXX")
+        result = result.replace("（项目名称）", cover_item_name or "（项目名称）")
+        result = result.replace("（项目编号）", cover_project_no or "（项目编号）")
+        result = result.replace("采购项目名称:#", "")
+        return result
+    
+    def _is_empty_or_placeholder(text):
+        """判断文本是否为空或纯占位符。"""
+        if not text or not text.strip():
+            return True
+        if re.fullmatch(r'[_\s]{2,}', text.strip()):
+            return True
+        if re.fullmatch(r'[xX]{2,}', text.strip()):
+            return True
+        return False
+    
+    for _cover_idx, _cover_item in enumerate(_cover_outline_items):
+        _cover_blocks = _cover_item.get("template_content", [])
+        _is_first_cover = (_cover_idx == 0)
+        
+        if _cover_blocks:
+            for _blk in _cover_blocks:
+                if _blk.get("type") in ("paragraph", "text"):
+                    _text = _blk.get("text", "") or ""
+                    _font = _blk.get("font", {}) or {}
+                    _is_placeholder = _blk.get("placeholder", False)
+                    _fill_mode = _blk.get("fill_mode", "")
+                    
+                    # 处理占位符填充
+                    if _is_placeholder:
+                        if _fill_mode == "replace":
+                            # 纯占位符 → 尝试用上下文填充
+                            _filled = _fill_placeholder_text(_text)
+                            if _filled == _text and _is_empty_or_placeholder(_text):
+                                # 找不到内容，保留原样（留空）
+                                pass
+                            else:
+                                _text = _filled
+                        elif _fill_mode == "partial":
+                            # 混合型 → 仅替换占位符部分
+                            _text = _fill_placeholder_text(_text)
+                        else:
+                            # 普通占位符 → 尝试填充
+                            _text = _fill_placeholder_text(_text)
+                    
+                    _p = document.add_paragraph()
+                    # 应用对齐方式
+                    _alignment = _font.get("alignment", "")
+                    if _alignment == "center":
+                        _p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    elif _alignment == "right":
+                        _p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+                    elif _alignment == "left":
+                        _p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                    else:
+                        _p.alignment = WD_ALIGN_PARAGRAPH.CENTER  # 封面默认居中
+                    
+                    _r = _p.add_run(_text)
+                    # 应用字体信息
+                    _font_name = _font.get("font_name", "") or "宋体"
+                    _font_size = _font.get("font_size", 16.0)
+                    _font_bold = _font.get("bold", False)
+                    try:
+                        _r.font.name = _font_name
+                        _r.font.size = Pt(_font_size)
+                    except Exception:
+                        _r.font.name = "宋体"
+                        _r.font.size = Pt(16)
+                    if _font_bold:
+                        _r.bold = True
+                    try:
+                        _r.element.rPr.rFonts.set(qn("w:eastAsia"), _font_name or "宋体")
+                    except Exception:
+                        pass
+                        
+                elif _blk.get("type") == "table":
+                    _headers = _blk.get("headers", [])
+                    _rows = _blk.get("rows", [])
+                    if _headers and _rows:
+                        _t = document.add_table(rows=len(_rows), cols=len(_headers))
+                        _t.style = "Table Grid"
+                        _apply_black_solid_borders(_t)
+                        for _ci, _h in enumerate(_headers):
+                            _t.rows[0].cells[_ci].text = _h
+                        for _ri, _row in enumerate(_rows):
+                            for _ci, _cell in enumerate(_row):
+                                if _is_first_cover:
+                                    _filled = _fill_placeholder_text(_cell)
+                                else:
+                                    _filled = _cell.replace("XXX", company_name or "") if _ci == 0 else _cell
+                                _t.rows[_ri].cells[_ci].text = _filled
+            _cover_template_found = True
+        else:
+            # outline 节点有 is_cover 但无 template_content → 降级到自生成
+            _cover_template_found = False
     
     if not _cover_template_found:
         # 自有封面模板
@@ -4137,6 +4193,7 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
         item["_chapter_idx"] = idx
 
     # ========== 构建封面标题集合（封面已单独渲染） ==========
+    _cover_fmt = analysis_context.get("_format_requirements", {}) if isinstance(analysis_context, dict) else {}
     _cover_titles = set()
     for _sec in _cover_fmt.get("required_sections", []):
         _t = _sec.get("title", "").strip()

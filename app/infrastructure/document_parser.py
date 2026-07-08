@@ -346,6 +346,11 @@ class ContentBlock:
         # 表格专用字段
         self.row_heights = []
         self.per_cell_data = None  # 唯一存储：per_cell 模型数据
+        # 字体元数据（封面渲染用）
+        self.font_name = ""         # 字体名称，如"宋体""黑体"
+        self.font_size = None       # 字号（Pt），如 16.0
+        self.bold = False           # 是否加粗
+        self.alignment = None       # 对齐方式: left/center/right
 
     # -----------------------------------------------------------
     #  Stage 2: aggregated column widths / merge_map / cell bounds
@@ -501,6 +506,15 @@ class ContentBlock:
             d["text"] = self.text
             if self.level:
                 d["level"] = self.level
+            # 字体元数据
+            if self.font_name:
+                d["font_name"] = self.font_name
+            if self.font_size is not None:
+                d["font_size"] = self.font_size
+            if self.bold:
+                d["bold"] = True
+            if self.alignment:
+                d["alignment"] = self.alignment
         elif self.type == self.TYPE_TABLE:
             d["row_heights"] = self.row_heights
             d["headers"] = self.headers
@@ -514,6 +528,10 @@ class ContentBlock:
     @classmethod
     def from_dict(cls, data: dict) -> "ContentBlock":
         cb = cls(data.get("type", "paragraph"), data.get("text", ""), data.get("level", 0))
+        cb.font_name = data.get("font_name", "") or ""
+        cb.font_size = data.get("font_size")
+        cb.bold = data.get("bold", False) or False
+        cb.alignment = data.get("alignment") or None
         cb.row_heights = data.get("row_heights", [])
         # 优先从 per_cell_data 还原，降级到旧字段
         pcd = data.get("per_cell_data")
@@ -765,7 +783,48 @@ class DocumentParser:
                         stack.append(_new_sec)
                         current_section = _new_sec
                     else:
+                        # 提取字体元数据（封面渲染用）
+                        _font_name = ""
+                        _font_size = None
+                        _bold = False
+                        _alignment = None
+                        try:
+                            for _r in para.runs:
+                                if not _font_name:
+                                    try:
+                                        _fn = getattr(_r.font, "name", None) or ""
+                                        if _fn:
+                                            _font_name = _fn
+                                    except Exception:
+                                        pass
+                                if _font_size is None:
+                                    try:
+                                        _fs = getattr(_r.font, "size", None)
+                                        if _fs:
+                                            _font_size = _fs / 12700.0  # EMU → Pt
+                                    except Exception:
+                                        pass
+                                if not _bold:
+                                    try:
+                                        if getattr(_r, "bold", None):
+                                            _bold = True
+                                    except Exception:
+                                        pass
+                            # 段落对齐方式
+                            _pPr = para._p.find('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}pPr') if hasattr(para, '_p') else None
+                            if _pPr is not None:
+                                _jc = _pPr.find('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}jc')
+                                if _jc is not None:
+                                    _jc_val = _jc.get('{http://schemas.openxmlformats.org/wordprocessingml/2006/main}val', '')
+                                    if _jc_val:
+                                        _alignment = _jc_val
+                        except Exception:
+                            pass
                         block = ContentBlock(ContentBlock.TYPE_PARAGRAPH, text)
+                        block.font_name = _font_name
+                        block.font_size = _font_size
+                        block.bold = _bold
+                        block.alignment = _alignment
                         # 尝试判断列表
                         num_prefix = re.match(r'^[\d一二三四五六七八九十]+[、.．\s]', text)
                         bullet_prefix = re.match(r'^[-•●○■\s]', text)

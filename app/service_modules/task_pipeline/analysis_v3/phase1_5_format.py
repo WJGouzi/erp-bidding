@@ -298,6 +298,263 @@ def _clean_section_title(title: str) -> str:
     return t
 
 
+
+
+# ═══════════════════════════════════════════════════════════════
+#  封面检测与合并逻辑
+# ═══════════════════════════════════════════════════════════════
+
+# 说明性关键词 — 标题含"封面"但内容为"应包含…"等说明句式时，不标封面
+_COVER_EXPLANATORY_KEYWORDS = [
+    "应包含", "须体现", "应当", "应包括", "必须", "需包含", "要求", "说明",
+    "需要", "建议", "请将", "请使用",
+]
+# 占位符模式
+_PLACEHOLDER_PATTERNS = re.compile(r'_+|XXX+|xx+')
+# 标签式结束符模式
+_LABEL_END_PATTERNS = re.compile(r'[：:：]$')
+# 疑似封面的特征段落（无编号+短文本+居中）
+_COVER_BODY_KEYWORDS = re.compile(
+    r'投标[文件函]|响应文件|资格性|资\s*格\s*性|其\s*他\s*响\s*应|采购项目|项目名称|'
+    r'投标单位|法定代表|投标日期|文件编号|采购编号'
+)
+
+
+def _is_template_style_content(template_content: List[Dict]) -> bool:
+    """判断 template_content 是否是封面模板样式（而非说明性内容）。
+
+    封面模板特征：
+    - 内容块少（通常 ≤20 块）
+    - 占位符密度高（___ / XXX）
+    - 标签式短句多（"项目名称："、"编号："）
+    - 无说明性句式（"应包含"、"须体现"）
+    - 没有长段落（每条 < 100 字）
+    - 无复杂层级
+
+    说明性内容特征：
+    - 含"应包含"、"须体现"、"应当"等祈使关键词
+    - 整段长文字（≥ 100 字）
+    - 无占位符
+    - 有条理的多段说明
+    """
+    if not template_content:
+        return False
+
+    total_text = ""
+    placeholder_count = 0
+    label_count = 0
+    long_paragraph_count = 0
+    explanatory_count = 0
+
+    for block in template_content:
+        if block.get("type") != "text":
+            continue
+        text = block.get("text", "") or ""
+        total_text += text
+
+        # 检查占位符
+        if _PLACEHOLDER_PATTERNS.search(text):
+            placeholder_count += 1
+
+        # 检查标签式结束（"项目名称："、"编号："）
+        if _LABEL_END_PATTERNS.search(text) and len(text) <= 30:
+            label_count += 1
+
+        # 检查说明性关键词
+        for kw in _COVER_EXPLANATORY_KEYWORDS:
+            if kw in text:
+                explanatory_count += 1
+                break
+
+        # 长段落
+        if len(text) >= 100:
+            long_paragraph_count += 1
+
+    # 全是空或极少内容
+    if not total_text.strip():
+        return False
+
+    # 说明性 → 不是封面
+    if explanatory_count > 0 and label_count == 0:
+        return False
+
+    # 无标签且多为长段落 → 说明性
+    if label_count == 0 and long_paragraph_count >= 2:
+        return False
+
+    # 有标签或有占位符 → 模板式
+    if label_count > 0 or placeholder_count > 0:
+        return True
+
+    # 混合情况：短内容（≤200字）+ 无说明关键词 → 可能是简单封面
+    if len(total_text.strip()) <= 200 and explanatory_count == 0:
+        return True
+
+    return False
+
+
+def _get_content_block_font_info(section_obj) -> List[Dict]:
+    """从原始 Section 的 ContentBlock 中提取 font 信息。
+    
+    返回与 template_content 平行的 font 信息列表（按 content 顺序）。
+    """
+    font_info_list = []
+    for block in getattr(section_obj, "content", []):
+        info = {}
+        try:
+            fn = getattr(block, "font_name", "") or ""
+            if fn:
+                info["font_name"] = fn
+            fs = getattr(block, "font_size", None)
+            if fs is not None:
+                info["font_size"] = fs
+            bd = getattr(block, "bold", False)
+            if bd:
+                info["bold"] = True
+            al = getattr(block, "alignment", None)
+            if al:
+                info["alignment"] = al
+        except Exception:
+            pass
+        font_info_list.append(info)
+    return font_info_list
+
+
+def _inject_font_into_template_content(template_content: List[Dict],
+                                        font_info_list: List[Dict]) -> None:
+    """将 font 信息注入 template_content 的每个块（覆盖检测阶段用）。"""
+    for tb, fi in zip(template_content, font_info_list):
+        if fi and tb.get("type") == "text":
+            tb["font"] = fi
+
+
+def _detect_placeholder(template_content: List[Dict]) -> None:
+    """检测 template_content 中的占位符并标记。
+    
+    占位符模式：
+    - 纯下划线: "____" / "___________" 等（长度≥2）
+    - XXX 占位符: "XXX" / "XXX（单位名称）" 
+    - 空字符串: ""（如果紧跟在标签后面）
+    - 混合型: "投标单位（盖章）：XXX" 中的 XXX 部分
+    """
+    for block in template_content:
+        if block.get("type") != "text":
+            continue
+        text = block.get("text", "") or ""
+        if not text.strip():
+            # 空字符串 → 设为 placeholder
+            block["placeholder"] = True
+            continue
+        # 纯下划线占位符
+        if re.fullmatch(r'_{2,}', text.strip()):
+            block["placeholder"] = True
+            block["fill_mode"] = "replace"
+            continue
+        # 纯 XXX
+        if re.fullmatch(r'[xX]{2,}', text.strip()):
+            block["placeholder"] = True
+            block["fill_mode"] = "replace"
+            continue
+        # 混合型: 文本中含 XXX 或下划线，需要部分替换
+        if _PLACEHOLDER_PATTERNS.search(text):
+            block["placeholder"] = True
+            block["fill_mode"] = "partial"
+            continue
+        # 默认：不是占位符
+        block["placeholder"] = False
+
+
+def _is_same_page(sec_a_raw, sec_b_raw) -> bool:
+    """判断两个原始 Section 是否在同一页。"""
+    pr_a = getattr(sec_a_raw, "page_range", []) or []
+    pr_b = getattr(sec_b_raw, "page_range", []) or []
+    if not pr_a or not pr_b:
+        # 无 page_range 时，保守假设为同页（仅靠相邻关系）
+        return True
+    # 有重叠即视为同页
+    a_start, a_end = pr_a[0], pr_a[-1] if len(pr_a) >= 2 else pr_a[0]
+    b_start, b_end = pr_b[0], pr_b[-1] if len(pr_b) >= 2 else pr_b[0]
+    return not (a_end < b_start or b_end < a_start)
+
+
+def _merge_cover_sections(required: List[Dict],
+                           raw_section_map: Dict[str, object]) -> List[Dict]:
+    """封面检测与合并后处理。
+
+    遍历 required_sections 列表，检测封面指示器/封面主体，
+    执行合并和标记，同时从原始 Section 注入 font 信息。
+    """
+    if not required:
+        return required
+
+    result = []
+    skip_until = -1
+
+    for i, sec in enumerate(required):
+        if i < skip_until:
+            continue
+
+        title = sec.get("title", "") or ""
+        has_cover_kw = "封面" in title or "封皮" in title
+        tc = sec.get("template_content", []) or []
+
+        if not has_cover_kw:
+            result.append(sec)
+            continue
+
+        # ===== 标题含"封面/封皮" → 进入判定 =====
+        if tc:
+            # 有内容 → 判定是封面模板还是封面说明
+            if _is_template_style_content(tc):
+                # 情形 B: 封面主体（标题含封面 + 内容为模板）
+                sec["is_cover"] = True
+                _detect_placeholder(tc)
+                # 从原始 section 注入 font
+                raw = raw_section_map.get(title)
+                if raw:
+                    fi = _get_content_block_font_info(raw)
+                    _inject_font_into_template_content(tc, fi)
+                result.append(sec)
+            else:
+                # 情形: 封面说明（"封面应包含…"）→ 不标封面
+                sec.pop("is_cover", None)
+                result.append(sec)
+        else:
+            # 情形 A: 内容为空 → 封面指示器
+            # 看下一个 section
+            merged = False
+            if i + 1 < len(required):
+                next_sec = required[i + 1]
+                next_title = next_sec.get("title", "") or ""
+                next_tc = next_sec.get("template_content", []) or []
+                next_raw = raw_section_map.get(next_title)
+
+                # 检查同页
+                raw_cur = raw_section_map.get(title)
+                if raw_cur and next_raw:
+                    same_page = _is_same_page(raw_cur, next_raw)
+                else:
+                    same_page = True  # 无 page_range 时保守假设同页
+
+                if same_page and _is_template_style_content(next_tc):
+                    # 合并: 用下个 section 的内容，标记 is_cover
+                    merged_sec = dict(next_sec)
+                    merged_sec["is_cover"] = True
+                    merged_sec["order"] = sec.get("order")
+                    # 注入 font
+                    if next_raw:
+                        fi = _get_content_block_font_info(next_raw)
+                        _inject_font_into_template_content(
+                            merged_sec.get("template_content", []), fi)
+                    _detect_placeholder(merged_sec.get("template_content", []))
+                    result.append(merged_sec)
+                    skip_until = i + 2
+                    merged = True
+
+            if not merged:
+                result.append(sec)
+
+    return result
 def extract_format_requirements(sections) -> Optional[Dict]:
     """从文档章节树中提取格式要求。
 
@@ -324,6 +581,21 @@ def extract_format_requirements(sections) -> Optional[Dict]:
     if not required_sections:
         logger.info("[phase1.5] 格式章节 '%s' 无子章节", chapter_title)
         return None
+
+    # ===== 封面检测与合并（在 required_sections 上后处理） =====
+    # 构建原始 Section 的标题映射（用于 page_range 和 font 信息）
+    raw_section_map = {}
+    for _child in getattr(chapter, "children", []):
+        _ct = getattr(_child, "title", "") or ""
+        if _ct:
+            raw_section_map[_ct] = _child
+        # 子章节也加入映射
+        for _sub in getattr(_child, "children", []):
+            _st = getattr(_sub, "title", "") or ""
+            if _st and _st not in raw_section_map:
+                raw_section_map[_st] = _sub
+
+    required_sections = _merge_cover_sections(required_sections, raw_section_map)
 
     # 收集固定文本
     fixed_texts = _extract_fixed_texts(chapter)
@@ -354,15 +626,11 @@ def extract_format_requirements(sections) -> Optional[Dict]:
         chapter_title, len(required_sections), _total_tables, len(fixed_texts), confidence,
     )
 
-    # 检测封面页
-    cover_pages = _detect_cover_sections(sections)
-
     return {
         "chapter_title": chapter_title,
         "required_sections": required_sections,
         "section_lookup": section_lookup,
 
         "fixed_texts": fixed_texts,
-        "cover_pages": cover_pages,
         "confidence": confidence,
     }
