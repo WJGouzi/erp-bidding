@@ -124,7 +124,28 @@ def to_dict(td: TableData) -> dict:
             }
             for row in td.rows
         ],
+        "merge_cells": _rebuild_merge_cells(td),
     }
+
+
+def _rebuild_merge_cells(td):
+    """从 TableData.rows 重建 merge_cells 列表。"""
+    _mc = []
+    ncols = td.col_count()
+    for ri, row in enumerate(td.rows):
+        ci = 0
+        cells_list = row.cells if hasattr(row, 'cells') else []
+        while ci < ncols:
+            cell = cells_list[ci] if ci < len(cells_list) else __import__('app.infrastructure.table_codec', fromlist=['TableCell']).TableCell()
+            if cell.hidden:
+                ci += 1
+                continue
+            if cell.col_span > 1:
+                _mc.append({"type": "horizontal", "row": ri, "col": ci, "span": cell.col_span})
+            if cell.row_span > 1:
+                _mc.append({"type": "vertical", "row": ri, "col": ci, "span": cell.row_span})
+            ci += cell.col_span
+    return _mc
 
 
 def from_dict(d: dict) -> TableData:
@@ -299,12 +320,13 @@ def _build_merge_key(merges: List[dict], row: int, col: int) -> Optional[dict]:
     return None
 
 
-def write_table_from_data(doc, table_data: TableData) -> None:
+def write_table_from_data(doc, table_data: TableData, insert_after=None):
     """将 TableData 写入 python-docx Document 的 XML 层。
 
     Args:
         doc: python-docx Document
         table_data: Per-Cell 表格数据
+        insert_after: 可选，在此 XML 元素之后插入表格。未提供时追加到 body 末尾。
     """
     ncols = table_data.col_count()
     if ncols <= 0:
@@ -321,8 +343,24 @@ def write_table_from_data(doc, table_data: TableData) -> None:
 
     _ns = NS
 
+    # 验证 insert_after 是 body 的直接子代，否则回溯到最近的 body 子代
+    _body = doc.element.body
+    if insert_after is not None:
+        _parent = insert_after.getparent() if hasattr(insert_after, 'getparent') else None
+        while _parent is not None and _parent is not _body:
+            insert_after = _parent
+            _parent = insert_after.getparent()
+        # 如果 insert_after 不是 body 子代或其本身为 None，回退到 append
+        if _parent is not _body or insert_after is None:
+            insert_after = None
+
     # 创建表格 XML 根
-    tbl = ET.SubElement(doc.element.body, _ns + 'tbl')
+    if insert_after is not None:
+        tbl = ET.SubElement(doc.element.body, _ns + 'tbl')
+        # 将 tbl 移动到 insert_after 之后
+        insert_after.addnext(tbl)
+    else:
+        tbl = ET.SubElement(doc.element.body, _ns + 'tbl')
 
     # tblPr
     tblPr = ET.SubElement(tbl, _ns + 'tblPr')
@@ -453,6 +491,9 @@ def write_table_from_data(doc, table_data: TableData) -> None:
                 t_elem.set('{http://www.w3.org/XML/1998/namespace}space', 'preserve')
 
             ci += col_span
+
+    return tbl
+
 
 def _patch_vmerge_continue(tbl: ET.Element, td: TableData, _ns: str) -> None:
     """遍历所有行，为被垂直合并覆盖的非起始行补上 vMerge continue。"""

@@ -1,3 +1,7 @@
+"""# DEPRECATED — 表格分类逻辑已移除，
+# 所有表格数据从 format_requirements.required_sections 获取。
+# 保留文件供回滚参考，不再被任何代码调用。
+"""
 """标书表格分类引擎 — 基于表头关键词模式识别。
 
 功能：

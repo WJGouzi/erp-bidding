@@ -70,7 +70,7 @@ def _strip_xml_control_chars(text: str) -> str:
 
 # ========== 全局产品列名映射表 ==========
 # 统一所有表格解析系统使用的字段映射，确保 _extract_table_data_from_analysis()
-# table_parser.py, table_classifier.py 共用同一套映射规则
+# 表格字段映射规则
 PRODUCT_COLUMN_MAP = {
     "name": ["品名", "名称", "产品名称", "试剂名称", "货物名称",
              "商品名", "采购产品名称", "标的名称", "产品名",
@@ -312,45 +312,13 @@ def _extract_analysis_context(analysis_result):
                 val = meta_val or payload.get(field) or getattr(analysis_result, field, None) or ""
                 if val:
                     bidder_notice["project_no"] = val
-                    break        # 提取 product_lists 供表格填充引擎使用
-        product_lists = []
-        # 保留所有原始表格结构（headers + rows + merges）用于原样复制
-        raw_tables = []
-        tc = payload.get("table_classification", {}) if isinstance(payload, dict) else {}
-        if tc:
-            for pl in tc.get("product_lists", []):
-                for item in pl.get("items", []):
-                    product_lists.append(item)
-            # 使用 raw_tables（由 classify_all_tables 前置提取，含所有表格的原始数据）
-            for rt in tc.get("raw_tables", []):
-                if not isinstance(rt, dict):
-                    continue
-                if rt.get("headers") and rt.get("rows"):
-                    raw_tables.append({
-                        "headers": rt["headers"],
-                        "rows": rt["rows"],
-                        "merges": rt.get("merges", []),
-                        "column_widths": rt.get("column_widths", []),
-                        "row_heights": rt.get("row_heights", []),
-                        "text_before": rt.get("text_before", ""),
-                        "text_after": rt.get("text_after", ""),
-                    })
-            # 合并表格周围段落文本
-            surroundings = tc.get("_table_surroundings", [])
-            if surroundings and isinstance(surroundings, list):
-                for si, surr in enumerate(surroundings):
-                    if si < len(raw_tables):
-                        tb = surr.get("text_before", "").strip()
-                        ta = surr.get("text_after", "").strip()
-                        if tb:
-                            raw_tables[si]["text_before"] = tb
-                        if ta:
-                            raw_tables[si]["text_after"] = ta
-        context["_raw_product_lists"] = product_lists
-        context["_raw_product_tables"] = raw_tables
+                    break        # 表格数据按章节存储在 format_requirements.required_sections[].template_tables
+        # 生成时通过 _generate_table_content 按章节标题查找，不需要全局列表
+        fmt = payload.get("format_requirements", {}) if isinstance(payload, dict) else {}
+        context["_raw_product_lists"] = []
+        context["_raw_product_tables"] = []
         context["_eligibility"] = payload.get("eligibility", {}) if isinstance(payload, dict) else {}
-        context["_table_classification"] = payload.get("table_classification", {}) if isinstance(payload, dict) else {}
-        context["_format_requirements"] = payload.get("format_requirements", {}) if isinstance(payload, dict) else {}
+        context["_format_requirements"] = fmt
         context["_scoring"] = payload.get("scoring", {}) if isinstance(payload, dict) else {}
         context["_packages"] = payload.get("packages", []) if isinstance(payload, dict) else []
 
@@ -768,17 +736,25 @@ def _build_product_context(task):
     requirements = analysis_result.technical_requirements if analysis_result else ""
     effective = analysis_result.effective_text if analysis_result and analysis_result.effective_text else (analysis_result.raw_text if analysis_result else "")
     
-    # 从 analysis_data.table_classification.product_lists 提取结构化产品名称
+    # 从 format_requirements.required_sections[].template_tables 提取产品名称
     product_names_from_tables = []
     if analysis_result and analysis_result.analysis_data:
         try:
             ad = json.loads(analysis_result.analysis_data) if isinstance(analysis_result.analysis_data, str) else analysis_result.analysis_data
-            tc = ad.get("table_classification", {}) if isinstance(ad, dict) else {}
-            for pl in tc.get("product_lists", []):
-                for item in pl.get("items", []):
-                    name = item.get("采购产品名称", "") or item.get("产品名称", "") or item.get("标的名称", "")
-                    if name and len(name) >= 2:
-                        product_names_from_tables.append(name)
+            fmt = ad.get("format_requirements", {}) if isinstance(ad, dict) else {}
+            if fmt:
+                for sec in fmt.get("required_sections", []):
+                    for tbl in sec.get("template_tables", []):
+                        headers = tbl.get("headers", [])
+                        rows = tbl.get("rows", [])
+                        if not headers or not rows:
+                            continue
+                        for row in rows:
+                            for i, h in enumerate(headers):
+                                if any(k in h for k in ["采购产品名称", "产品名称", "标的名称", "标的"]):
+                                    name = row[i] if i < len(row) else ""
+                                    if name and len(name) >= 2:
+                                        product_names_from_tables.append(name)
         except Exception:
             pass
     
@@ -869,91 +845,6 @@ def _fetch_product_data(product_names, adapter=None):
             logger.warning("[product] 产品库查询失败 name=%s: %s", pname, exc)
 
     return result
-
-def _fill_table_from_original(original_headers, original_rows):
-    """从产品库填充原始表格的空白单元格。
-
-    策略：
-    1. 保留原始表格的完整框架（表头+行）
-    2. 用 PRODUCT_COLUMN_MAP 定位产品名列
-    3. 收集全部产品名，批量查询产品库
-    4. 用 PRODUCT_FIELD_TO_COLUMN 匹配哪些列可填充
-    5. 只填充空单元格，已有内容的单元格不动
-
-    Args:
-        original_headers: list[str] - 原始表头
-        original_rows: list[list[str]] - 原始数据行
-
-    Returns:
-        list[list[str]]: 填充后的数据行
-    """
-    if not original_headers or not original_rows:
-        return original_rows or []
-
-    # 1. 定位产品名列索引
-    name_col_idx = -1
-    for i, h in enumerate(original_headers):
-        for candidate in PRODUCT_COLUMN_MAP.get("name", []):
-            if candidate in h:
-                name_col_idx = i
-                break
-        if name_col_idx >= 0:
-            break
-
-    if name_col_idx < 0:
-        return original_rows
-
-    # 2. 收集产品名
-    product_names = []
-    for row in original_rows:
-        name = (row[name_col_idx] or "").strip() if name_col_idx < len(row) else ""
-        if name and len(name) >= 2:
-            product_names.append(name)
-
-    if not product_names:
-        return original_rows
-
-    # 3. 批量查询产品库
-    product_data = _fetch_product_data(product_names)
-
-    if not product_data:
-        return original_rows
-
-    # 4. 建立 表头→产品字段 的映射
-    header_to_product_field = {}
-    for col_idx, h in enumerate(original_headers):
-        h_clean = h.strip()
-        for product_field, col_candidates in PRODUCT_FIELD_TO_COLUMN.items():
-            if any(c in h_clean for c in col_candidates):
-                header_to_product_field[col_idx] = product_field
-                break
-
-    # 5. 填充每行的空白单元格
-    filled_rows = []
-    for row in original_rows:
-        new_row = list(row)
-        while len(new_row) < len(original_headers):
-            new_row.append("")
-
-        product_name = (new_row[name_col_idx] or "").strip() if name_col_idx < len(new_row) else ""
-        product_info = product_data.get(product_name, {})
-
-        if product_info:
-            for col_idx in range(len(original_headers)):
-                cell_val = (new_row[col_idx] or "").strip()
-                if not cell_val:
-                    product_field = header_to_product_field.get(col_idx)
-                    if product_field and product_field in product_info:
-                        fill_val = product_info[product_field]
-                        new_row[col_idx] = fill_val[:100]
-
-        new_row = [str(c)[:100] if c else "" for c in new_row]
-        filled_rows.append(new_row)
-
-    return filled_rows
-
-
-
 def _build_coverage_matrix(nrows, ncols, merges):
     """建立合并覆盖矩阵，标记每个单元格是实格还是虚拟格。
 
@@ -2500,316 +2391,55 @@ def _detect_template_type(chapter_title, chapter_desc, tender_text):
 # 路径 B：表格填充引擎
 # ============================================================================
 # 常见表格模板的列结构定义
-
-def _normalize_row_heights(raw_heights, n_headers, n_data_rows):
-    """确保 row_heights 长度与总行数（表头 + 数据）匹配。
-    
-    旧缓存可能缺少表头行高，此时在前面补一条默认值。
-    """
-    expected = n_headers + n_data_rows
-    if len(raw_heights) == expected:
-        return list(raw_heights)
-    if len(raw_heights) == n_data_rows:
-        # 缺少表头行高 → 在前面补一条
-        return [{"val": 0, "rule": "atLeast"}] + list(raw_heights)
-    # 长度仍然不匹配 → 返回默认全零
-    return [{"val": 0, "rule": "atLeast"}] * expected
-
-
-
-_TABLE_COLUMNS = {
-    "报价一览表": ["序号", "标的名称", "规格型号", "数量", "单价（元）", "总价（元）", "备注"],
-    "报价表": ["序号", "标的名称", "规格型号", "数量", "单价（元）", "总价（元）", "备注"],
-    "商务要求偏离表": ["序号", "商务条款", "比选文件要求", "响应情况", "偏离说明", "备注"],
-    "技术要求偏离表": ["序号", "技术条款", "比选文件要求", "响应情况", "偏离说明", "备注"],
-    "商务应答表": ["序号", "商务条款", "比选文件要求", "响应情况", "偏离说明"],
-    "技术应答表": ["序号", "技术条款", "比选文件要求", "响应情况", "偏离说明"],
-    "业绩一览表": ["序号", "项目名称", "采购人名称", "合同金额", "签订时间", "证明材料"],
-    "类似项目业绩一览表": ["序号", "项目名称", "采购人名称", "合同金额", "签订时间", "证明材料"],
-    "基本情况表": ["单位名称", "注册地址", "统一社会信用代码", "法定代表人", "成立时间", "注册资本", "联系人", "联系电话"],
-    "人员情况表": ["序号", "姓名", "职务", "职称", "学历", "专业", "相关经验", "拟任岗位"],
-}
-
-
-def _detect_table_columns(chapter_title, chapter_desc):
-    """检测表格模板的列结构。
-
-    返回:
-        (columns: list[str], is_found: bool)
-    """
-    combined = f"{chapter_title} {chapter_desc}"
-    for keyword, columns in _TABLE_COLUMNS.items():
-        if keyword in combined:
-            return columns, True
-    # 默认列结构
-    return ["序号", "内容", "要求", "响应", "备注"], False
-
-
-def _extract_table_data_from_analysis(table_type, analysis_context, subject_context):
-    """从分析结果中提取可用于表格填充的数据。
-
-    返回:
-        list[list[str]]: 数据行（不包含表头）
-    """
-    rows = []
-    requirements_text = analysis_context.get("technical_requirements", "") or ""
-    business_text = analysis_context.get("business_requirements", "") or ""
-    bidder_notice = analysis_context.get("bidder_notice", {}) or {}
-
-    if "报价" in table_type or "报价一览表" in table_type:
-        # 优先使用原始表格结构（招标文件的原表复制）
-        raw_tables = analysis_context.get("_raw_product_tables", [])
-        if raw_tables:
-            for rt in raw_tables:
-                original_rows = rt.get("rows", [])
-                original_headers = rt.get("headers", [])
-                if not original_rows:
-                    continue
-                # 建立列名→标准字段映射，用于后续产品库填充
-                header_to_std = {}
-                for i, h in enumerate(original_headers):
-                    for std_field, candidates in PRODUCT_COLUMN_MAP.items():
-                        if any(c in h for c in candidates):
-                            header_to_std[i] = std_field
-                            break
-                # 直接使用原始行数据（保留全部原始内容）
-                for row_idx, row in enumerate(original_rows):
-                    # 序号从 1 开始
-                    new_row = list(row)
-                    # 确保有足够的列
-                    while len(new_row) < len(original_headers):
-                        new_row.append("")
-                    # 限制每列长度
-                    new_row = [str(c)[:40] if c else "" for c in new_row]
-                    rows.append(new_row)
-            if rows:
-                return rows
-        
-        # 降级：从 _raw_product_lists（结构化提取数据）获取产品数据
-        product_data = analysis_context.get("_raw_product_lists", [])
-        if product_data and isinstance(product_data[0], dict):
-            for item in product_data:
-                mapped = {}
-                for std_field in PRODUCT_COLUMN_MAP:
-                    candidates = PRODUCT_COLUMN_MAP[std_field]
-                    matched_val = ""
-                    for candidate in candidates:
-                        val = item.get(candidate, "")
-                        if val:
-                            matched_val = val
-                            break
-                    mapped[std_field] = matched_val
-                name = mapped.get("name", "") or ""
-                spec = mapped.get("spec", "")
-                unit = mapped.get("unit", "")
-                qty = mapped.get("qty", "") or ""
-                unit_price = mapped.get("unit_price", "")
-                total_price = mapped.get("total_price", "")
-                rows.append([str(len(rows) + 1),
-                             name[:40] if name else "",
-                             spec[:30] if spec else "",
-                             qty,
-                             unit_price,
-                             total_price,
-                             unit])
-        if not rows:
-            # 兜底：从 technical_requirements 中提取
-            lines = requirements_text.split("\n")
-            for line in lines:
-                stripped = line.strip()
-                if re.match(r'^\d+[.、]', stripped) and len(stripped) > 5:
-                    clean = re.sub(r'^\d+[.、]\s*', '', stripped)
-                    rows.append([str(len(rows) + 1), clean[:40], "", "", "", "", ""])
-        if not rows:
-            rows.append(["1", "", "", "", "", "", ""])
-        return rows
-
-    if "偏离" in table_type or "应答" in table_type:
-        # 从 technical_requirements / business_requirements 提取条款
-        source_text = requirements_text if "技术" in table_type else business_text
-        lines = source_text.split("\n")
-        for line in lines:
-            stripped = line.strip()
-            if re.match(r'^\d+[.、]', stripped) and len(stripped) > 5:
-                clean = re.sub(r'^\d+[.、]\s*', '', stripped)
-                rows.append([str(len(rows) + 1), clean[:60], clean[:60], "完全响应", "无偏离"])
-        if not rows:
-            rows.append(["1", "全部条款", "全部条款", "完全响应", "无偏离"])
-        return rows
-
-    if "业绩" in table_type:
-        # 业绩表通常由用户自行填写
-        rows.append(["1", "", "", "", "", ""])
-        rows.append(["2", "", "", "", "", ""])
-        return rows
-
-    if "基本情况" in table_type:
-        if subject_context:
-            return [[
-                subject_context.get("company_name", ""),
-                subject_context.get("address", ""),
-                subject_context.get("credit_code", ""),
-                "",
-                "",
-                "",
-                subject_context.get("contact_person", ""),
-                subject_context.get("contact_phone", ""),
-            ]]
-        return [["", "", "", "", "", "", "", ""]]
-
-    return rows
-
-
-def _match_raw_table(chapter_title, chapter_desc, raw_tables):
-    """从原始表格列表中匹配与当前章节最相关的表格。
-    
-    匹配策略：
-    1. 先检查章节标题中的关键词
-    2. 再检查章节描述中的关键词
-    3. 返回匹配的原始表格（含 headers + rows + source_type）
-    """
-    if not raw_tables:
-        return None
-    
-    combined = f"{chapter_title} {chapter_desc}"
-    
-    # 关键词 → 表格 source_type 映射
-    keyword_map = {
-        "报价": ("product_list", "报价"),
-        "分项报价": ("product_list", "分项"),
-        "产品": ("product_list", "产品"),
-        "技术响应": ("tech_requirements", "技术"),
-        "技术参数": ("tech_requirements", "参数"),
-        "服务要求": ("service_requirements", "服务"),
-        "服务响应": ("service_requirements", "服务"),
-        "商务响应": ("business_requirements", "商务"),
-        "商务应答": ("business_requirements", "商务"),
-        "资格": ("qualification_checks", "资格"),
-        "资格证明": ("qualification_checks", "资格证明"),
-        "证明材料": ("qualification_checks", "资质材料"),
-        "偏离": ("response_forms", "偏离"),
-        "应答表": ("response_forms", "应答"),
-        "评分": ("scoring", "评分"),
-        "前附表": ("preliminary", "前附"),
-        "营业": ("qualification_checks", "营业执照"),
-        "授权": ("qualification_checks", "授权书"),
-        "承诺": ("qualification_checks", "承诺函"),
-        "资质": ("qualification_checks", "资质"),
-        "信息": ("qualification_checks", "基本信息"),
-    }
-    
-    best_match = None
-    best_score = 0
-    for keyword, (source_type, _) in keyword_map.items():
-        if keyword in combined:
-            # 找同类型的原始表格
-            for rt in raw_tables:
-                st = rt.get("source_type", "")
-                if st == source_type:
-                    score = 10
-                    # 子类型关键词匹配加分
-                    headers_text = " ".join(rt.get("headers", []))
-                    if keyword in headers_text:
-                        score += 5
-                    if score > best_score:
-                        best_score = score
-                        best_match = rt
-            # 无 source_type 时按表头关键词匹配
-            if not best_match:
-                for rt in raw_tables:
-                    st = rt.get("source_type", "")
-                    if st:
-                        continue
-                    headers_text = " ".join(rt.get("headers", []))
-                    if keyword in headers_text:
-                        best_match = rt
-                        break
-    
-    # 没匹配到关键词时返回 None，让调用方降级到旧路径
-    if not best_match:
-        return None
-    
-    return best_match
-
-
 def _generate_table_content(chapter_title, chapter_desc, analysis_context, subject_context):
-    """生成表格模板的填充内容（JSON 格式，携带完整结构信息）。
+    """从 format_requirements 中当前章节的 template_tables 提取第一个表格并填充。
 
-    策略：
-    1. 优先匹配原始表格（宽/高/合并全部保留）
-    2. 产品表从产品库填充空白单元格
-    3. 无原始表时降级到关键词匹配的硬编码逻辑
+    不创建默认表格 — 招标文件没有的表格不在标书中生成。
 
     返回:
-        str: 以 _TABLE_JSON_PREFIX 开头的 JSON 文本
+        str: 以 _TABLE_JSON_PREFIX 开头的 JSON 文本，无可返回的表时返回空。
     """
     import json as _json
     table_type = chapter_title
-    raw_tables = analysis_context.get("_raw_product_tables", [])
 
-    # ========== 主路径：原始表复用+填空（所有类型） ==========
-    matched_table = _match_raw_table(chapter_title, chapter_desc, raw_tables)
-    if matched_table:
-        original_headers = matched_table.get("headers", [])
-        original_rows = matched_table.get("rows", [])
-        if original_headers and original_rows:
-            # 通用智能填充（所有表类型）
-            merged_rows = list(original_rows)
-            # 构建临时 table_dict 供填充引擎使用
+    fmt = analysis_context.get("_format_requirements", {})
+    if not fmt:
+        return ""
+    for sec in fmt.get("required_sections", []):
+        if not (chapter_title in sec.get("title", "") or sec.get("title", "") in chapter_title):
+            continue
+        for tbl in sec.get("template_tables", []):
+            headers = tbl.get("headers", [])
+            rows = tbl.get("rows", [])
+            if not headers or not rows:
+                continue
             table_dict = {
-                "headers": list(original_headers),
-                "rows": merged_rows,
-                "merges": matched_table.get("merges", []),
-                "column_widths": matched_table.get("column_widths", []),
-                "row_heights": _normalize_row_heights(
-                    matched_table.get("row_heights", []),
-                    len(original_headers), len(filled_rows[data_start:])
-                ),
+                "headers": list(headers),
+                "rows": list(rows),
+                "merges": tbl.get("merge_cells", []),
+                "column_widths": [],
+                "row_heights": [],
             }
             filled_rows = _smart_fill_table(table_dict, analysis_context, subject_context)
-            # 对于产品表，额外用产品库填充（优先级更高，覆盖 smart_fill 的结果）
-            source_type = matched_table.get("source_type", "")
-            if source_type == "product_list":
-                product_filled = _fill_table_from_original(original_headers, original_rows)
-                # 只在产品库有数据时才合并（优先产品库填充，保留 smart_fill 的兜底）
-                if any(any(c.strip() for c in row) for row in product_filled):
-                    filled_rows = product_filled
-            data_start = 0
-            if filled_rows and original_headers and filled_rows[0] == original_headers:
-                data_start = 1
-            ncols = len(original_headers)
+            ncols = len(headers)
             for i in range(len(filled_rows)):
                 while len(filled_rows[i]) < ncols:
                     filled_rows[i].append("")
+            data_start = 0
+            if filled_rows and filled_rows[0] == headers:
+                data_start = 1
             table_package = {
-                "headers": list(original_headers),
+                "headers": list(headers),
                 "rows": filled_rows[data_start:],
-                "column_widths": matched_table.get("column_widths", []),
-                "row_heights": matched_table.get("row_heights", []),
-                "merges": matched_table.get("merges", []),
-                "text_before": (matched_table.get("text_before", "") or "").strip(),
-                "text_after": (matched_table.get("text_after", "") or "").strip(),
+                "column_widths": [],
+                "row_heights": [],
+                "merges": tbl.get("merge_cells", []),
+                "text_before": "",
+                "text_after": "",
             }
             marker = f"{_TABLE_JSON_PREFIX}{table_type}]]"
             return marker + "\n" + _json.dumps(table_package, ensure_ascii=False, default=str)
-
-    # ========== 降级路径：硬编码表格（无原始表时兜底） ==========
-    columns, found = _detect_table_columns(chapter_title, chapter_desc)
-    data_rows = _extract_table_data_from_analysis(table_type, analysis_context, subject_context)
-
-    table_package = {
-        "headers": list(columns),
-        "rows": data_rows,
-        "column_widths": [],
-        "row_heights": _normalize_row_heights(
-            [], len(columns), len(data_rows)
-        ),
-        "merges": [],
-        "text_before": "",
-        "text_after": "",
-    }
-    marker = f"{_TABLE_JSON_PREFIX}{table_type}]]"
-    return marker + "\n" + _json.dumps(table_package, ensure_ascii=False, default=str)
+    return ""
 
 # ============================================================================
 # 路径 C：资格证明文件插入引擎
@@ -3263,7 +2893,7 @@ def _generate_chapter_content(task, chapter, analysis_result, subject_context, k
                             user_parts.append(f"  ✘{idx}. {req}")
         
         # 产品清单表
-        _tc = analysis_context.get("_table_classification", {}) or {}
+        _tc = analysis_context.get("_format_requirements", {}) or {}
         if _tc and isinstance(_tc, dict):
             pl = _tc.get("product_lists", []) or []
             if pl:
@@ -4193,6 +3823,7 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
         if not title:
             return
         h = document.add_heading(title, level=min(level, 4))
+        _last_element = h._element
         chapter_title_for_plan = parent_title or title
 
         matched_content = None
@@ -4310,9 +3941,10 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                                 _r.font.name = "仿宋"
                                 _r.font.size = Pt(12)
                                 _r.element.rPr.rFonts.set(qn("w:eastAsia"), "仿宋")
+                            _last_element = _p._element
                         elif _block.get("type") == "table":
                             # 统一渲染：通过 per_cell_data → write_table_from_data
-                            _pcd = _block.get("per_cell_data")
+                            _pcd = _block.get("per_cell_data") or _block.get("per_cell")
                             if _pcd:
                                 from app.infrastructure.table_codec import from_dict, write_table_from_data
                                 td = from_dict(_pcd)
@@ -4331,7 +3963,9 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                                         _cell.font_name = "仿宋"
                                     if not _cell.font_size_half_pt:
                                         _cell.font_size_half_pt = 24
-                            write_table_from_data(document, td)
+                            _tbl = write_table_from_data(document, td, insert_after=_last_element)
+                            if _tbl is not None:
+                                _last_element = _tbl
                                 # ContentBlock 已处理，跳过后续文本写入和表格标记处理
                 # 仍需要处理子章节
                 _write_subject_materials_for_outline_item(title, desc)
@@ -4383,7 +4017,9 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                                         _cell.font_name = "仿宋"
                                     if not _cell.font_size_half_pt:
                                         _cell.font_size_half_pt = 24
-                            write_table_from_data(document, td)
+                            _tbl = write_table_from_data(document, td, insert_after=_last_element)
+                            if _tbl is not None:
+                                _last_element = _tbl
 
                             # 写入表格后段落
                             if text_after:
@@ -4505,6 +4141,8 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                     _sec_lookup_global = _fmt4.get("section_lookup", {}) or {}
                 except Exception:
                     _sec_lookup_global = {}
+            # 用于追踪子节点渲染中的最后一个 body 子元素，确保表格精准定位
+            _last_child_element = None
             for _child in item.get("children", []):
                 _child_title = _child.get("title", "").strip()
                 if not _child_title:
@@ -4517,7 +4155,8 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                 if _sec3:
                     _tc3 = _sec3.get("template_content", [])
                     if _tc3:
-                        # 渲染有序的段落+表格内容
+                        # 渲染有序的段落+表格内容，使用 write_table_from_data 确保表格定位
+                        from app.infrastructure.table_codec import to_per_cell, write_table_from_data
                         for _bd3 in _tc3:
                             if not isinstance(_bd3, dict):
                                 continue
@@ -4527,96 +4166,25 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                                 _r3 = _bd3.get("rows", [])
                                 _mc3 = _bd3.get("merge_cells", [])
                                 _cw3 = _bd3.get("column_widths", [])
+                                _per_cell3 = _bd3.get("per_cell") or _bd3.get("per_cell_data")
                                 if _h3 and _r3:
-                                    _t3 = document.add_table(rows=len(_r3) + 1, cols=len(_h3))
-                                    _t3.style = "Table Grid"
-                                    # 设置 tblGrid 列宽（匹配原始文档）
-                                    if _cw3:
-                                        try:
-                                            _tbl_grid3 = _t3._tbl.find(qn('w:tblGrid'))
-                                            if _tbl_grid3 is not None:
-                                                _grid_cols3 = _tbl_grid3.findall(qn('w:gridCol'))
-                                                for _gci3, _gcw3 in enumerate(_cw3):
-                                                    if _gci3 < len(_grid_cols3) and _gcw3:
-                                                        _grid_cols3[_gci3].set(qn("w:w"), str(int(_gcw3 / 635)))
-                                        except Exception:
-                                            pass
-                                    for _ci3, _h3v in enumerate(_h3):
-                                        _t3.rows[0].cells[_ci3].text = _h3v
-                                    for _ri3, _row3 in enumerate(_r3):
-                                        for _ci3, _cell3 in enumerate(_row3):
-                                            if _ci3 < len(_h3):
-                                                _t3.rows[_ri3 + 1].cells[_ci3].text = _cell3
-                                    # 矩形合并法：处理 horizontal+vertical 合并
-                                    _merge_map3 = {}
-                                    for _mc3_item in (_mc3 or []):
-                                        _mk3 = (_mc3_item.get("row", 0), _mc3_item.get("col", 0))
-                                        if _mk3 not in _merge_map3:
-                                            _merge_map3[_mk3] = {"v_span": 1, "h_span": 1}
-                                        if _mc3_item.get("type") == "vertical":
-                                            _merge_map3[_mk3]["v_span"] = max(_merge_map3[_mk3]["v_span"], _mc3_item.get("span", 1))
-                                        elif _mc3_item.get("type") == "horizontal":
-                                            _merge_map3[_mk3]["h_span"] = max(_merge_map3[_mk3]["h_span"], _mc3_item.get("span", 1))
-                                    _consumed3 = set()
-                                    for (_mr3, _mc3_pos), _ms3 in _merge_map3.items():
-                                        _mv3 = _ms3["v_span"]
-                                        _mh3 = _ms3["h_span"]
-                                        if _mv3 == 1 and _mh3 == 1:
-                                            continue
-                                        _mer3 = _mr3 + _mv3 - 1
-                                        _mec3 = _mc3_pos + _mh3 - 1
-                                        if _mer3 >= len(_r3) + 1 or _mec3 >= len(_h3):
-                                            continue
-                                        _mrange3 = set((_r, _c) for _r in range(_mr3, _mer3 + 1) for _c in range(_mc3_pos, _mec3 + 1))
-                                        if _consumed3.intersection(_mrange3):
-                                            _consumed3.update(_mrange3)
-                                            continue
-                                        # 合并前清空被消耗单元格的文本，避免文本重复
-                                        for _cr3 in range(_mr3, _mer3 + 1):
-                                            for _cc3 in range(_mc3_pos, _mec3 + 1):
-                                                if _cr3 == _mr3 and _cc3 == _mc3_pos:
-                                                    continue
-                                                try:
-                                                    _t3.rows[_cr3].cells[_cc3].text = ""
-                                                except Exception:
-                                                    pass
-                                        try:
-                                            _t3.rows[_mr3].cells[_mc3_pos].merge(_t3.rows[_mer3].cells[_mec3])
-                                            _consumed3.update(_mrange3)
-                                        except Exception:
-                                            pass
-                                    for _row3 in _t3.rows:
+                                    # 使用 write_table_from_data 而非 document.add_table() 以支持精确定位
+                                    if _per_cell3:
+                                        from app.infrastructure.table_codec import from_dict as _pcd_from_dict
+                                        _td3 = _pcd_from_dict(_per_cell3)
+                                    else:
+                                        _all_rows3 = [_h3] + _r3
+                                        _td3 = to_per_cell(_h3, _all_rows3, _mc3, _cw3, _bd3.get("row_heights", []))
+                                    # 注入默认字体格式
+                                    for _row3 in _td3.rows:
                                         for _cell3 in _row3.cells:
-                                            for _para3 in _cell3.paragraphs:
-                                                for _run3 in _para3.runs:
-                                                    _run3.font.name = "仿宋"
-                                                    _run3.font.size = Pt(12)
-                                                    _run3.element.rPr.rFonts.set(qn("w:eastAsia"), "仿宋")
-                                    # 禁用 autoFit 并设置表格固定宽度
-                                    if _cw3:
-                                        _valid_widths3 = [w for w in _cw3 if w]
-                                        if _valid_widths3:
-                                            try:
-                                                _total_w3 = int(sum(_valid_widths3) / 635)
-                                                _tblPr3 = _t3._tbl.find(qn('w:tblPr'))
-                                                if _tblPr3 is None:
-                                                    _tblPr3 = OxmlElement('w:tblPr')
-                                                    _t3._tbl.insert(0, _tblPr3)
-                                                _existing_tblW3 = _tblPr3.find(qn('w:tblW'))
-                                                if _existing_tblW3 is not None:
-                                                    _tblPr3.remove(_existing_tblW3)
-                                                _tblW3 = OxmlElement('w:tblW')
-                                                _tblW3.set(qn('w:w'), str(_total_w3))
-                                                _tblW3.set(qn('w:type'), 'dxa')
-                                                _tblPr3.append(_tblW3)
-                                                _existing_layout3 = _tblPr3.find(qn('w:tblLayout'))
-                                                if _existing_layout3 is not None:
-                                                    _tblPr3.remove(_existing_layout3)
-                                                _tblLayout3 = OxmlElement('w:tblLayout')
-                                                _tblLayout3.set(qn('w:type'), 'fixed')
-                                                _tblPr3.append(_tblLayout3)
-                                            except Exception:
-                                                pass
+                                            if not _cell3.font_name:
+                                                _cell3.font_name = "仿宋"
+                                            if not _cell3.font_size_half_pt:
+                                                _cell3.font_size_half_pt = 24
+                                    _tbl3 = write_table_from_data(document, _td3, insert_after=_last_child_element)
+                                    if _tbl3 is not None:
+                                        _last_child_element = _tbl3
                             elif _bt3 in ("text", "paragraph"):
                                 _p3 = document.add_paragraph(_bd3.get("text", ""))
                                 _p3.style = document.styles["Normal"]
@@ -4624,6 +4192,7 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                                     _r3.font.name = "仿宋"
                                     _r3.font.size = Pt(12)
                                     _r3.element.rPr.rFonts.set(qn("w:eastAsia"), "仿宋")
+                                _last_child_element = _p3._element
                         # 模板内容已渲染，跳过子章节的 _write_outline_item 调用
                         # 避免模板内容被重复渲染（content_blocks 中的同份模板会导致重复）
                         document.add_page_break()

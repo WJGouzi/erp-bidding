@@ -146,7 +146,7 @@ def _extract_required_sections(section) -> List[Dict]:
                     "rows": _rows,
                     "merge_cells": getattr(block, "merge_cells", []),
                     "column_widths": getattr(block, "column_widths", []),
-                    "per_cell": _build_per_cell(
+                    "per_cell": getattr(block, "per_cell_data", None) or _build_per_cell(
                         getattr(block, "headers", []),
                         getattr(block, "rows", []),
                         getattr(block, "merge_cells", []),
@@ -286,6 +286,9 @@ def _extract_template_tables(section) -> List[Dict]:
 
     仅搜索当前章节的直接内容块，**不递归子章节**。
     通过限制作用域防止解析器分组错误的表被错误关联。
+
+    merge_cells 优先从 per_cell_data 读取（保留原始 XML 合并信息），
+    降级到 block.merge_cells 属性（可能来自 _rebuild_merge_cells）。
     """
     tables = []
     
@@ -297,10 +300,16 @@ def _extract_template_tables(section) -> List[Dict]:
                 continue
             # 折叠水平合并列（处理 WPS 伪合并）
             headers, rows = _collapse_merged_columns(headers, rows)
+            # 优先从 per_cell_data 读取原始 merge_cells
+            _pcd = getattr(block, "per_cell_data", None)
+            if _pcd and isinstance(_pcd, dict):
+                _mc = _pcd.get("merge_cells", []) or []
+            else:
+                _mc = getattr(block, "merge_cells", []) or []
             tables.append({
                 "headers": headers,
                 "rows": rows,
-                "merge_cells": getattr(block, "merge_cells", []) or [],
+                "merge_cells": _mc,
             })
     return tables
 
@@ -423,14 +432,6 @@ def extract_format_requirements(sections) -> Optional[Dict]:
         logger.info("[phase1.5] 格式章节 '%s' 无子章节", chapter_title)
         return None
 
-    # 收集所有模板表格（注入所属章节标题）
-    all_tables = []
-    for rs in required_sections:
-        section_title = rs.get("title", "")
-        for tbl in rs.get("template_tables", []):
-            tbl["title"] = section_title
-            all_tables.append(tbl)
-
     # 收集固定文本
     fixed_texts = _extract_fixed_texts(chapter)
 
@@ -454,9 +455,11 @@ def extract_format_requirements(sections) -> Optional[Dict]:
     _build_lookup_recursive(required_sections)
 
 
+    # 统计各章节 template_tables 中的表格总数
+    _total_tables = sum(len(rs.get("template_tables", [])) for rs in required_sections)
     logger.info(
         "[phase1.5] 格式要求提取完成: chapter='%s', sections=%d, tables=%d, fixed=%d, confidence=%.2f",
-        chapter_title, len(required_sections), len(all_tables), len(fixed_texts), confidence,
+        chapter_title, len(required_sections), _total_tables, len(fixed_texts), confidence,
     )
 
     # 检测封面页
@@ -466,7 +469,7 @@ def extract_format_requirements(sections) -> Optional[Dict]:
         "chapter_title": chapter_title,
         "required_sections": required_sections,
         "section_lookup": section_lookup,
-        "template_tables": all_tables,
+
         "fixed_texts": fixed_texts,
         "cover_pages": cover_pages,
         "confidence": confidence,

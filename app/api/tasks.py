@@ -1,8 +1,9 @@
 import logging; import logging
 logger = logging.getLogger(__name__)
-from flask import Response
+from flask import Response, send_file, make_response
 from flask_restx import Namespace, Resource, fields, reqparse
 from werkzeug.datastructures import FileStorage as WerkzeugFileStorage
+from io import BytesIO
 
 from ..core.response import success
 from ..service_modules import BiddingTaskService
@@ -95,6 +96,33 @@ task_batch_delete_model = task_ns.model(
     },
 )
 
+
+
+
+# ── 文件响应模型 ──────────────────────────────────────────
+
+document_file_model = task_ns.model("DocumentFile", {
+    "file_id": fields.Integer(description="文件ID"),
+    "file_name": fields.String(description="文件名"),
+    "file_ext": fields.String(description="文件扩展名"),
+    "file_size": fields.Integer(description="文件大小(字节)"),
+    "url": fields.String(description="下载URL"),
+})
+
+documents_data_model = task_ns.model("DocumentsData", {
+    "tender_file": fields.Nested(
+        document_file_model, allow_null=True, description="招标主文件"
+    ),
+    "attachments": fields.List(
+        fields.Nested(document_file_model), description="附件列表"
+    ),
+})
+
+documents_response_model = task_ns.model("DocumentsResponse", {
+    "code": fields.Integer(description="状态码，0 表示成功"),
+    "message": fields.String(description="消息"),
+    "data": fields.Nested(documents_data_model, description="数据"),
+})
 
 @task_ns.route("/upload-tender")
 class UploadTenderResource(Resource):
@@ -503,6 +531,7 @@ class TaskSubjectTemplatesResource(Resource):
 class TaskDocumentsResource(Resource):
     """获取任务关联的所有原始文件列表。"""
 
+    @task_ns.marshal_with(documents_response_model)
     def get(self, task_id):
         """返回招标文件和附件列表，每个文件包含下载 URL。"""
 
@@ -513,7 +542,40 @@ class TaskDocumentsResource(Resource):
 class TaskDocumentFileResource(Resource):
     """下载任务关联的原始文件。"""
 
+    @task_ns.produces(["application/octet-stream"])
+    @task_ns.response(200, "文件二进制流")
     def get(self, task_id, file_id):
         """返回文件二进制流。前端根据 file_ext 决定渲染方式。"""
-
-        return BiddingTaskService.download_task_document(task_id, file_id)
+        file_data = BiddingTaskService.download_task_document(task_id, file_id)
+        
+        # 如果 file_data 是文件路径
+        if isinstance(file_data, str):
+            return send_file(
+                file_data,
+                as_attachment=False,
+                mimetype='application/octet-stream'
+            )
+        
+        # 如果 file_data 是 bytes
+        elif isinstance(file_data, bytes):
+            return send_file(
+                BytesIO(file_data),
+                as_attachment=False,
+                mimetype='application/octet-stream',
+                download_name=f'document_{file_id}'
+            )
+        
+        # 如果 file_data 是文件对象（有 read 方法）
+        elif hasattr(file_data, 'read'):
+            return send_file(
+                file_data,
+                as_attachment=False,
+                mimetype='application/octet-stream'
+            )
+        
+        # 其他情况，直接返回 bytes
+        return send_file(
+            BytesIO(str(file_data).encode()),
+            as_attachment=False,
+            mimetype='application/octet-stream'
+        )

@@ -60,6 +60,7 @@ class ContentBlock:
             d["column_widths"] = self.column_widths
             if self.per_cell:
                 d["per_cell"] = self.per_cell
+                d["per_cell_data"] = self.per_cell
         return d
 
     @classmethod

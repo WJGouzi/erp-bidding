@@ -141,6 +141,7 @@ def safe_read_deep(meta: dict, *keys: str, default: Any = "") -> Any:
 
 # extra 字段 → 中文标签映射（按展示顺序）
 EXTRA_LABELS: List[Tuple[str, str]] = [
+    ("file_purchase_price", "文件售价"),
     ("payment_terms", "付款方式"),
     ("service_period", "服务期限"),
     ("delivery_location", "交付地点"),
@@ -153,10 +154,10 @@ EXTRA_LABELS: List[Tuple[str, str]] = [
     ("delivery_terms", "交付要求"),
     ("special_declaration", "特别说明"),
     ("agency_fee", "代理服务费"),
-    ("submission_location", "递交地点"),
-    ("winner_count", "成交数量"),
+    ("bid_submission_location", "递交地点"),
+    ("winner_count_text", "成交数量"),
     ("submission_copies", "份数要求"),
-    ("submission_docs", "递交资料"),
+    ("submission_docs_summary", "递交资料"),
 ]
 
 

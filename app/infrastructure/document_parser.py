@@ -1007,17 +1007,20 @@ class DocumentParser:
         # Stage 5: 构建 per_cell_data 作为唯一存储
         from app.infrastructure.table_codec import to_per_cell, to_dict
         try:
-            td = to_per_cell(_header_cells, rows_data, merge_cells, column_widths, block.row_heights)
-            block.per_cell_data = to_dict(td)
+            all_rows = [_header_cells] + rows_data
+            td = to_per_cell(_header_cells, all_rows, merge_cells, column_widths, block.row_heights)
+            pcd = to_dict(td)
+            pcd["merge_cells"] = merge_cells
+            block.per_cell_data = pcd
         except Exception:
-            # 降级：直接存储旧格式
-            if row_idx == 0:
+            # 降级：直接存储旧格式（per_cell 未构建成功）
+            if not block.per_cell_data:
                 block.per_cell_data = None
-            pass
+            logger.warning("[parser] to_per_cell 构建失败，降级到旧格式")
         # ===== WPS 伪合并检测（无 OOXML gridSpan/vMerge 的合并） =====
         if not merge_cells and rows_data:
             # 水平伪合并：逐行检测连续相同非空文本
-            all_rows = [block.headers] + rows_data
+            all_rows = [_header_cells] + rows_data
             for r_idx in range(len(all_rows)):
                 c = 0
                 while c < len(all_rows[r_idx]):

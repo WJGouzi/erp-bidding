@@ -38,7 +38,7 @@ from .phase1_5_format import extract_format_requirements
 from .phase2_extractor import scan_eligibility_v2
 from .phase3_scoring import extract_scoring, extract_packages, cross_package_analysis
 from .check_items import generate_check_items, assemble_check_items
-from ....infrastructure.table_classifier import classify_all_tables
+
 from ....infrastructure.document_parser import ContentBlock, Section
 from ....infrastructure.table_parser import parse_all_tables
 from .segmented import run_segmented_analysis as _run_segmented_analysis
@@ -500,25 +500,7 @@ def start_analyze_v3(task, source_texts, adapter=None):
     except Exception as exc:
         logger.warning("[analysis_v3] 表格解析异常: %s", exc)
     
-    # 表格矩阵分类（补充分类维度，兼容已有 table_results）
-    try:
-        doc_tables = getattr(doc, 'tables', []) or []
-        if doc_tables:
-            classification = classify_all_tables(doc_tables)
-            # 提取表格周围的段落文本
-            try:
-                from ....infrastructure.table_classifier import extract_table_surroundings
-                doc_body = getattr(doc, 'element', None)
-                if doc_body and hasattr(doc_body, 'body'):
-                    surroundings = extract_table_surroundings(doc_body.body)
-                    classification["_table_surroundings"] = surroundings
-            except Exception as exc:
-                logger.warning("[analysis_v3] 提取表格周围段落异常: %s", exc)
-            if table_results is None:
-                table_results = {}
-            table_results["_classification"] = classification
-    except Exception as exc:
-        logger.warning("[analysis_v3] 表格分类异常: %s", exc)
+
     
     # 元数据提取（含文档分类 + 表格融合）
     metadata = extract_metadata(meta_text, file_name=file_name, table_results=table_results, sections=doc.sections)
@@ -530,8 +512,7 @@ def start_analyze_v3(task, source_texts, adapter=None):
             # LLM提取预算
             table_kv_text = ''
             if table_results:
-                cls = table_results.get('_classification', {})
-                prelim = cls.get('preliminary', {}) if cls else {}
+                prelim = {}
                 kv = prelim.get('kv_pairs', {}) if prelim else {}
                 if kv:
                     table_kv_text = '\n'.join([f'{k} → {v}' for k, v in kv.items()])
@@ -701,10 +682,8 @@ def start_analyze_v3(task, source_texts, adapter=None):
     # ════════════════════════════════════════════
 
     # 组装 analysis_data
-    # 获取表格分类结果（用于补充商务/技术要求等字段）
-    table_classification = None
-    if table_results and isinstance(table_results, dict):
-        table_classification = table_results.get("_classification")
+    # 表格数据已通过 format_requirements 按章节存储
+    # 不再需要独立的 table_classification
     
     # ── 收集文档章节标题（用于后续目录生成） ──
     chapter_titles = []
@@ -729,8 +708,9 @@ def start_analyze_v3(task, source_texts, adapter=None):
         scoring=scoring,
         packages=packages,
         strategy=strategy,
-        table_classification=table_classification,
     )
+    # 防御性清理：确保 analysis_data 不含废弃的 table_classification
+    analysis_data.pop("table_classification", None)
     # 注入章节标题到 analysis_data
     analysis_data["document_chapters"] = chapter_titles
 
@@ -961,13 +941,25 @@ def _backfill_merge_cells_from_tables(doc):
             for block in section.content:
                 if block.type == ContentBlock.TYPE_TABLE and table_idx < len(table_stubs):
                     stub = table_stubs[table_idx]
-                    if stub.merge_cells:
-                        block.merge_cells = list(stub.merge_cells)
-                    # 如果 TableStub 也没有 merge_cells，进行 WPS 伪合并检测
+                    # 兼容 python-docx Table（无 merge_cells 属性）和 TableStub
+                    _stub_merge_cells = getattr(stub, 'merge_cells', None)
+                    if _stub_merge_cells:
+                        block.merge_cells = list(_stub_merge_cells)
+                    # 如果也没有 merge_cells，尝试从 ContentBlock 当前属性读取
                     if not block.merge_cells:
-                        detected = _detect_pseudo_merges(stub.headers, stub.rows)
-                        if detected:
-                            block.merge_cells = detected
+                        # 优先从 per_cell_data 读取
+                        if block.per_cell_data:
+                            _pcd_mc = block.per_cell_data.get('merge_cells', [])
+                            if _pcd_mc:
+                                block.merge_cells = list(_pcd_mc)
+                        else:
+                            # 获取 headers/rows 进行 WPS 伪合并检测
+                            _hdr = getattr(stub, 'headers', block.headers) or []
+                            _rws = getattr(stub, 'rows', block.rows) or []
+                            if _hdr and _rws:
+                                detected = _detect_pseudo_merges(_hdr, _rws)
+                                if detected:
+                                    block.merge_cells = detected
                     table_idx += 1
             if section.children:
                 _walk_sections(section.children)

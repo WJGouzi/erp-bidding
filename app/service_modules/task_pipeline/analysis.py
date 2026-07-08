@@ -263,7 +263,7 @@ def _complete_analysis(task_id, execution_id=None):
             result.technical_requirements = "\n".join(tech_parts) if tech_parts else "暂未提取到技术要求。"
             
             # 从表格分类结果补充技术/商务要求（政府采购一体化平台格式）
-            tc = v3_data.get("table_classification")
+            tc = v3_data.get("format_requirements", {})  # table_classification removed
             if tc:
                 # 技术要求表
                 if result.technical_requirements == "暂未提取到技术要求。":
