@@ -503,14 +503,12 @@ class ContentBlock:
                 d["level"] = self.level
         elif self.type == self.TYPE_TABLE:
             d["row_heights"] = self.row_heights
+            d["headers"] = self.headers
+            d["rows"] = self.rows
+            d["merge_cells"] = self.merge_cells
+            d["column_widths"] = self.column_widths
             if self.per_cell_data:
                 d["per_cell_data"] = self.per_cell_data
-            else:
-                # 降级：从属性重建（兼容未迁移的场景）
-                d["merge_cells"] = self.merge_cells
-                d["column_widths"] = self.column_widths
-                d["headers"] = self.headers
-                d["rows"] = self.rows
         return d
 
     @classmethod

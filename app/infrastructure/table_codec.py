@@ -370,6 +370,15 @@ def write_table_from_data(doc, table_data: TableData, insert_after=None):
     tblStyle = ET.SubElement(tblPr, _ns + 'tblStyle')
     tblStyle.set(_ns + 'val', 'Table Grid')
 
+    # 黑色实线边框
+    tblBorders = ET.SubElement(tblPr, _ns + 'tblBorders')
+    for _edge in ['top', 'left', 'bottom', 'right', 'insideH', 'insideV']:
+        _el = ET.SubElement(tblBorders, _ns + _edge)
+        _el.set(_ns + 'val', 'single')
+        _el.set(_ns + 'sz', '4')
+        _el.set(_ns + 'space', '0')
+        _el.set(_ns + 'color', '000000')
+
     # tblGrid — 列定义
     tblGrid = ET.SubElement(tbl, _ns + 'tblGrid')
     for cw in col_widths:

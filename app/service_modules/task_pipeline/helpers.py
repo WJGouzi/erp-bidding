@@ -55,6 +55,30 @@ from ..storage import StorageService
 
 logger = logging.getLogger(__name__)
 
+
+def _apply_black_solid_borders(table):
+    """为 python-docx Table 的 XML 设置黑色实线边框。"""
+    from docx.oxml.ns import qn
+    tbl = table._tbl
+    tblPr = tbl.find(qn('w:tblPr'))
+    if tblPr is None:
+        tblPr = __import__('lxml.etree', fromlist=['SubElement']).SubElement(tbl, qn('w:tblPr'))
+    # 移除已有 tblBorders
+    existing = tblPr.find(qn('w:tblBorders'))
+    if existing is not None:
+        tblPr.remove(existing)
+    
+    NS = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
+    borders = __import__('lxml.etree', fromlist=['SubElement']).SubElement(tblPr, NS + 'tblBorders')
+    for edge in ['top', 'left', 'bottom', 'right', 'insideH', 'insideV']:
+        el = __import__('lxml.etree', fromlist=['SubElement']).SubElement(borders, NS + edge)
+        el.set(NS + 'val', 'single')
+        el.set(NS + 'sz', '4')
+        el.set(NS + 'space', '0')
+        el.set(NS + 'color', '000000')
+
+
+
 def _strip_xml_control_chars(text: str) -> str:
     """移除 XML 不兼容的控制字符，防止 _build_docx_bytes 序列化时崩溃。
 
@@ -312,7 +336,7 @@ def _extract_analysis_context(analysis_result):
                 val = meta_val or payload.get(field) or getattr(analysis_result, field, None) or ""
                 if val:
                     bidder_notice["project_no"] = val
-                    break        # 表格数据按章节存储在 format_requirements.required_sections[].template_tables
+                    break        # 表格数据按章节存储在 format_requirements.required_sections[].template_content
         # 生成时通过 _generate_table_content 按章节标题查找，不需要全局列表
         fmt = payload.get("format_requirements", {}) if isinstance(payload, dict) else {}
         context["_raw_product_lists"] = []
@@ -736,7 +760,7 @@ def _build_product_context(task):
     requirements = analysis_result.technical_requirements if analysis_result else ""
     effective = analysis_result.effective_text if analysis_result and analysis_result.effective_text else (analysis_result.raw_text if analysis_result else "")
     
-    # 从 format_requirements.required_sections[].template_tables 提取产品名称
+    # 从 format_requirements.required_sections[].template_content 提取产品名称
     product_names_from_tables = []
     if analysis_result and analysis_result.analysis_data:
         try:
@@ -744,7 +768,10 @@ def _build_product_context(task):
             fmt = ad.get("format_requirements", {}) if isinstance(ad, dict) else {}
             if fmt:
                 for sec in fmt.get("required_sections", []):
-                    for tbl in sec.get("template_tables", []):
+                    for blk in sec.get("template_content", []):
+                        if blk.get("type") != "table":
+                            continue
+                        tbl = blk
                         headers = tbl.get("headers", [])
                         rows = tbl.get("rows", [])
                         if not headers or not rows:
@@ -2392,7 +2419,7 @@ def _detect_template_type(chapter_title, chapter_desc, tender_text):
 # ============================================================================
 # 常见表格模板的列结构定义
 def _generate_table_content(chapter_title, chapter_desc, analysis_context, subject_context):
-    """从 format_requirements 中当前章节的 template_tables 提取第一个表格并填充。
+    """从 format_requirements 中当前章节的 template_content 提取第一个表格并填充。
 
     不创建默认表格 — 招标文件没有的表格不在标书中生成。
 
@@ -2408,7 +2435,10 @@ def _generate_table_content(chapter_title, chapter_desc, analysis_context, subje
     for sec in fmt.get("required_sections", []):
         if not (chapter_title in sec.get("title", "") or sec.get("title", "") in chapter_title):
             continue
-        for tbl in sec.get("template_tables", []):
+        for blk in sec.get("template_content", []):
+            if blk.get("type") != "table":
+                continue
+            tbl = blk
             headers = tbl.get("headers", [])
             rows = tbl.get("rows", [])
             if not headers or not rows:
@@ -3731,6 +3761,7 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                                 if _headers and _rows:
                                     _t = document.add_table(rows=len(_rows), cols=len(_headers))
                                     _t.style = "Table Grid"
+                                    _apply_black_solid_borders(_t)
                                     for _ci, _h in enumerate(_headers):
                                         _t.rows[0].cells[_ci].text = _h
                                     for _ri, _row in enumerate(_rows):
@@ -3934,7 +3965,7 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
             if _chapter_cc:
                 for _block in _chapter_cc:
                     if isinstance(_block, dict):
-                        if _block.get("type") == "paragraph":
+                        if _block.get("type") in ("text", "paragraph"):
                             _p = document.add_paragraph(_strip_xml_control_chars(_block.get("text", "")))
                             _p.style = document.styles["Normal"]
                             for _r in _p.runs:
@@ -4199,6 +4230,10 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                         continue
                 # 无模板内容：回退到 write_outline_item
                 _write_outline_item(_child, level=1)
+                # 更新 _last_child_element 为 body 的最后一个子元素
+                _body_children = list(document.element.body)
+                if _body_children:
+                    _last_child_element = _body_children[-1]
                 document.add_page_break()
             continue
         if _oi_idx > 0:

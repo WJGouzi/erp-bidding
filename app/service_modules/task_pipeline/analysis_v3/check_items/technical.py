@@ -68,7 +68,10 @@ def _collect_from_tech_tables(analysis: dict, seen: set) -> list:
         return items
     req_secs = fmt.get("required_sections", [])
     for sec in _find_sections_by_type(req_secs, "technical"):
-        for tbl in sec.get("template_tables", []):
+        for blk in sec.get("template_content", []):
+            if blk.get("type") != "table":
+                continue
+            tbl = blk
             headers = tbl.get("headers", [])
             rows = tbl.get("rows", [])
             if not headers or not rows:
@@ -94,7 +97,10 @@ def _collect_from_product_lists(analysis: dict, seen: set) -> list:
         return items
     req_secs = fmt.get("required_sections", [])
     for sec in _find_sections_by_type(req_secs, "price_list"):
-        for tbl in sec.get("template_tables", []):
+        for blk in sec.get("template_content", []):
+            if blk.get("type") != "table":
+                continue
+            tbl = blk
             headers = tbl.get("headers", [])
             rows = tbl.get("rows", [])
             if not headers or not rows:

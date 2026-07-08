@@ -354,15 +354,6 @@ class ReqSection:
 
 
 @dataclass
-class TemplateTable:
-    """格式要求中定义的模板表格"""
-    section_ref: str
-    headers: List[str]
-    rows: List[List[str]]
-    description: str = ""
-
-
-@dataclass
 class FixedText:
     """格式要求中定义的固定文本"""
     section_ref: str
@@ -378,7 +369,6 @@ class FormatRequirement:
     """
     chapter_title: str = ""
     required_sections: List[ReqSection] = field(default_factory=list)
-    template_tables: List[TemplateTable] = field(default_factory=list)
     fixed_texts: List[FixedText] = field(default_factory=list)
     confidence: float = 0.0
 

@@ -167,7 +167,6 @@ def _extract_required_sections(section) -> List[Dict]:
             "order": idx + 1,
             "required": True,
             "has_template": has_template,
-            "template_tables": _extract_template_tables(child),
             "template_texts": template_texts,
             "template_content": template_content,
             "file_type": file_type,
@@ -206,112 +205,6 @@ def _check_descendant_has_template(section, current_has_template: bool) -> bool:
         if _check_descendant_has_template(sub, False):
             return True
     return False
-
-
-def _collapse_merged_columns(headers: List[str], rows: List[List[str]], cell_index: int = 0) -> tuple:
-    """根据表头行中连续重复的列名折叠合并列（处理 WPS 伪合并）。
-
-    WPS 表格经常出现相邻列有相同文本但无标准 OOXML hMerge 的情况，
-    表现为 gridSpan=2 但两个物理格都存在且文本相同。
-    此函数将连续相同文本的列合并为一个逻辑列。
-
-    Args:
-        headers: 表头列表
-        rows: 数据行列表
-        cell_index: 当 headers 长度与行单元格数不一致时尝试的索引偏移
-
-    Returns:
-        (collapsed_headers, collapsed_rows)
-    """
-    if not headers:
-        return headers, rows
-
-    # 检测需要折叠的列：连续相同文本的列组
-    collapse_groups = []  # [(start, end), ...]
-    i = 0
-    while i < len(headers):
-        j = i + 1
-        while j < len(headers) and headers[j] == headers[i] and headers[i] != '':
-            j += 1
-        if j - i > 1:
-            collapse_groups.append((i, j - 1))  # start, end inclusive
-        i = j
-
-    if not collapse_groups:
-        return headers, rows
-
-    # 构建旧列→新列的映射
-    col_map = {}
-    new_idx = 0
-    for i in range(len(headers)):
-        # 如果此列属于折叠组且不是第一个，映射到前一个
-        in_group = False
-        for start, end in collapse_groups:
-            if start < i <= end:
-                col_map[i] = col_map.get(start, new_idx - 1)
-                in_group = True
-                break
-        if not in_group:
-            col_map[i] = new_idx
-            new_idx += 1
-
-    # 折叠表头
-    new_headers = []
-    seen = set()
-    for i, h in enumerate(headers):
-        nc = col_map.get(i, i)
-        if nc not in seen:
-            new_headers.append(h)
-            seen.add(nc)
-
-    # 折叠数据行
-    new_rows = []
-    for row in rows:
-        new_row = [''] * len(new_headers)
-        for i, cell in enumerate(row):
-            nc = col_map.get(i, i)
-            if nc < len(new_row):
-                if not new_row[nc]:
-                    new_row[nc] = cell
-                elif cell and cell != new_row[nc]:
-                    # 非空内容不同时追加
-                    new_row[nc] += ' ' + cell
-        new_rows.append(new_row)
-
-    return new_headers, new_rows
-
-
-def _extract_template_tables(section) -> List[Dict]:
-    """从章节中提取模板表格。
-
-    仅搜索当前章节的直接内容块，**不递归子章节**。
-    通过限制作用域防止解析器分组错误的表被错误关联。
-
-    merge_cells 优先从 per_cell_data 读取（保留原始 XML 合并信息），
-    降级到 block.merge_cells 属性（可能来自 _rebuild_merge_cells）。
-    """
-    tables = []
-    
-    for block in getattr(section, "content", []):
-        if getattr(block, "type", "") == "table":
-            headers = getattr(block, "headers", []) or []
-            rows = getattr(block, "rows", []) or []
-            if not headers and not rows:
-                continue
-            # 折叠水平合并列（处理 WPS 伪合并）
-            headers, rows = _collapse_merged_columns(headers, rows)
-            # 优先从 per_cell_data 读取原始 merge_cells
-            _pcd = getattr(block, "per_cell_data", None)
-            if _pcd and isinstance(_pcd, dict):
-                _mc = _pcd.get("merge_cells", []) or []
-            else:
-                _mc = getattr(block, "merge_cells", []) or []
-            tables.append({
-                "headers": headers,
-                "rows": rows,
-                "merge_cells": _mc,
-            })
-    return tables
 
 
 
@@ -415,7 +308,7 @@ def extract_format_requirements(sections) -> Optional[Dict]:
         dict or None: {
             "chapter_title": "第三章 比选申请文件格式",
             "required_sections": [...],
-            "template_tables": [...],
+
             "fixed_texts": [...],
             "confidence": 0.85,
         }
@@ -455,8 +348,7 @@ def extract_format_requirements(sections) -> Optional[Dict]:
     _build_lookup_recursive(required_sections)
 
 
-    # 统计各章节 template_tables 中的表格总数
-    _total_tables = sum(len(rs.get("template_tables", [])) for rs in required_sections)
+    _total_tables = 0
     logger.info(
         "[phase1.5] 格式要求提取完成: chapter='%s', sections=%d, tables=%d, fixed=%d, confidence=%.2f",
         chapter_title, len(required_sections), _total_tables, len(fixed_texts), confidence,
