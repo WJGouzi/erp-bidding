@@ -3748,6 +3748,9 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
         return False
     
     for _cover_idx, _cover_item in enumerate(_cover_outline_items):
+        if _cover_idx > 0:
+            # 第二个及以后的封面：保持原有渲染方式，走主循环
+            continue
         _cover_blocks = _cover_item.get("template_content", [])
         _is_first_cover = (_cover_idx == 0)
         
@@ -3857,6 +3860,37 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
             run.font.name = "宋体"
             run.font.size = Pt(16)
             run.element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
+    # ====== "正本"标记（浮动右上角，黑色边框） ======
+    _zhengben_table = document.add_table(rows=1, cols=1)
+    _zhengben_table.style = "Table Grid"
+    _apply_black_solid_borders(_zhengben_table)
+    # 设置列宽为仅容纳"正本"二字
+    for _cell in _zhengben_table.columns[0].cells:
+        _cell.width = Cm(1.5)
+    _zhengben_cell = _zhengben_table.rows[0].cells[0]
+    _zhengben_cell.text = ""
+    _zhengben_p = _zhengben_cell.paragraphs[0]
+    _zhengben_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    _zhengben_run = _zhengben_p.add_run("正本")
+    _zhengben_run.font.name = "宋体"
+    _zhengben_run.font.size = Pt(16)
+    _zhengben_run.bold = True
+    _zhengben_run.element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
+    # 绝对定位：上边框距页面上边距 2.5cm，右边框距页面右边距 2.5cm
+    _tbl_pr = _zhengben_table._tbl.tblPr
+    _existing_tblp = _tbl_pr.find(qn("w:tblpPr"))
+    if _existing_tblp is not None:
+        _tbl_pr.remove(_existing_tblp)
+    _tblpPr = OxmlElement("w:tblpPr")
+    _tblpPr.set(qn("w:leftFromText"), "0")
+    _tblpPr.set(qn("w:rightFromText"), "0")
+    _tblpPr.set(qn("w:topFromText"), "0")
+    _tblpPr.set(qn("w:bottomFromText"), "0")
+    _tblpPr.set(qn("w:vertAnchor"), "page")
+    _tblpPr.set(qn("w:horzAnchor"), "page")
+    _tblpPr.set(qn("w:tblpX"), "19560000")  # 距右侧 2.5cm
+    _tblpPr.set(qn("w:tblpY"), "900000")
+    _tbl_pr.append(_tblpPr)
     document.add_page_break()
 
     # ========== 目录页（占位） ==========
@@ -4201,9 +4235,59 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
             _cover_titles.add(_t)
 
     # ========== 按目录结构生成正文 ==========
+    _first_cover_in_content = True
     for _oi_idx, item in enumerate(outline):
         _item_title = item.get("title", "").strip()
-        # ===== 分隔页检测（放在 is_cover 检查之前，避免被封面跳过） =====
+        # ===== 封面处理：第一个跳过（已提前渲染），后续正常渲染 =====
+        if item.get("is_cover"):
+            if _first_cover_in_content:
+                _first_cover_in_content = False
+                continue  # 第一个封面已提前渲染
+            # 后续封面：正常渲染模板内容
+            _render_separator_page(document, item, original_text=None)
+            for _blk in item.get("template_content", []):
+                if _blk.get("type") in ("paragraph", "text"):
+                    _text = _blk.get("text", "") or ""
+                    _font = _blk.get("font", dict()) or dict()
+                    _p = document.add_paragraph()
+                    _alignment = _font.get("alignment", "")
+                    if _alignment == "center":
+                        _p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    elif _alignment == "right":
+                        _p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+                    elif _alignment == "left":
+                        _p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                    _r = _p.add_run(_text)
+                    _font_name = _font.get("font_name", "") or "宋体"
+                    _font_size = _font.get("font_size", 16.0)
+                    _font_bold = _font.get("bold", False)
+                    try:
+                        _r.font.name = _font_name
+                        _r.font.size = Pt(_font_size)
+                    except Exception:
+                        _r.font.name = "宋体"
+                        _r.font.size = Pt(16)
+                    if _font_bold:
+                        _r.bold = True
+                    try:
+                        _r.element.rPr.rFonts.set(qn("w:eastAsia"), _font_name or "宋体")
+                    except Exception:
+                        pass
+                elif _blk.get("type") == "table":
+                    _headers = _blk.get("headers", [])
+                    _rows = _blk.get("rows", [])
+                    if _headers and _rows:
+                        _t = document.add_table(rows=len(_rows), cols=len(_headers))
+                        _t.style = "Table Grid"
+                        _apply_black_solid_borders(_t)
+                        for _ci, _h in enumerate(_headers):
+                            _t.rows[0].cells[_ci].text = _h
+                        for _ri, _row in enumerate(_rows):
+                            for _ci, _cell in enumerate(_row):
+                                _t.rows[_ri].cells[_ci].text = _cell
+            document.add_page_break()
+            continue
+        # ===== 分隔页检测 =====
         if _is_separator_page_title(_item_title):
             # 从 chapter_contents 查找分隔页的原文内容
             _sep_raw = None
@@ -4294,6 +4378,8 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                 document.add_page_break()
             continue
         if _oi_idx > 0:
+            
+    
             document.add_page_break()
         _write_outline_item(item, level=1)
 

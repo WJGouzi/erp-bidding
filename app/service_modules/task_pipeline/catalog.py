@@ -110,6 +110,7 @@ def _parse_format_tree(required_sections):
             "children": children if children is not None else [],
             "description": p_texts[0] if p_texts else "",
             "is_cover": is_cover,
+            "template_content": item.get("template_content", []),
         }
 
     tree = []
@@ -746,6 +747,7 @@ def _assign_numbers(skeleton):
                     "is_volume_label": True,
                     "is_cover": True,
                     "children": [],
+                    "template_content": node.get("template_content", []),
                 })
                 vol_content_count = 0
             else:
