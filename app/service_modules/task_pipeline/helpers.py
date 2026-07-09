@@ -3355,7 +3355,26 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                     if _pc and str(_pc).strip():
                         cover_project_no = str(_pc).strip()
     cover_package_no = (getattr(task, "selected_package_no", "") or bidder_notice.get("package_no") or "").strip()
-    cover_bid_time = utc_now().strftime("%Y年%m月%d日")
+    # 读取 bid_open_time（开标时间），用于封面投标日期
+    _cover_bid_open_time = ""
+    if analysis_result:
+        _ad_raw_bt = getattr(analysis_result, "analysis_data", None)
+        if _ad_raw_bt:
+            try:
+                import json as _json_bt
+                _ad_bt = _json_bt.loads(_ad_raw_bt) if isinstance(_ad_raw_bt, str) else (_ad_raw_bt or {})
+                _meta_bt = _ad_bt.get("metadata", {}) or {} if isinstance(_ad_bt, dict) else {}
+                # 优先从 metadata 顶层读取 bid_open_time
+                _bid_ot = _meta_bt.get("bid_open_time", "") or ""
+                if not _bid_ot:
+                    # 降级：从 key_dates 子结构读取
+                    _kd_bt = _meta_bt.get("key_dates", {}) or {}
+                    _bid_ot = _kd_bt.get("bid_opening", "") or ""
+                if _bid_ot and str(_bid_ot).strip():
+                    _cover_bid_open_time = str(_bid_ot).strip()
+            except Exception:
+                _cover_bid_open_time = ""
+    cover_bid_time = _cover_bid_open_time or utc_now().strftime("%Y年%m月%d日")
 
     document = Document()
     inserted_material_ids = set()
@@ -3724,17 +3743,136 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
     _cover_outline_items = [item for item in outline if item.get("is_cover")]
     _cover_template_found = False
     
+
+    # ====== LLM 封面智能填充（识别标签并匹配数据） ======
+    def _llm_fill_cover_blocks(blocks, cover_item_name, cover_project_no, company_name, cover_bid_time):
+        """使用 LLM 识别封面文本中的填充项并用上下文数据填充。只使用已有数据，不编造内容。"""
+        if not blocks:
+            return blocks
+        
+        text_items = []
+        for idx, blk in enumerate(blocks):
+            if blk.get("type") in ("paragraph", "text"):
+                text = blk.get("text", "") or ""
+                if text.strip():
+                    text_items.append({"idx": idx, "text": text})
+        
+        if not text_items:
+            return blocks
+        
+        available_data = {}
+        if cover_item_name:
+            available_data["项目名称"] = cover_item_name
+        if cover_project_no:
+            available_data["项目编号"] = cover_project_no
+        if company_name:
+            available_data["投标单位名称"] = company_name
+        if cover_bid_time:
+            available_data["投标日期"] = cover_bid_time
+        
+        if not available_data:
+            return blocks
+        
+        try:
+            from ...infrastructure.integrations import LLMAdapter
+            from flask import current_app
+            
+            adapter = LLMAdapter(
+                api_key=current_app.config.get("DEEPSEEK_API_KEY"),
+                base_url=current_app.config.get("DEEPSEEK_BASE_URL"),
+                default_model=current_app.config.get("DEEPSEEK_MODEL_NAME"),
+            )
+            if not adapter.is_available():
+                return blocks
+            
+            NL = chr(10)
+            item_lines = NL.join([f'  [{item["idx"]}] {item["text"]}' for item in text_items])
+            data_lines = NL.join([f'  {k}: {v}' for k, v in available_data.items()])
+            
+            system_prompt = "你是一个投标文件封面填充助手。根据提供的可用数据，识别封面文本中需要填充的字段，并用正确的数据填充。只填充确切匹配的字段，不要编造数据。"
+            
+            user_prompt = (
+                f"以下是封面上的文本项列表，每项可能包含需要填充的标签（如'项目名称'、'项目编号'等）：{NL}{NL}"
+                f"{item_lines}{NL}{NL}"
+                f"可用数据：{NL}"
+                f"{data_lines}{NL}{NL}"
+                f"请对每个文本项判断：{NL}"
+                f"1. 如果文本是纯标签（如'采购项目名称:'），在标签后追加对应的值{NL}"
+                f"2. 如果文本已包含占位符（如'20    年     月     日'），用实际值替换占位符{NL}"
+                f"3. 如果文本不需要填充（如'法定代表人或其代理人（签字）：'），保持原样{NL}{NL}"
+                f"以 JSON 格式返回，只返回 JSON 数组：{NL}"
+                '[{"idx": 0, "filled": "采购项目名称: XX项目名称"}, {"idx": 1, "filled": "采购文件编号: XX编号"}]'
+                f"不需要填充的项不要包含在返回中。"
+            )
+            
+            raw = adapter.generate_text(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                temperature=0.1,
+                max_tokens=2000,
+            )
+            
+            import json as _json
+            import re as _re
+            json_match = _re.search(r'\[.*?\]', raw.strip(), _re.DOTALL)
+            if json_match:
+                fills = _json.loads(json_match.group(0))
+                if isinstance(fills, list):
+                    for fill in fills:
+                        idx = fill.get("idx")
+                        filled_text = fill.get("filled", "")
+                        if idx is not None and filled_text and idx < len(blocks):
+                            blocks[idx]["text"] = filled_text
+                            blocks[idx]["_filled_by_llm"] = True
+            return blocks
+        except Exception as exc:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning("[cover] LLM 封面填充失败: %s", exc)
+            return blocks
+    
     # ====== 占位符填充辅助函数 ======
     def _fill_placeholder_text(text):
         """对封面文本进行占位符填充。"""
-        # 仅第一个封面做全文替换，后续封面只替换可识别的占位符
         result = text
-        # 常见占位符替换（按优先级）
+        
+        # ===== 精确占位符替换（XXX、（项目名称）等） =====
         result = result.replace("XXX（单位名称）", company_name or "XXX（单位名称）")
         result = result.replace("XXX", company_name or "XXX")
         result = result.replace("（项目名称）", cover_item_name or "（项目名称）")
         result = result.replace("（项目编号）", cover_project_no or "（项目编号）")
         result = result.replace("采购项目名称:#", "")
+        
+        # ===== 日期占位符 =====
+        if "投标日期" in result and ("20    年" in result or "年     月" in result):
+            result = re.sub(
+                r"(投标日期[：:]\s*)(20\s+年\s+月\s+日)",
+                lambda m: m.group(1) + (cover_bid_time or m.group(2)),
+                result
+            )
+        
+        # ===== 标签+下划线占位符："采购项目名称：____________" =====
+        # 匹配：标签文字 + 可选冒号 + 可选空格 + 2个以上下划线
+        m = re.search(r'^(.*?[：:])?\s*(_{2,})\s*$', result.strip())
+        if m:
+            prefix = m.group(1) or ""  # 标签部分（含冒号）
+            # 根据标签内容确定填充值
+            full_label = prefix
+            if "项目名称" in full_label or "标的名称" in full_label or "采购项目" in full_label:
+                value = cover_item_name or ""
+            elif "项目编号" in full_label or "采购编号" in full_label or "比选编号" in full_label:
+                value = cover_project_no or ""
+            elif "投标人" in full_label or "投标单位" in full_label or "单位名称" in full_label or "供应商" in full_label:
+                value = company_name or ""
+            elif "日期" in full_label or "时间" in full_label:
+                value = cover_bid_time or ""
+            elif "包号" in full_label:
+                value = cover_package_no or ""
+            else:
+                value = ""
+            if value:
+                result = prefix + value
+        
         return result
     
     def _is_empty_or_placeholder(text):
@@ -3747,40 +3885,109 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
             return True
         return False
     
+    # ====== 从 format_requirements 构建 section_lookup 用于查找封面数据 ======
+    _ad_raw_for_cover = getattr(analysis_result, "analysis_data", None) if analysis_result else None
+    _cover_section_lookup = {}
+    if _ad_raw_for_cover:
+        try:
+            import json as _json_c
+            _ad_c = _json_c.loads(_ad_raw_for_cover) if isinstance(_ad_raw_for_cover, str) else (_ad_raw_for_cover or {})
+            _fmt_c = _ad_c.get("format_requirements", {}) if isinstance(_ad_c, dict) else {}
+            _cover_section_lookup = _fmt_c.get("section_lookup", {}) or {}
+        except Exception:
+            _cover_section_lookup = {}
+    
     for _cover_idx, _cover_item in enumerate(_cover_outline_items):
         if _cover_idx > 0:
-            # 第二个及以后的封面：保持原有渲染方式，走主循环
             continue
-        _cover_blocks = _cover_item.get("template_content", [])
-        _is_first_cover = (_cover_idx == 0)
+        _cover_title = _cover_item.get("title", "").strip()
+        # 从 section_lookup 查找完整的封面模板数据（优先）
+        _cover_blocks = []
+        if _cover_section_lookup and _cover_title:
+            from .analysis_v3.phase1_5_format import _clean_section_title as _cover_clean
+            _clean_key = _cover_clean(_cover_title)
+            _cover_section = _cover_section_lookup.get(_clean_key)
+            if _cover_section:
+                _cover_blocks = _cover_section.get("template_content", [])
+        # 降级：从 outline item 读取
+        if not _cover_blocks:
+            _cover_blocks = _cover_item.get("template_content", [])
         
         if _cover_blocks:
+            _cover_template_found = True
+            
+        # ====== "正本"浮动表格（锚点在封面内容前，通过绝对定位浮动到右上角） ======
+            _zhengben_table = document.add_table(rows=1, cols=1)
+            _zhengben_table.style = "Table Grid"
+            _apply_black_solid_borders(_zhengben_table)
+        # 设置列宽为容纳"正本"二字横向排列
+            for _cell in _zhengben_table.columns[0].cells:
+                _cell.width = Cm(3.0)
+            _zhengben_cell = _zhengben_table.rows[0].cells[0]
+            _zhengben_cell.text = ""
+            _zhengben_p = _zhengben_cell.paragraphs[0]
+            _zhengben_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            _zhengben_run = _zhengben_p.add_run("正本")
+            _zhengben_run.font.name = "宋体"
+            _zhengben_run.font.size = Pt(16)
+            _zhengben_run.bold = True
+            _zhengben_run.font.color.rgb = RGBColor(0x00, 0x00, 0x00)
+            _zhengben_run.element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
+        # 绝对定位：上边框距页面上边距 2.5cm，右边框距页面右边距 2.5cm
+            _tbl_pr = _zhengben_table._tbl.tblPr
+            _existing_tblp = _tbl_pr.find(qn("w:tblpPr"))
+            if _existing_tblp is not None:
+                _tbl_pr.remove(_existing_tblp)
+            _tblpPr = OxmlElement("w:tblpPr")
+            _tblpPr.set(qn("w:leftFromText"), "0")
+            _tblpPr.set(qn("w:rightFromText"), "0")
+            _tblpPr.set(qn("w:topFromText"), "0")
+            _tblpPr.set(qn("w:bottomFromText"), "0")
+            _tblpPr.set(qn("w:vertAnchor"), "page")
+            _tblpPr.set(qn("w:horzAnchor"), "page")
+            _tblpPr.set(qn("w:tblpX"), "5580000")  # 3cm宽表格，右边缘距页边2.5cm
+            _tblpPr.set(qn("w:tblpY"), "406400")
+            _tbl_pr.append(_tblpPr)
+            
+        # LLM 智能填充封面内容
+            _cover_blocks = _llm_fill_cover_blocks(
+                _cover_blocks, cover_item_name, cover_project_no, company_name, cover_bid_time
+            )
+            
+        # 渲染封面 title（使用第一个 template_content block 的字体信息）
+            if _cover_title:
+                _first_font = {}
+                if _cover_blocks:
+                    _first_font = _cover_blocks[0].get("font", {}) or {}
+                _fn = _first_font.get("font_name", "") or "宋体"
+                _fs = _first_font.get("font_size", 22.0)
+                _fb = _first_font.get("bold", True)
+                _p = document.add_paragraph()
+                _p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                _r = _p.add_run(_cover_title)
+                try:
+                    _r.font.name = _fn
+                    _r.font.size = Pt(_fs)
+                except Exception:
+                    _r.font.name = "宋体"
+                    _r.font.size = Pt(22)
+                if _fb:
+                    _r.bold = True
+                try:
+                    _r.element.rPr.rFonts.set(qn("w:eastAsia"), _fn)
+                except Exception:
+                    pass
+            
+        # 渲染 template_content 块
             for _blk in _cover_blocks:
                 if _blk.get("type") in ("paragraph", "text"):
                     _text = _blk.get("text", "") or ""
                     _font = _blk.get("font", {}) or {}
-                    _is_placeholder = _blk.get("placeholder", False)
-                    _fill_mode = _blk.get("fill_mode", "")
                     
-                    # 处理占位符填充
-                    if _is_placeholder:
-                        if _fill_mode == "replace":
-                            # 纯占位符 → 尝试用上下文填充
-                            _filled = _fill_placeholder_text(_text)
-                            if _filled == _text and _is_empty_or_placeholder(_text):
-                                # 找不到内容，保留原样（留空）
-                                pass
-                            else:
-                                _text = _filled
-                        elif _fill_mode == "partial":
-                            # 混合型 → 仅替换占位符部分
-                            _text = _fill_placeholder_text(_text)
-                        else:
-                            # 普通占位符 → 尝试填充
-                            _text = _fill_placeholder_text(_text)
+        # 基础占位符填充（作为 LLM 填充的补充）
+                    _text = _fill_placeholder_text(_text)
                     
                     _p = document.add_paragraph()
-                    # 应用对齐方式
                     _alignment = _font.get("alignment", "")
                     if _alignment == "center":
                         _p.alignment = WD_ALIGN_PARAGRAPH.CENTER
@@ -3789,10 +3996,9 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                     elif _alignment == "left":
                         _p.alignment = WD_ALIGN_PARAGRAPH.LEFT
                     else:
-                        _p.alignment = WD_ALIGN_PARAGRAPH.CENTER  # 封面默认居中
+                        _p.alignment = WD_ALIGN_PARAGRAPH.CENTER
                     
                     _r = _p.add_run(_text)
-                    # 应用字体信息
                     _font_name = _font.get("font_name", "") or "宋体"
                     _font_size = _font.get("font_size", 16.0)
                     _font_bold = _font.get("bold", False)
@@ -3820,92 +4026,129 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                             _t.rows[0].cells[_ci].text = _h
                         for _ri, _row in enumerate(_rows):
                             for _ci, _cell in enumerate(_row):
-                                if _is_first_cover:
-                                    _filled = _fill_placeholder_text(_cell)
-                                else:
-                                    _filled = _cell.replace("XXX", company_name or "") if _ci == 0 else _cell
+                                _filled = _fill_placeholder_text(_cell)
                                 _t.rows[_ri].cells[_ci].text = _filled
-            _cover_template_found = True
+                    
+                    _p = document.add_paragraph()
+                    _alignment = _font.get("alignment", "")
+                    if _alignment == "center":
+                        _p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    elif _alignment == "right":
+                        _p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+                    elif _alignment == "left":
+                        _p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                    else:
+                        _p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    
+                    _r = _p.add_run(_text)
+                    _font_name = _font.get("font_name", "") or "宋体"
+                    _font_size = _font.get("font_size", 16.0)
+                    _font_bold = _font.get("bold", False)
+                    try:
+                        _r.font.name = _font_name
+                        _r.font.size = Pt(_font_size)
+                    except Exception:
+                        _r.font.name = "宋体"
+                        _r.font.size = Pt(16)
+                    if _font_bold:
+                        _r.bold = True
+                    try:
+                        _r.element.rPr.rFonts.set(qn("w:eastAsia"), _font_name or "宋体")
+                    except Exception:
+                        pass
+                        
+                elif _blk.get("type") == "table":
+                    _headers = _blk.get("headers", [])
+                    _rows = _blk.get("rows", [])
+                    if _headers and _rows:
+                        _t = document.add_table(rows=len(_rows), cols=len(_headers))
+                        _t.style = "Table Grid"
+                        _apply_black_solid_borders(_t)
+                        for _ci, _h in enumerate(_headers):
+                            _t.rows[0].cells[_ci].text = _h
+                        for _ri, _row in enumerate(_rows):
+                            for _ci, _cell in enumerate(_row):
+                                _filled = _fill_placeholder_text(_cell)
+                                _t.rows[_ri].cells[_ci].text = _filled
         else:
-            # outline 节点有 is_cover 但无 template_content → 降级到自生成
-            _cover_template_found = False
+            pass
     
-    if not _cover_template_found:
-        # 自有封面模板
-        for _ in range(5):
-            document.add_paragraph("")
-        title_para = document.add_paragraph()
-        title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        run = title_para.add_run("投标文件")
-        run.font.name = "宋体"
-        run.font.size = Pt(22)
-        run.bold = True
-        run.element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
+        if not _cover_template_found:
+            # 自有封面模板
+            for _ in range(5):
+                document.add_paragraph("")
+            title_para = document.add_paragraph()
+            title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            run = title_para.add_run("投标文件")
+            run.font.name = "宋体"
+            run.font.size = Pt(22)
+            run.bold = True
+            run.element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
+        
+            # ====== "正本"浮动表格 ======
+            _zhengben_table = document.add_table(rows=1, cols=1)
+            _zhengben_table.style = "Table Grid"
+            _apply_black_solid_borders(_zhengben_table)
+            # 设置列宽为容纳"正本"二字横向排列
+            for _cell in _zhengben_table.columns[0].cells:
+                _cell.width = Cm(3.0)
+            _zhengben_cell = _zhengben_table.rows[0].cells[0]
+            _zhengben_cell.text = ""
+            _zhengben_p = _zhengben_cell.paragraphs[0]
+            _zhengben_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            _zhengben_run = _zhengben_p.add_run("正本")
+            _zhengben_run.font.name = "宋体"
+            _zhengben_run.font.size = Pt(16)
+            _zhengben_run.bold = True
+            _zhengben_run.font.color.rgb = RGBColor(0x00, 0x00, 0x00)
+            _zhengben_run.element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
+            # 绝对定位：上边框距页面上边距 2.5cm，右边框距页面右边距 2.5cm
+            _tbl_pr = _zhengben_table._tbl.tblPr
+            _existing_tblp = _tbl_pr.find(qn("w:tblpPr"))
+            if _existing_tblp is not None:
+                _tbl_pr.remove(_existing_tblp)
+            _tblpPr = OxmlElement("w:tblpPr")
+            _tblpPr.set(qn("w:leftFromText"), "0")
+            _tblpPr.set(qn("w:rightFromText"), "0")
+            _tblpPr.set(qn("w:topFromText"), "0")
+            _tblpPr.set(qn("w:bottomFromText"), "0")
+            _tblpPr.set(qn("w:vertAnchor"), "page")
+            _tblpPr.set(qn("w:horzAnchor"), "page")
+            _tblpPr.set(qn("w:tblpX"), "5580000")  # 3cm宽表格，右边缘距页边2.5cm
+            _tblpPr.set(qn("w:tblpY"), "406400")
+            _tbl_pr.append(_tblpPr)
 
-        document.add_paragraph("")
-        cover_fields = [
+            document.add_paragraph("")
+            cover_fields = [
             ("标的名称", cover_item_name),
             ("项目编号", cover_project_no),
             ("投标人名称", company_name),
             ("投标时间", cover_bid_time),
-        ]
-        if cover_package_no:
-            cover_fields.append(("包号", cover_package_no))
+            ]
+            if cover_package_no:
+                cover_fields.append(("包号", cover_package_no))
 
-        for label, value in cover_fields:
-            field_para = document.add_paragraph()
-            field_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            safe_value = _strip_xml_control_chars(str(value or ""))
-            run = field_para.add_run(f"{label}：{safe_value}")
-            run.font.name = "宋体"
-            run.font.size = Pt(16)
-            run.element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
-    # ====== "正本"标记（浮动右上角，黑色边框） ======
-    _zhengben_table = document.add_table(rows=1, cols=1)
-    _zhengben_table.style = "Table Grid"
-    _apply_black_solid_borders(_zhengben_table)
-    # 设置列宽为仅容纳"正本"二字
-    for _cell in _zhengben_table.columns[0].cells:
-        _cell.width = Cm(1.5)
-    _zhengben_cell = _zhengben_table.rows[0].cells[0]
-    _zhengben_cell.text = ""
-    _zhengben_p = _zhengben_cell.paragraphs[0]
-    _zhengben_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    _zhengben_run = _zhengben_p.add_run("正本")
-    _zhengben_run.font.name = "宋体"
-    _zhengben_run.font.size = Pt(16)
-    _zhengben_run.bold = True
-    _zhengben_run.element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
-    # 绝对定位：上边框距页面上边距 2.5cm，右边框距页面右边距 2.5cm
-    _tbl_pr = _zhengben_table._tbl.tblPr
-    _existing_tblp = _tbl_pr.find(qn("w:tblpPr"))
-    if _existing_tblp is not None:
-        _tbl_pr.remove(_existing_tblp)
-    _tblpPr = OxmlElement("w:tblpPr")
-    _tblpPr.set(qn("w:leftFromText"), "0")
-    _tblpPr.set(qn("w:rightFromText"), "0")
-    _tblpPr.set(qn("w:topFromText"), "0")
-    _tblpPr.set(qn("w:bottomFromText"), "0")
-    _tblpPr.set(qn("w:vertAnchor"), "page")
-    _tblpPr.set(qn("w:horzAnchor"), "page")
-    _tblpPr.set(qn("w:tblpX"), "19560000")  # 距右侧 2.5cm
-    _tblpPr.set(qn("w:tblpY"), "900000")
-    _tbl_pr.append(_tblpPr)
-    document.add_page_break()
+            for label, value in cover_fields:
+                field_para = document.add_paragraph()
+                field_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                safe_value = _strip_xml_control_chars(str(value or ""))
+                run = field_para.add_run(f"{label}：{safe_value}")
+                run.font.name = "宋体"
+                run.font.size = Pt(16)
+                run.element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
+            # ========== 目录页（占位） ==========
+            for _ in range(1):
+                document.add_paragraph("")
+            toc_title = document.add_paragraph()
+            toc_title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            run = toc_title.add_run("目  录")
+            run.font.name = "黑体"
+            run.font.size = Pt(22)
+            run.bold = True
+            run.element.rPr.rFonts.set(qn("w:eastAsia"), "黑体")
 
-    # ========== 目录页（占位） ==========
-    for _ in range(1):
-        document.add_paragraph("")
-    toc_title = document.add_paragraph()
-    toc_title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = toc_title.add_run("目  录")
-    run.font.name = "黑体"
-    run.font.size = Pt(22)
-    run.bold = True
-    run.element.rPr.rFonts.set(qn("w:eastAsia"), "黑体")
-
-    document.add_paragraph("")
-    # 输出目录结构
+            document.add_paragraph("")
+            # 输出目录结构
     def _write_toc_items(items, indent=0):
         for item in items:
             title = item.get("title", "").strip()
@@ -3924,6 +4167,7 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
             if children:
                 _write_toc_items(children, indent + 1)
 
+    document.add_page_break()
     _write_toc_items(outline)
 
     document.add_paragraph("")
@@ -4243,12 +4487,76 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
             if _first_cover_in_content:
                 _first_cover_in_content = False
                 continue  # 第一个封面已提前渲染
-            # 后续封面：正常渲染模板内容
-            _render_separator_page(document, item, original_text=None)
-            for _blk in item.get("template_content", []):
+            # 后续封面：先分页确保从新页开始
+            document.add_page_break()
+
+            # ====== "正本"浮动表格（锚点在封面内容前，通过绝对定位浮动到右上角） ======
+            _zhengben_table = document.add_table(rows=1, cols=1)
+            _zhengben_table.style = "Table Grid"
+            _apply_black_solid_borders(_zhengben_table)
+            # 设置列宽为容纳"正本"二字横向排列
+            for _cell in _zhengben_table.columns[0].cells:
+                _cell.width = Cm(3.0)
+            _zhengben_cell = _zhengben_table.rows[0].cells[0]
+            _zhengben_cell.text = ""
+            _zhengben_p = _zhengben_cell.paragraphs[0]
+            _zhengben_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            _zhengben_run = _zhengben_p.add_run("正本")
+            _zhengben_run.font.name = "宋体"
+            _zhengben_run.font.size = Pt(16)
+            _zhengben_run.bold = True
+            _zhengben_run.font.color.rgb = RGBColor(0x00, 0x00, 0x00)
+            _zhengben_run.element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
+            # 绝对定位：上边框距页面上边距 2.5cm，右边框距页面右边距 2.5cm
+            _tbl_pr = _zhengben_table._tbl.tblPr
+            _existing_tblp = _tbl_pr.find(qn("w:tblpPr"))
+            if _existing_tblp is not None:
+                _tbl_pr.remove(_existing_tblp)
+            _tblpPr = OxmlElement("w:tblpPr")
+            _tblpPr.set(qn("w:leftFromText"), "0")
+            _tblpPr.set(qn("w:rightFromText"), "0")
+            _tblpPr.set(qn("w:topFromText"), "0")
+            _tblpPr.set(qn("w:bottomFromText"), "0")
+            _tblpPr.set(qn("w:vertAnchor"), "page")
+            _tblpPr.set(qn("w:horzAnchor"), "page")
+            _tblpPr.set(qn("w:tblpX"), "5580000")
+            _tblpPr.set(qn("w:tblpY"), "406400")
+            _tbl_pr.append(_tblpPr)
+            _cover_title_text = item.get("title", "").strip()
+            if _cover_title_text:
+                _p = document.add_paragraph()
+                _p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                _r = _p.add_run(_cover_title_text)
+
+                _r.font.name = "宋体"
+                _r.font.size = Pt(22)
+                _r.bold = True
+                _r.element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
+            # 从 section_lookup 查找完整的封面模板数据（优先）
+            _cover_blocks_2 = []
+            if _cover_section_lookup and _cover_title_text:
+                try:
+                    from .analysis_v3.phase1_5_format import _clean_section_title as _cover_clean_2
+                    _clean_key_2 = _cover_clean_2(_cover_title_text)
+                    _cover_section_2 = _cover_section_lookup.get(_clean_key_2)
+                    if _cover_section_2:
+                        _cover_blocks_2 = _cover_section_2.get("template_content", [])
+                except Exception:
+                    _cover_blocks_2 = []
+            if not _cover_blocks_2:
+                _cover_blocks_2 = item.get("template_content", [])
+            # LLM 智能填充封面内容
+            _cover_blocks_2 = _llm_fill_cover_blocks(
+                _cover_blocks_2, cover_item_name, cover_project_no, company_name, cover_bid_time
+            )
+            for _blk in _cover_blocks_2:
                 if _blk.get("type") in ("paragraph", "text"):
                     _text = _blk.get("text", "") or ""
                     _font = _blk.get("font", dict()) or dict()
+                    
+                    # 基础占位符填充（作为 LLM 填充的补充）
+                    _text = _fill_placeholder_text(_text)
+                    
                     _p = document.add_paragraph()
                     _alignment = _font.get("alignment", "")
                     if _alignment == "center":
@@ -4284,7 +4592,8 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                             _t.rows[0].cells[_ci].text = _h
                         for _ri, _row in enumerate(_rows):
                             for _ci, _cell in enumerate(_row):
-                                _t.rows[_ri].cells[_ci].text = _cell
+                                _filled = _fill_placeholder_text(_cell)
+                                _t.rows[_ri].cells[_ci].text = _filled
             document.add_page_break()
             continue
         # ===== 分隔页检测 =====
