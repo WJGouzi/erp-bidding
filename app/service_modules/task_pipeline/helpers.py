@@ -616,7 +616,11 @@ def _build_chapter_contents_from_records(chapter_records):
     chapter_contents = []
     for item in chapter_records:
         if not item.content_snapshot:
-            raise RuntimeError(f"章节{item.chapter_no}尚未生成完成，无法组装结果文件")
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning("章节%s内容为空，跳过组装", item.chapter_no)
+            chapter_contents.append({"title": item.chapter_title, "content": "", "content_blocks": None})
+            continue
         snapshot = item.content_snapshot
         content_blocks = None
         # 检测是否为序列化的 ContentBlock
@@ -3486,20 +3490,6 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
         return cleaned.strip()
 
 
-    def _build_subject_declaration_text():
-        materials = subject_context.get("materials", []) if subject_context else []
-        if not company_name or not materials:
-            return ""
-        labels = [item.get("material_label", "").strip() for item in materials if item.get("material_label")]
-        joined_labels = "、".join(dict.fromkeys(labels))
-        if not joined_labels:
-            return ""
-        return (
-            f"{company_name}郑重声明：本单位已按本项目要求提供主体资质、身份证明及授权相关材料，"
-            f"包括{joined_labels}。凡在本标书中引用到前述主体资料的章节，均同步插入对应原始文件、扫描页或图片内容；"
-            "未在正文中单独展开的资料，统一附于本文件后续附件章节备查。"
-        )
-
     def _write_formatted_content(doc, text):
         if not text or not text.strip():
             return
@@ -3663,22 +3653,6 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
         for material in matched:
             _write_material_block(material)
         return len(matched)
-
-    def _write_remaining_subject_materials():
-        materials = subject_context.get("materials", []) if subject_context else []
-        remaining = [item for item in materials if _get_material_identity(item) not in inserted_material_ids]
-        if not remaining:
-            return
-
-        document.add_page_break()
-        document.add_heading("主体资料附件", level=1)
-        declaration_text = _build_subject_declaration_text()
-        if declaration_text:
-            _write_formatted_content(document, declaration_text)
-        for material in remaining:
-            _write_material_block(material)
-
-
 
     def _render_separator_page(doc, outline_item, original_text=None):
         """渲染响应文件分隔页：居中、大字号、独立一页。"""
@@ -3874,17 +3848,96 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                 result = prefix + value
         
         return result
-    
-    def _is_empty_or_placeholder(text):
-        """判断文本是否为空或纯占位符。"""
-        if not text or not text.strip():
-            return True
-        if re.fullmatch(r'[_\s]{2,}', text.strip()):
-            return True
-        if re.fullmatch(r'[xX]{2,}', text.strip()):
-            return True
-        return False
-    
+
+    def _insert_zhengben_frame(document):
+        """在封面内容前插入带边框的"正本"标签（右对齐，距行末约两字距离）。"""
+        from docx.shared import Pt, Cm, RGBColor
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+        from docx.oxml import OxmlElement
+        from docx.oxml.ns import qn
+
+        # 空一行（正本在第二行）
+        document.add_paragraph("")
+
+        table = document.add_table(rows=1, cols=1)
+
+        # 列宽：1.6cm 刚好包裹"正本"二字
+        col_width = Cm(1.6)
+        table.columns[0].width = col_width
+
+        # 添加内容
+        cell = table.rows[0].cells[0]
+        cell.text = ""
+        p = cell.paragraphs[0]
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+
+        # 垂直居中：去掉段间距和行距干扰
+        p.paragraph_format.line_spacing = 1.0
+        p.paragraph_format.space_before = Pt(0)
+        p.paragraph_format.space_after = Pt(0)
+
+        tcPr = cell._tc.get_or_add_tcPr()
+        vAlign = OxmlElement("w:vAlign")
+        vAlign.set(qn("w:val"), "center")
+        tcPr.append(vAlign)
+
+        # 单元格边距归零
+        tcMar = OxmlElement('w:tcMar')
+        for pos_name in ['top', 'left', 'bottom', 'right']:
+            mar_el = OxmlElement(f'w:{pos_name}')
+            mar_el.set(qn('w:w'), '0')
+            mar_el.set(qn('w:type'), 'dxa')
+            tcMar.append(mar_el)
+        tcPr.append(tcMar)
+
+        run = p.add_run("正本")
+        run.font.name = "宋体"
+        run.font.size = Pt(16)
+        run.bold = True
+        run.font.color.rgb = RGBColor(0x00, 0x00, 0x00)
+        run.element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
+
+        # 清理并重建 tblPr
+        tbl = table._tbl
+        tblPr = tbl.tblPr
+
+        for child in list(tblPr):
+            tag = child.tag
+            if tag in [qn('w:tblStyle'), qn('w:tblpPr'), qn('w:tblInd'),
+                       qn('w:jc'), qn('w:tblLayout'), qn('w:tblW')]:
+                tblPr.remove(child)
+
+        # 表格右对齐 + 从右边缩进约两字距离（1cm）
+        jc = OxmlElement('w:jc')
+        jc.set(qn('w:val'), 'right')
+        tblPr.append(jc)
+
+        tblInd = OxmlElement('w:tblInd')
+        tblInd.set(qn('w:w'), str(int(Cm(1.0).emu // 635)))
+        tblInd.set(qn('w:type'), 'dxa')
+        tblPr.append(tblInd)
+
+        # 表格宽度
+        tblW = OxmlElement('w:tblW')
+        tblW.set(qn('w:w'), str(int(col_width.emu // 635)))
+        tblW.set(qn('w:type'), 'dxa')
+        tblPr.append(tblW)
+
+        # 固定布局
+        tblLayout = OxmlElement('w:tblLayout')
+        tblLayout.set(qn('w:type'), 'fixed')
+        tblPr.append(tblLayout)
+
+        # 黑色实线边框
+        borders = OxmlElement('w:tblBorders')
+        for pos in ['top', 'left', 'bottom', 'right', 'insideH', 'insideV']:
+            border = OxmlElement(f'w:{pos}')
+            border.set(qn('w:val'), 'single')
+            border.set(qn('w:sz'), '4')
+            border.set(qn('w:space'), '0')
+            border.set(qn('w:color'), '000000')
+            borders.append(border)
+        tblPr.append(borders)
     # ====== 从 format_requirements 构建 section_lookup 用于查找封面数据 ======
     _ad_raw_for_cover = getattr(analysis_result, "analysis_data", None) if analysis_result else None
     _cover_section_lookup = {}
@@ -3912,49 +3965,18 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
         # 降级：从 outline item 读取
         if not _cover_blocks:
             _cover_blocks = _cover_item.get("template_content", [])
-        
+
         if _cover_blocks:
             _cover_template_found = True
             
-        # ====== "正本"浮动表格（锚点在封面内容前，通过绝对定位浮动到右上角） ======
-            _zhengben_table = document.add_table(rows=1, cols=1)
-            _zhengben_table.style = "Table Grid"
-            _apply_black_solid_borders(_zhengben_table)
-        # 设置列宽为容纳"正本"二字横向排列
-            for _cell in _zhengben_table.columns[0].cells:
-                _cell.width = Cm(3.0)
-            _zhengben_cell = _zhengben_table.rows[0].cells[0]
-            _zhengben_cell.text = ""
-            _zhengben_p = _zhengben_cell.paragraphs[0]
-            _zhengben_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            _zhengben_run = _zhengben_p.add_run("正本")
-            _zhengben_run.font.name = "宋体"
-            _zhengben_run.font.size = Pt(16)
-            _zhengben_run.bold = True
-            _zhengben_run.font.color.rgb = RGBColor(0x00, 0x00, 0x00)
-            _zhengben_run.element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
-        # 绝对定位：上边框距页面上边距 2.5cm，右边框距页面右边距 2.5cm
-            _tbl_pr = _zhengben_table._tbl.tblPr
-            _existing_tblp = _tbl_pr.find(qn("w:tblpPr"))
-            if _existing_tblp is not None:
-                _tbl_pr.remove(_existing_tblp)
-            _tblpPr = OxmlElement("w:tblpPr")
-            _tblpPr.set(qn("w:leftFromText"), "0")
-            _tblpPr.set(qn("w:rightFromText"), "0")
-            _tblpPr.set(qn("w:topFromText"), "0")
-            _tblpPr.set(qn("w:bottomFromText"), "0")
-            _tblpPr.set(qn("w:vertAnchor"), "page")
-            _tblpPr.set(qn("w:horzAnchor"), "page")
-            _tblpPr.set(qn("w:tblpX"), "5580000")  # 3cm宽表格，右边缘距页边2.5cm
-            _tblpPr.set(qn("w:tblpY"), "406400")
-            _tbl_pr.append(_tblpPr)
+            _insert_zhengben_frame(document)
             
-        # LLM 智能填充封面内容
+            # ====== LLM 智能填充封面内容 ======
             _cover_blocks = _llm_fill_cover_blocks(
                 _cover_blocks, cover_item_name, cover_project_no, company_name, cover_bid_time
             )
             
-        # 渲染封面 title（使用第一个 template_content block 的字体信息）
+            # ====== 渲染封面 title ======
             if _cover_title:
                 _first_font = {}
                 if _cover_blocks:
@@ -3978,13 +4000,12 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                 except Exception:
                     pass
             
-        # 渲染 template_content 块
+            # ====== 渲染 template_content 块 ======
             for _blk in _cover_blocks:
                 if _blk.get("type") in ("paragraph", "text"):
                     _text = _blk.get("text", "") or ""
                     _font = _blk.get("font", {}) or {}
                     
-        # 基础占位符填充（作为 LLM 填充的补充）
                     _text = _fill_placeholder_text(_text)
                     
                     _p = document.add_paragraph()
@@ -4029,49 +4050,27 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                                 _filled = _fill_placeholder_text(_cell)
                                 _t.rows[_ri].cells[_ci].text = _filled
                     
-                    _p = document.add_paragraph()
-                    _alignment = _font.get("alignment", "")
-                    if _alignment == "center":
+                    _table_caption = _blk.get("caption", "") or ""
+                    if _table_caption:
+                        _p = document.add_paragraph()
                         _p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                    elif _alignment == "right":
-                        _p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-                    elif _alignment == "left":
-                        _p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-                    else:
-                        _p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                    
-                    _r = _p.add_run(_text)
-                    _font_name = _font.get("font_name", "") or "宋体"
-                    _font_size = _font.get("font_size", 16.0)
-                    _font_bold = _font.get("bold", False)
-                    try:
-                        _r.font.name = _font_name
-                        _r.font.size = Pt(_font_size)
-                    except Exception:
-                        _r.font.name = "宋体"
-                        _r.font.size = Pt(16)
-                    if _font_bold:
-                        _r.bold = True
-                    try:
-                        _r.element.rPr.rFonts.set(qn("w:eastAsia"), _font_name or "宋体")
-                    except Exception:
-                        pass
-                        
-                elif _blk.get("type") == "table":
-                    _headers = _blk.get("headers", [])
-                    _rows = _blk.get("rows", [])
-                    if _headers and _rows:
-                        _t = document.add_table(rows=len(_rows), cols=len(_headers))
-                        _t.style = "Table Grid"
-                        _apply_black_solid_borders(_t)
-                        for _ci, _h in enumerate(_headers):
-                            _t.rows[0].cells[_ci].text = _h
-                        for _ri, _row in enumerate(_rows):
-                            for _ci, _cell in enumerate(_row):
-                                _filled = _fill_placeholder_text(_cell)
-                                _t.rows[_ri].cells[_ci].text = _filled
-        else:
-            pass
+                        _r = _p.add_run(_table_caption)
+                        _font = _blk.get("font", {}) or {}
+                        _font_name = _font.get("font_name", "") or "宋体"
+                        _font_size = _font.get("font_size", 16.0)
+                        _font_bold = _font.get("bold", False)
+                        try:
+                            _r.font.name = _font_name
+                            _r.font.size = Pt(_font_size)
+                        except Exception:
+                            _r.font.name = "宋体"
+                            _r.font.size = Pt(16)
+                        if _font_bold:
+                            _r.bold = True
+                        try:
+                            _r.element.rPr.rFonts.set(qn("w:eastAsia"), _font_name or "宋体")
+                        except Exception:
+                            pass    
     
         if not _cover_template_found:
             # 自有封面模板
@@ -4085,38 +4084,7 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
             run.bold = True
             run.element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
         
-            # ====== "正本"浮动表格 ======
-            _zhengben_table = document.add_table(rows=1, cols=1)
-            _zhengben_table.style = "Table Grid"
-            _apply_black_solid_borders(_zhengben_table)
-            # 设置列宽为容纳"正本"二字横向排列
-            for _cell in _zhengben_table.columns[0].cells:
-                _cell.width = Cm(3.0)
-            _zhengben_cell = _zhengben_table.rows[0].cells[0]
-            _zhengben_cell.text = ""
-            _zhengben_p = _zhengben_cell.paragraphs[0]
-            _zhengben_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            _zhengben_run = _zhengben_p.add_run("正本")
-            _zhengben_run.font.name = "宋体"
-            _zhengben_run.font.size = Pt(16)
-            _zhengben_run.bold = True
-            _zhengben_run.font.color.rgb = RGBColor(0x00, 0x00, 0x00)
-            _zhengben_run.element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
-            # 绝对定位：上边框距页面上边距 2.5cm，右边框距页面右边距 2.5cm
-            _tbl_pr = _zhengben_table._tbl.tblPr
-            _existing_tblp = _tbl_pr.find(qn("w:tblpPr"))
-            if _existing_tblp is not None:
-                _tbl_pr.remove(_existing_tblp)
-            _tblpPr = OxmlElement("w:tblpPr")
-            _tblpPr.set(qn("w:leftFromText"), "0")
-            _tblpPr.set(qn("w:rightFromText"), "0")
-            _tblpPr.set(qn("w:topFromText"), "0")
-            _tblpPr.set(qn("w:bottomFromText"), "0")
-            _tblpPr.set(qn("w:vertAnchor"), "page")
-            _tblpPr.set(qn("w:horzAnchor"), "page")
-            _tblpPr.set(qn("w:tblpX"), "5580000")  # 3cm宽表格，右边缘距页边2.5cm
-            _tblpPr.set(qn("w:tblpY"), "406400")
-            _tbl_pr.append(_tblpPr)
+            _insert_zhengben_frame(document)
 
             document.add_paragraph("")
             cover_fields = [
@@ -4136,19 +4104,21 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                 run.font.name = "宋体"
                 run.font.size = Pt(16)
                 run.element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
-            # ========== 目录页（占位） ==========
-            for _ in range(1):
-                document.add_paragraph("")
-            toc_title = document.add_paragraph()
-            toc_title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            run = toc_title.add_run("目  录")
-            run.font.name = "黑体"
-            run.font.size = Pt(22)
-            run.bold = True
-            run.element.rPr.rFonts.set(qn("w:eastAsia"), "黑体")
+            
+    # ========== 目录页 ==========
+    document.add_page_break()
+    toc_title = document.add_heading("目录", level=1)
+    toc_title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    for run in toc_title.runs:
+        run.font.name = "宋体"
+        run.font.size = Pt(16)
+        run.bold = True
+        run.font.color.rgb = RGBColor(0x00, 0x00, 0x00)
+        run.element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
 
-            document.add_paragraph("")
-            # 输出目录结构
+    document.add_paragraph("")
+    
+    # 输出目录结构        
     def _write_toc_items(items, indent=0):
         for item in items:
             title = item.get("title", "").strip()
@@ -4167,7 +4137,6 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
             if children:
                 _write_toc_items(children, indent + 1)
 
-    document.add_page_break()
     _write_toc_items(outline)
 
     document.add_paragraph("")
@@ -4487,41 +4456,8 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
             if _first_cover_in_content:
                 _first_cover_in_content = False
                 continue  # 第一个封面已提前渲染
-            # 后续封面：先分页确保从新页开始
-            document.add_page_break()
 
-            # ====== "正本"浮动表格（锚点在封面内容前，通过绝对定位浮动到右上角） ======
-            _zhengben_table = document.add_table(rows=1, cols=1)
-            _zhengben_table.style = "Table Grid"
-            _apply_black_solid_borders(_zhengben_table)
-            # 设置列宽为容纳"正本"二字横向排列
-            for _cell in _zhengben_table.columns[0].cells:
-                _cell.width = Cm(3.0)
-            _zhengben_cell = _zhengben_table.rows[0].cells[0]
-            _zhengben_cell.text = ""
-            _zhengben_p = _zhengben_cell.paragraphs[0]
-            _zhengben_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            _zhengben_run = _zhengben_p.add_run("正本")
-            _zhengben_run.font.name = "宋体"
-            _zhengben_run.font.size = Pt(16)
-            _zhengben_run.bold = True
-            _zhengben_run.font.color.rgb = RGBColor(0x00, 0x00, 0x00)
-            _zhengben_run.element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
-            # 绝对定位：上边框距页面上边距 2.5cm，右边框距页面右边距 2.5cm
-            _tbl_pr = _zhengben_table._tbl.tblPr
-            _existing_tblp = _tbl_pr.find(qn("w:tblpPr"))
-            if _existing_tblp is not None:
-                _tbl_pr.remove(_existing_tblp)
-            _tblpPr = OxmlElement("w:tblpPr")
-            _tblpPr.set(qn("w:leftFromText"), "0")
-            _tblpPr.set(qn("w:rightFromText"), "0")
-            _tblpPr.set(qn("w:topFromText"), "0")
-            _tblpPr.set(qn("w:bottomFromText"), "0")
-            _tblpPr.set(qn("w:vertAnchor"), "page")
-            _tblpPr.set(qn("w:horzAnchor"), "page")
-            _tblpPr.set(qn("w:tblpX"), "5580000")
-            _tblpPr.set(qn("w:tblpY"), "406400")
-            _tbl_pr.append(_tblpPr)
+            _insert_zhengben_frame(document)
             _cover_title_text = item.get("title", "").strip()
             if _cover_title_text:
                 _p = document.add_paragraph()
@@ -4686,11 +4622,8 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                     _last_child_element = _body_children[-1]
                 document.add_page_break()
             continue
-        if _oi_idx > 0:
-            
-    
-            document.add_page_break()
         _write_outline_item(item, level=1)
+        document.add_page_break()
 
 
     stream = BytesIO()
