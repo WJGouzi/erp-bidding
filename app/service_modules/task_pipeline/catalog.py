@@ -142,14 +142,29 @@ def _parse_format_tree(required_sections):
         parent = required_sections[p_idx]
         next_p = parent_indices[idx + 1] if idx + 1 < len(parent_indices) else len(required_sections)
         children = [c for c in required_sections[p_idx + 1:next_p]
-                    if not _score_keywords.search(c.get("title", ""))]
+                    if not _score_keywords.search(c.get("title", ""))
+                    and not c.get("is_cover", False)]
+        # 封面节点不在 children 中收集，后续作为独立顶层节点处理
+        cover_children = [c for c in required_sections[p_idx + 1:next_p]
+                         if c.get("is_cover", False)]
         tree.append(_build_node(parent, [
             {"source": "format_requirements", "title": c.get("title", ""),
              "template_texts": c.get("template_texts", []),
              "template_content": c.get("template_content", [])}
             for c in children
         ]))
-        processed_up_to = p_idx + 1
+        # 将封面节点（如分册封面）作为独立顶层节点追加
+        _cover_max_idx = p_idx
+        for _cc in cover_children:
+            tree.append(_build_node(_cc))
+        # 跳过已被封面节点占据的索引，避免重复处理
+        if cover_children:
+            for _i in range(p_idx + 1, next_p):
+                if required_sections[_i].get("is_cover", False):
+                    _cover_max_idx = _i
+            processed_up_to = max(p_idx + 1, _cover_max_idx + 1)
+        else:
+            processed_up_to = p_idx + 1
 
     # 最后一个父级之后的剩余项 → 扁平节点
     while processed_up_to < len(required_sections):
@@ -777,6 +792,39 @@ def _assign_numbers(skeleton):
         "children": [],
     })
     return skeleton
+
+
+def _build_volume_map(outline):
+    """从已编号的 outline 中构建分册映射。
+
+    Args:
+        outline: _assign_numbers 返回的已编号目录树
+
+    Returns:
+        list[dict]: [
+            {"volume_name": "资格性响应文件",
+             "chapter_titles": ["一、法定代表人授权书", ...]},
+            ...
+        ]
+        无分册时返回空列表。
+    """
+    volumes = []
+    current_volume = None
+    for node in outline:
+        if node.get("is_volume_label"):
+            # 新分册开始
+            vol_name = node.get("title", "").strip()
+            if current_volume is not None:
+                volumes.append(current_volume)
+            current_volume = {"volume_name": vol_name, "chapter_titles": []}
+        elif current_volume is not None and not node.get("is_cover"):
+            title = node.get("title", "").strip()
+            if title:
+                current_volume["chapter_titles"].append(title)
+    # 处理最后一个分册
+    if current_volume is not None:
+        volumes.append(current_volume)
+    return volumes
 
 
 def _extract_volume_name(cover_title):

@@ -555,6 +555,39 @@ def _merge_cover_sections(required: List[Dict],
                 result.append(sec)
 
     return result
+def _build_volumes_from_required(required_sections):
+    """从 required_sections 构建分册映射。
+
+    required_sections 中 is_cover=True 的条目为分册封面，
+    其后跟随的条目为该分册的章节，直到下一个封面条目。
+
+    Returns:
+        list[dict]: [{"volume_name": "...", "chapter_titles": ["...", ...]}, ...]
+    """
+    volumes = []
+    current_volume = None
+    for rs in required_sections:
+        if rs.get("is_cover"):
+            if current_volume is not None:
+                volumes.append(current_volume)
+            title = (rs.get("title", "") or "").strip()
+            vol_name = title
+            # 如果标题含括号封面指示器，提取括号内的名称
+            m = re.search(r'[（(]([^）)]+)[）)]', title)
+            if m:
+                vol_name = m.group(1)
+                vol_name = re.sub(r'封面|封皮', '', vol_name).strip()
+                vol_name = vol_name.rstrip('，,、').strip()
+            current_volume = {"volume_name": vol_name if vol_name else "封面", "chapter_titles": []}
+        elif current_volume is not None:
+            title = (rs.get("title", "") or "").strip()
+            if title:
+                current_volume["chapter_titles"].append(title)
+    if current_volume is not None:
+        volumes.append(current_volume)
+    return volumes
+
+
 def extract_format_requirements(sections) -> Optional[Dict]:
     """从文档章节树中提取格式要求。
 
@@ -626,11 +659,12 @@ def extract_format_requirements(sections) -> Optional[Dict]:
         chapter_title, len(required_sections), _total_tables, len(fixed_texts), confidence,
     )
 
+    volumes = _build_volumes_from_required(required_sections)
     return {
         "chapter_title": chapter_title,
         "required_sections": required_sections,
         "section_lookup": section_lookup,
-
+        "volumes": volumes,
         "fixed_texts": fixed_texts,
         "confidence": confidence,
     }

@@ -592,6 +592,150 @@ class DocumentParser:
 
     def __init__(self, ocr_client=None):
         self.ocr_client = ocr_client
+    # ========== WPS/Word 自动编号解析 ==========
+
+    _CHINESE_NUMS = ['零', '一', '二', '三', '四', '五', '六', '七', '八', '九']
+
+    @staticmethod
+    def _int_to_chinese(n: int) -> str:
+        """阿拉伯数字转中文数字（支持 1~999）。"""
+        if n < 1:
+            return str(n)
+        if n <= 10:
+            return DocumentParser._CHINESE_NUMS[n]
+        if n < 20:
+            return '十' + (DocumentParser._CHINESE_NUMS[n - 10] if n > 10 else '')
+        if n < 100:
+            tens = n // 10
+            ones = n % 10
+            return DocumentParser._CHINESE_NUMS[tens] + '十' + (DocumentParser._CHINESE_NUMS[ones] if ones else '')
+        if n < 1000:
+            hundreds = n // 100
+            rest = n % 100
+            result = DocumentParser._CHINESE_NUMS[hundreds] + '百'
+            if rest:
+                if rest < 10:
+                    result += '零' + DocumentParser._CHINESE_NUMS[rest]
+                else:
+                    result += DocumentParser._int_to_chinese(rest)
+            return result
+        return str(n)
+
+    _NUMFMT_HANDLERS = {
+        'chineseCounting': _int_to_chinese,
+        'decimal': str,
+        'ordinal': str,
+        'cardinalText': str,
+    }
+
+    def _load_numbering_defs(self, payload: bytes) -> dict:
+        """从 DOCX payload 中加载自动编号定义（numbering.xml）。
+
+        Returns:
+            dict: {num_id: {ilvl: {numFmt, lvlText, start}}}
+        """
+        ns = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
+        numbering_defs = {}
+        try:
+            with ZipFile(BytesIO(payload)) as zf:
+                if 'word/numbering.xml' not in zf.namelist():
+                    return numbering_defs
+                tree = ET.parse(zf.open('word/numbering.xml'))
+                root = tree.getroot()
+
+                # 1. Build abstractNum lookup
+                abstract_nums = {}
+                for anum in root.findall(f'.//{ns}abstractNum'):
+                    anum_id = anum.get(f'{ns}abstractNumId')
+                    levels = {}
+                    for lvl in anum.findall(f'{ns}lvl'):
+                        ilvl = lvl.get(f'{ns}ilvl')
+                        numFmt_elem = lvl.find(f'{ns}numFmt')
+                        lvlText_elem = lvl.find(f'{ns}lvlText')
+                        start_elem = lvl.find(f'{ns}start')
+                        numFmt = numFmt_elem.get(f'{ns}val') if numFmt_elem is not None else 'decimal'
+                        lvlText = lvlText_elem.get(f'{ns}val') if lvlText_elem is not None else '%1.'
+                        start = int(start_elem.get(f'{ns}val')) if start_elem is not None else 1
+                        levels[int(ilvl)] = {
+                            'numFmt': numFmt,
+                            'lvlText': lvlText,
+                            'start': start,
+                        }
+                    abstract_nums[anum_id] = levels
+
+                # 2. Build num lookup (numId -> abstractNumId)
+                for num_elem in root.findall(f'.//{ns}num'):
+                    num_id = num_elem.get(f'{ns}numId')
+                    anum_ref = num_elem.find(f'{ns}abstractNumId')
+                    if anum_ref is not None:
+                        anum_id = anum_ref.get(f'{ns}val')
+                        numbering_defs[num_id] = abstract_nums.get(anum_id, {})
+        except Exception as e:
+            logger.warning("[parser] 加载编号定义失败: %s", e)
+        return numbering_defs
+
+    def _resolve_numbering_prefix(self, para_element, numbering_defs: dict,
+                                   num_counters: dict) -> str:
+        """从段落 XML 中解析自动编号前缀。
+
+        Args:
+            para_element: python-docx 段落的 _element (lxml Element)
+            numbering_defs: _load_numbering_defs 返回的编号定义
+            num_counters: 跟踪每个 numId+ilvl 已出现的次数（跨段落维护）
+
+        Returns:
+            str: 解析出的编号前缀（如 "三、"），无编号时返回空字符串
+        """
+        ns = '{http://schemas.openxmlformats.org/wordprocessingml/2006/main}'
+        try:
+            pPr = para_element.find(f'{ns}pPr')
+            if pPr is None:
+                return ''
+
+            numPr = pPr.find(f'{ns}numPr')
+            if numPr is None:
+                return ''
+
+            numId_elem = numPr.find(f'{ns}numId')
+            ilvl_elem = numPr.find(f'{ns}ilvl')
+
+            if numId_elem is None:
+                return ''
+
+            num_id = numId_elem.get(f'{ns}val')
+            ilvl = int(ilvl_elem.get(f'{ns}val', '0')) if ilvl_elem is not None else 0
+
+            levels = numbering_defs.get(num_id, {})
+            level = levels.get(ilvl, {})
+
+            if not level or level.get('numFmt') in ('none', 'bullet'):
+                return ''
+
+            numFmt = level['numFmt']
+            lvlText = level['lvlText']
+            start = level['start']
+
+            # Track sequential count for this numId+ilvl
+            key = (num_id, ilvl)
+            count = num_counters.get(key, 0)
+            num_counters[key] = count + 1
+
+            current_num = start + count
+
+            # Format the number according to numFmt
+            handler = self._NUMFMT_HANDLERS.get(numFmt, str)
+            number_text = handler(current_num)
+
+            prefix = lvlText.replace('%1', number_text)
+            # 清除多级编号的残留引用 %2, %3...
+            prefix = re.sub(r'%\d+', '', prefix).strip()
+
+            return prefix
+        except Exception as e:
+            logger.debug("[parser] 解析编号前缀失败: %s", e)
+            return ''
+
+
 
     # ========== 统一入口 ==========
 
@@ -668,6 +812,10 @@ class DocumentParser:
 
         ]
 
+        # 加载 WPS/Word 自动编号定义
+        numbering_defs = self._load_numbering_defs(payload)
+        num_counters = {}
+
         stack = [Section(title="__root__", level=0)]
         current_section = stack[-1]
         # ── 跟踪 body 子元素到章节的映射 ──
@@ -677,6 +825,11 @@ class DocumentParser:
         for para in document.paragraphs:
             _body_child_counter += 1
             text = para.text.strip()
+            # 解析 WPS/Word 自动编号前缀
+            if text and numbering_defs and hasattr(para, '_element') and para._element is not None:
+                _num_prefix = self._resolve_numbering_prefix(para._element, numbering_defs, num_counters)
+                if _num_prefix:
+                    text = _num_prefix + text
             if not text:
                 continue
 
@@ -1464,6 +1617,10 @@ class DocumentParser:
     def _build_sections_from_text(self, text: str, doc: StructuredDocument):
         """从合并文本中重建章节结构。"""
         lines = text.split("\n")
+        # 加载 WPS/Word 自动编号定义
+        numbering_defs = self._load_numbering_defs(payload)
+        num_counters = {}
+
         stack = [Section(title="__root__", level=0)]
 
         for line in lines:
