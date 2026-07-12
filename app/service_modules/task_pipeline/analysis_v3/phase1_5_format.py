@@ -588,6 +588,78 @@ def _build_volumes_from_required(required_sections):
     return volumes
 
 
+def _detect_two_choice_patterns(required_sections):
+    """扫描 required_sections 中的 template_content，检测二选一占位符。
+
+    返回:
+        List[dict]: [{"section_key": "五、承诺函", "raw": "（有、无）",
+                       "selected": "无", "reason": "失信→选无"}]
+    """
+    import re
+
+    _TWO_CHOICE_PATTERN = re.compile(
+        r'[\uFF08(]\s*([\u4e00-\u9fff]{1,2})\s*[\u3001/]\s*([\u4e00-\u9fff]{1,2})\s*[\uFF09)]'
+    )
+    _TWO_CHOICE_KEYWORDS = {'有', '无', '是', '否'}
+    _NEGATIVE_KEYWORDS = {'犯罪', '失信', '处罚', '违规', '违法', '不良', '诉讼', '纠纷', '黑名单', '惩戒', '禁止', '处分'}
+    _CONTEXT_WINDOW = 100
+
+    def _has_negative_context(text, position):
+        if not text:
+            return False
+        start = max(0, position - _CONTEXT_WINDOW)
+        end = min(len(text), position + _CONTEXT_WINDOW)
+        return any(kw in text[start:end] for kw in _NEGATIVE_KEYWORDS)
+
+    def _choose_positive(opt_a, opt_b, text, pos):
+        is_neg = _has_negative_context(text, pos)
+        neg_option = None
+        if '无' in (opt_a, opt_b):
+            neg_option = '无'
+        elif '否' in (opt_a, opt_b):
+            neg_option = '否'
+        if neg_option:
+            return neg_option if is_neg else (opt_b if opt_a == neg_option else opt_a)
+        return opt_a
+
+    results = []
+
+    def _scan_section(sec, parent_title=""):
+        title = sec.get("title", "") or parent_title
+        # 扫描 template_content 中的文本
+        tc_list = sec.get("template_content", []) or []
+        for block in tc_list:
+            block_text = block.get("text", "") if isinstance(block, dict) else ""
+            if not block_text:
+                continue
+            for m in _TWO_CHOICE_PATTERN.finditer(block_text):
+                opt_a, opt_b = m.group(1), m.group(2)
+                if opt_a not in _TWO_CHOICE_KEYWORDS and opt_b not in _TWO_CHOICE_KEYWORDS:
+                    continue
+                selected = _choose_positive(opt_a, opt_b, block_text, m.start())
+                reasons = []
+                if _has_negative_context(block_text, m.start()):
+                    for kw in _NEGATIVE_KEYWORDS:
+                        if kw in block_text:
+                            reasons.append(kw)
+                reason = ("上下文含" + "、".join(reasons[:3]) + "关键词，选择否定选项") if reasons else "正面/未知上下文，选择肯定选项"
+                results.append({
+                    "section_key": _clean_section_title(title),
+                    "raw": m.group(0),
+                    "selected": selected,
+                    "reason": reason,
+                    "text_snippet": block_text.strip()[:120],
+                })
+        # 递归扫描子章节
+        for child in sec.get("children", []):
+            _scan_section(child, title)
+
+    for sec in required_sections:
+        _scan_section(sec)
+
+    return results
+
+
 def extract_format_requirements(sections) -> Optional[Dict]:
     """从文档章节树中提取格式要求。
 
@@ -660,11 +732,17 @@ def extract_format_requirements(sections) -> Optional[Dict]:
     )
 
     volumes = _build_volumes_from_required(required_sections)
+    two_choice_placeholders = _detect_two_choice_patterns(required_sections)
+    if two_choice_placeholders:
+        logger.info("[phase1.5] 检测到 %d 个二选一占位符: %s",
+                     len(two_choice_placeholders),
+                     [p["raw"] for p in two_choice_placeholders])
     return {
         "chapter_title": chapter_title,
         "required_sections": required_sections,
         "section_lookup": section_lookup,
         "volumes": volumes,
+        "two_choice_placeholders": two_choice_placeholders,
         "fixed_texts": fixed_texts,
         "confidence": confidence,
     }

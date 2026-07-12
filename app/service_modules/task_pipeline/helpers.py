@@ -2338,6 +2338,105 @@ def _verify_template_diff(original, filled):
     return is_safe, modified
 
 
+# ========== 二选一占位符常量 ==========
+_TWO_CHOICE_PATTERN = re.compile(
+    r'[\uFF08(]\s*([\u4e00-\u9fff]{1,2})\s*[\u3001/]\s*([\u4e00-\u9fff]{1,2})\s*[\uFF09)]'
+)
+_TWO_CHOICE_KEYWORDS = {'有', '无', '是', '否'}
+_NEGATIVE_KEYWORDS = {'犯罪', '失信', '处罚', '违规', '违法', '不良', '诉讼', '纠纷', '黑名单', '惩戒', '禁止', '处分'}
+_CONTEXT_WINDOW = 100
+
+
+def _is_negative_context(text, position):
+    """检测 position 附近 _CONTEXT_WINDOW 字符内是否有负面关键词。"""
+    if not text:
+        return False
+    start = max(0, position - _CONTEXT_WINDOW)
+    end = min(len(text), position + _CONTEXT_WINDOW)
+    window = text[start:end]
+    return any(kw in window for kw in _NEGATIVE_KEYWORDS)
+
+
+def _fill_two_choice_placeholders(text, section_title=None, two_choice_fills=None):
+    """检测并正向填充二选一占位符（有/无、是/否等）。
+
+    优先使用分析阶段预存的结果。若分析阶段无对应数据，降级到关键词检测。
+
+    Args:
+        text: 待填充文本
+        section_title: 当前章节标题（用于匹配分析数据）
+        two_choice_fills: 分析阶段检测到的二选一占位符列表，
+            [{"section_key": "...", "raw": "（有、无）", "selected": "无", ...}]
+
+    Returns:
+        填充后的文本（含 **option** 加粗标记）
+    """
+    if not text:
+        return text
+
+    # Phase 1：优先使用分析阶段预存的数据
+    if section_title and two_choice_fills:
+        _clean_key = None
+        try:
+            # 使用和分析阶段一致的标题清洗函数
+            from .analysis_v3.phase1_5_format import _clean_section_title
+            _clean_key = _clean_section_title(section_title)
+        except Exception:
+            _clean_key = section_title.strip()
+
+        # 收集当前章节的所有匹配条目
+        _section_fills = [
+            e for e in two_choice_fills
+            if e.get("section_key") == _clean_key
+        ]
+        if len(_section_fills) == 1:
+            # 仅一条 → 简单替换
+            _entry = _section_fills[0]
+            _raw = _entry.get("raw", "")
+            _sel = _entry.get("selected", "")
+            if _raw and _sel:
+                return text.replace(_raw, f'**{_sel}**')
+        elif len(_section_fills) > 1:
+            # 同一章节多条 → 用 text_snippet 精确匹配
+            _result = text
+            for _entry in _section_fills:
+                _raw = _entry.get("raw", "")
+                _sel = _entry.get("selected", "")
+                _snip = _entry.get("text_snippet", "")
+                if _raw and _sel:
+                    if _snip and _snip in _result:
+                        _result = _result.replace(_snip, _snip.replace(_raw, f'**{_sel}**'))
+                    else:
+                        _result = _result.replace(_raw, f'**{_sel}**', 1)
+            return _result
+
+    # Phase 2：降级到关键词检测（兼容旧的分析数据）
+    result = list(text)
+    for m in reversed(list(_TWO_CHOICE_PATTERN.finditer(text))):
+        opt_a, opt_b = m.group(1), m.group(2)
+        pos = m.start()
+
+        if opt_a not in _TWO_CHOICE_KEYWORDS and opt_b not in _TWO_CHOICE_KEYWORDS:
+            continue
+
+        is_neg = _is_negative_context(text, pos)
+
+        neg_option = None
+        if '无' in (opt_a, opt_b):
+            neg_option = '无'
+        elif '否' in (opt_a, opt_b):
+            neg_option = '否'
+
+        if neg_option:
+            chosen = neg_option if is_neg else (opt_b if opt_a == neg_option else opt_a)
+        else:
+            chosen = opt_a
+
+        result[m.start():m.end()] = f'**{chosen}**'
+
+    return ''.join(result)
+
+
 def _template_has_meaningful_content(template_text):
     """判断模板文本是否包含有效内容（不只是占位符框架）。"""
     if not template_text or not template_text.strip():
@@ -2825,6 +2924,9 @@ def _generate_chapter_content(task, chapter, analysis_result, subject_context, k
                                    chapter_title, len(unfilled))
                 logger.info("[template] 章节「%s」填空完成，占位符%s个，未填充%s个",
                             chapter_title, len(placeholders), len(unfilled))
+                # 二选一占位符正向填充（优先使用分析阶段预存数据）
+                _tc_fills = _analysis_data.get("format_requirements", {}).get("two_choice_placeholders", []) if isinstance(_analysis_data, dict) else []
+                filled = _fill_two_choice_placeholders(filled, section_title=chapter_title, two_choice_fills=_tc_fills)
                 return filled
         # TEXT_TEMPLATE 在原文中找不到模板文本→留空，绝不落入 LLM
         logger.info("[template] 章节「%s」为模板类型但原文中未找到模板文本，留空", chapter_title)
@@ -3472,6 +3574,39 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
     _set_heading_style(4, "宋体", 12, True, 6, 6)
 
     # ========== 辅助函数 ==========
+    def _add_run_with_bold(paragraph, text, font_name=None, font_size=None, default_bold=False):
+        """向段落添加文本，处理 **bold** 标记生成多个 run。"""
+        if not text:
+            return
+        bold_re = re.compile(r'\*\*(.+?)\*\*')
+        parts = []
+        last_end = 0
+        for m in bold_re.finditer(text):
+            if m.start() > last_end:
+                parts.append((text[last_end:m.start()], False))
+            parts.append((m.group(1), True))
+            last_end = m.end()
+        if last_end < len(text):
+            parts.append((text[last_end:], False))
+        if not parts:
+            parts = [(text, False)]
+        for part_text, is_bold in parts:
+            if not part_text:
+                continue
+            run = paragraph.add_run(part_text)
+            if font_name:
+                try:
+                    run.font.name = font_name
+                    run.element.rPr.rFonts.set(qn("w:eastAsia"), font_name)
+                except Exception:
+                    pass
+            if font_size is not None:
+                try:
+                    run.font.size = Pt(font_size)
+                except Exception:
+                    pass
+            run.bold = is_bold or default_bold
+
     def _clean_markdown(text):
         cleaned = text
         cleaned = re.sub(r'```[\w]*\n?', '', cleaned)
@@ -3507,11 +3642,17 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
             safe_text = _strip_xml_control_chars(stripped)
             if not safe_text:
                 continue
-            p = doc.add_paragraph(safe_text)
+            # 二选一占位符正向填充
+            safe_text = _fill_two_choice_placeholders(safe_text)
+            p = doc.add_paragraph()
             p.style = document.styles["Normal"]
             pf = p.paragraph_format
             pf.first_line_indent = Pt(24)
             pf.line_spacing = 1.5
+            if '**' in safe_text:
+                _add_run_with_bold(p, safe_text)
+            else:
+                p.add_run(safe_text)
 
     
 
@@ -3949,6 +4090,9 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
             _cover_section_lookup = _fmt_c.get("section_lookup", {}) or {}
         except Exception:
             _cover_section_lookup = {}
+    # 提取分析阶段检测到的二选一占位符数据
+    _two_choice_raw = _fmt_c.get("two_choice_placeholders", []) if isinstance(_fmt_c, dict) else []
+    _tc_fills_cover = _two_choice_raw if isinstance(_two_choice_raw, list) else []
     
     for _cover_idx, _cover_item in enumerate(_cover_outline_items):
         if _cover_idx > 0:
@@ -4007,6 +4151,7 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                     _font = _blk.get("font", {}) or {}
                     
                     _text = _fill_placeholder_text(_text)
+                    _text = _fill_two_choice_placeholders(_text, section_title=_cover_title, two_choice_fills=_tc_fills_cover)
                     
                     _p = document.add_paragraph()
                     _alignment = _font.get("alignment", "")
@@ -4019,22 +4164,25 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                     else:
                         _p.alignment = WD_ALIGN_PARAGRAPH.CENTER
                     
-                    _r = _p.add_run(_text)
                     _font_name = _font.get("font_name", "") or "宋体"
                     _font_size = _font.get("font_size", 16.0)
                     _font_bold = _font.get("bold", False)
-                    try:
-                        _r.font.name = _font_name
-                        _r.font.size = Pt(_font_size)
-                    except Exception:
-                        _r.font.name = "宋体"
-                        _r.font.size = Pt(16)
-                    if _font_bold:
-                        _r.bold = True
-                    try:
-                        _r.element.rPr.rFonts.set(qn("w:eastAsia"), _font_name or "宋体")
-                    except Exception:
-                        pass
+                    if '**' in _text:
+                        _add_run_with_bold(_p, _text, font_name=_font_name, font_size=_font_size, default_bold=_font_bold)
+                    else:
+                        _r = _p.add_run(_text)
+                        try:
+                            _r.font.name = _font_name
+                            _r.font.size = Pt(_font_size)
+                        except Exception:
+                            _r.font.name = "宋体"
+                            _r.font.size = Pt(16)
+                        if _font_bold:
+                            _r.bold = True
+                        try:
+                            _r.element.rPr.rFonts.set(qn("w:eastAsia"), _font_name or "宋体")
+                        except Exception:
+                            pass
                         
                 elif _blk.get("type") == "table":
                     _headers = _blk.get("headers", [])
@@ -4492,6 +4640,7 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                     
                     # 基础占位符填充（作为 LLM 填充的补充）
                     _text = _fill_placeholder_text(_text)
+                    _text = _fill_two_choice_placeholders(_text, section_title=_cover_title_text, two_choice_fills=_tc_fills_cover)
                     
                     _p = document.add_paragraph()
                     _alignment = _font.get("alignment", "")
@@ -4501,22 +4650,25 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                         _p.alignment = WD_ALIGN_PARAGRAPH.RIGHT
                     elif _alignment == "left":
                         _p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-                    _r = _p.add_run(_text)
                     _font_name = _font.get("font_name", "") or "宋体"
                     _font_size = _font.get("font_size", 16.0)
                     _font_bold = _font.get("bold", False)
-                    try:
-                        _r.font.name = _font_name
-                        _r.font.size = Pt(_font_size)
-                    except Exception:
-                        _r.font.name = "宋体"
-                        _r.font.size = Pt(16)
-                    if _font_bold:
-                        _r.bold = True
-                    try:
-                        _r.element.rPr.rFonts.set(qn("w:eastAsia"), _font_name or "宋体")
-                    except Exception:
-                        pass
+                    if '**' in _text:
+                        _add_run_with_bold(_p, _text, font_name=_font_name, font_size=_font_size, default_bold=_font_bold)
+                    else:
+                        _r = _p.add_run(_text)
+                        try:
+                            _r.font.name = _font_name
+                            _r.font.size = Pt(_font_size)
+                        except Exception:
+                            _r.font.name = "宋体"
+                            _r.font.size = Pt(16)
+                        if _font_bold:
+                            _r.bold = True
+                        try:
+                            _r.element.rPr.rFonts.set(qn("w:eastAsia"), _font_name or "宋体")
+                        except Exception:
+                            pass
                 elif _blk.get("type") == "table":
                     _headers = _blk.get("headers", [])
                     _rows = _blk.get("rows", [])
@@ -4529,6 +4681,8 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                         for _ri, _row in enumerate(_rows):
                             for _ci, _cell in enumerate(_row):
                                 _filled = _fill_placeholder_text(_cell)
+                                _filled = _fill_two_choice_placeholders(_filled, section_title=_cover_title_text, two_choice_fills=_tc_fills_cover)
+                                _filled = _filled.replace('**', '')
                                 _t.rows[_ri].cells[_ci].text = _filled
             document.add_page_break()
             continue

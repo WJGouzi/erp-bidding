@@ -370,6 +370,7 @@ class FormatRequirement:
     chapter_title: str = ""
     required_sections: List[ReqSection] = field(default_factory=list)
     volumes: List[dict] = field(default_factory=list)
+    two_choice_placeholders: List[dict] = field(default_factory=list)
     fixed_texts: List[FixedText] = field(default_factory=list)
     confidence: float = 0.0
 
