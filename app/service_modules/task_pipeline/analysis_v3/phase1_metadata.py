@@ -82,10 +82,10 @@ RULES = [
     ("agent_name", r"(?:采购代理机构|比选代理机构|招标代理机构|代理机构)\s*[:：]\s*(.+?)$", 2, "identity"),
 
     # ── 预算 ──
-    ("budget", r"(?:采购预算|预算金额|项目预算|最高限价|控制价)[：:]*[^。]*?([\d,]+(?:\.[\d]+)?)\s*(?:万元|元)", 1, "parse_money"),
+    ("budget", r"(?:采购预算|预算金额|项目预算|最高限价|控制价)[：:]*[^。]*?((?:[\d,]+(?:\.[\d]+)?)\s*(?:万元|元))", 1, None),
     ("budget_cn", r"(?:采购预算|预算金额|项目预算|最高限价)[^。]*?([零壹贰叁肆伍陆柒捌玖拾佰仟万亿]+)\s*元", 1, "parse_money_cn"),
-    ("budget_item", r"预算[：:]*[^。]*?([\d,]+(?:\.[\d]+)?)\s*(?:万元|元)", 2, "parse_money"),
-    ("package_budget", r"第[\d一二三四五六七八九十]+包[：:][^。]*?([\d,]+(?:\.[\d]+)?)\s*(?:万元|元)", 1, "parse_money"),
+    ("budget_item", r"预算[：:]*[^。]*?((?:[\d,]+(?:\.[\d]+)?)\s*(?:万元|元))", 2, None),
+    ("package_budget", r"第[\d一二三四五六七八九十]+包[：:][^。]*?((?:[\d,]+(?:\.[\d]+)?)\s*(?:万元|元))", 1, None),
 
     # ── 关键日期 ──
     ("bid_deadline", r"(?:投标截止|递交投标文件截止|投标截止时间|递交的起止时间|递交比选申请书截止时间)[^。]*?([\d]{4}年[\d]{1,2}月[\d]{1,2}日)", 1, "identity"),
@@ -306,7 +306,13 @@ def _build_metadata(rule_result):
 
     # 处理 bundle 字段
     if "package_budget" in rule_result:
-        metadata["budget"]["packages"] = rule_result.get("package_budget", {})
+        pkg_budget_val = rule_result.get("package_budget", {})
+        if isinstance(pkg_budget_val, dict):
+            metadata["budget"]["packages"] = pkg_budget_val
+
+    # 确保 packages 始终为 dict（防止规则提取返回非 dict 值）
+    if not isinstance(metadata["budget"].get("packages"), dict):
+        metadata["budget"]["packages"] = {}
 
     # 文档类型分类结果（优先级高于默认值）
     if "_document_type" in rule_result:
@@ -379,6 +385,22 @@ def extract_metadata(doc_text, file_name="", table_results=None, sections=None):
                         metadata["extra"][key] = str(value)
         except Exception as exc:
             logger.warning("[phase1] 章节提取异常: %s", exc)
+
+    # 多包预算提取：从原文中找出所有"第X包：XXX万元/元"（通用方案，不限格式来源）
+    _pkg_budget_re = re.compile(
+        r'第([\d一二三四五六七八九十]+)包[：:]\s*((?:[\d,]+(?:\.[\d]+)?)\s*(?:万元|元))'
+    )
+    _pkg_matches = _pkg_budget_re.findall(doc_text)
+    if _pkg_matches:
+        _chinese_num = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+                        "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+        _pkg_dict = {}
+        for _no_str, _val in _pkg_matches:
+            _pkg_no = int(_no_str) if _no_str.isdigit() else _chinese_num.get(_no_str, 0)
+            if _pkg_no > 0:
+                _pkg_dict[str(_pkg_no)] = _val
+        if _pkg_dict:
+            metadata["budget"]["packages"] = _pkg_dict
 
     # 统一标准化：所有展示字段用 string，计算字段保留数字
     metadata = _normalize_metadata_types(metadata)

@@ -852,7 +852,8 @@ def extract_packages(sections, package_nos, metadata_budget=None, pkg_name_map=N
     budget_per_pkg = {}
     budget_total = 0
     if metadata_budget and isinstance(metadata_budget, dict):
-        budget_per_pkg = metadata_budget.get("packages", {})
+        raw_packages = metadata_budget.get("packages", {})
+        budget_per_pkg = raw_packages if isinstance(raw_packages, dict) else {}
         budget_total = metadata_budget.get("total", 0) or 0
 
     packages = []
@@ -973,7 +974,7 @@ def cross_package_analysis(packages):
     for pkg in packages:
         score = 0
         budget_val = pkg.get("budget", 0) or 0
-        if budget_val:
+        if budget_val and isinstance(budget_val, (int, float)):
             score += min(budget_val / 10000, 10)
         params = pkg.get("parameters") or {}
         if params.get("starred_count", 0):

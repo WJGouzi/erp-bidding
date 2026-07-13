@@ -67,16 +67,21 @@ def _find_format_chapter(sections) -> Optional[object]:
         nonlocal best, best_kw
         for section in section_list:
             title = getattr(section, "title", "") or ""
+            _matched = False
             for kw in FORMAT_CHAPTER_KEYWORDS:
                 if kw in title:
                     children = getattr(section, "children", [])
                     if len(children) >= 2 or kw == best_kw:
                         best = section
                         best_kw = kw
+                    _matched = True
                     break
-            children = getattr(section, "children", [])
-            if children:
-                _search(children)
+            # 仅当前章节本身未匹配关键词时，才向下递归子章节
+            # 避免子章节包含相同关键词时覆盖父章节
+            if not _matched:
+                children = getattr(section, "children", [])
+                if children:
+                    _search(children)
 
     _search(sections if isinstance(sections, list) else [])
     return best
@@ -102,6 +107,9 @@ def _extract_required_sections(section) -> List[Dict]:
     for idx, child in enumerate(children):
         title = getattr(child, "title", "") or ""
         if not title:
+            continue
+        # 跳过章首说明项（如"一、本章所制投标文件格式…"），非实际文件模板
+        if "本章所制" in title:
             continue
 
         # 检查是否有模板表格 → 仅检查当前章节的直接内容

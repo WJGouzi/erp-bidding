@@ -29,12 +29,21 @@ from .llm_extractor import (
     extract_scoring as llm_extract_scoring,
     extract_business as llm_extract_business,
     extract_technical as llm_extract_technical,
+    find_format_chapter_by_llm as _find_format_chapter_by_llm,
+    classify_pre_chapter_sections as _classify_pre_chapter_sections,
 )
 from ....infrastructure.document_parser import strip_heading_prefix as _strip_heading_prefix
 from .llm_validator import merge_llm_into_metadata
 from .phase1_metadata import extract_metadata, classify_document
 from .phase2_eligibility import scan_eligibility
-from .phase1_5_format import extract_format_requirements
+from .phase1_5_format import (
+    extract_format_requirements,
+    _extract_required_sections,
+    _clean_section_title,
+    _build_volumes_from_required,
+    _detect_two_choice_patterns,
+    _extract_fixed_texts,
+)
 from .phase2_extractor import scan_eligibility_v2
 from .phase3_scoring import extract_scoring, extract_packages, cross_package_analysis
 from .check_items import generate_check_items, assemble_check_items
@@ -138,7 +147,7 @@ def _build_strategy_from_phases(metadata, eligibility, scoring, packages):
             # 综合优先级评分（预算 + 难度 + 评分维度）
             budget = pkg.get("budget", 0)
             priority_score = 0
-            if budget:
+            if budget and isinstance(budget, (int, float)):
                 priority_score += min(budget / 10000, 10)
 
             params = pkg.get("parameters") or {}
@@ -373,6 +382,185 @@ def _section_to_text(section) -> str:
 
 
 
+
+
+# ========== Patch A: LLM fallback for format chapter ==========
+
+def _patch_find_format_chapter(sections, format_requirements):
+    """When keyword search misses the format chapter, use LLM to find it.
+
+    Only runs when extract_format_requirements returns None.
+    Does not modify existing _find_format_chapter logic.
+    """
+    if format_requirements:
+        return format_requirements
+    if not sections:
+        return None
+
+    chapter_titles = []
+    for s in sections:
+        title = getattr(s, "title", "") or ""
+        level = getattr(s, "level", 0)
+        if title and level <= 2:
+            chapter_titles.append(title)
+
+    if not chapter_titles:
+        return None
+
+    found_title = _find_format_chapter_by_llm(chapter_titles)
+    if not found_title:
+        logger.info("[patchA] LLM did not find format chapter")
+        return None
+
+    found_section = None
+    for s in sections:
+        if getattr(s, "title", "") == found_title:
+            found_section = s
+            break
+
+    if not found_section:
+        logger.warning("[patchA] LLM found title but section not matched: %s", found_title)
+        return None
+
+    required = _extract_required_sections(found_section)
+    if not required:
+        logger.info("[patchA] Found format chapter but no sub-sections: %s", found_title)
+        return None
+
+    chapter_title = getattr(found_section, "title", "") or ""
+
+    section_lookup = {}
+    def _build_lookup(sec_list):
+        for rs in sec_list:
+            key = _clean_section_title(rs.get("title", ""))
+            if key:
+                section_lookup[key] = rs
+            children = rs.get("children", [])
+            if children:
+                _build_lookup(children)
+    _build_lookup(required)
+
+    volumes = _build_volumes_from_required(required)
+    two_choice = _detect_two_choice_patterns(required)
+    fixed_texts = _extract_fixed_texts(found_section)
+    confidence = 0.5 + min(len(required) / 30, 0.3)
+
+    logger.info("[patchA] LLM fallback located format chapter: %s, %d sections",
+                chapter_title, len(required))
+
+    return {
+        "chapter_title": chapter_title,
+        "required_sections": required,
+        "section_lookup": section_lookup,
+        "volumes": volumes,
+        "two_choice_placeholders": two_choice,
+        "fixed_texts": fixed_texts,
+        "confidence": confidence,
+    }
+
+
+# ========== Patch B: classify pre-chapter cover fragments ==========
+
+def _patch_pre_chapter_covers(sections, format_requirements):
+    """Detect root-level sections before chapter 1 and classify them.
+
+    Parser security gate 4 may elevate bold+large cover text to sections.
+    This patch uses LLM to classify and merge qualifying content.
+    """
+    if not sections or not format_requirements:
+        return format_requirements
+
+    required = format_requirements.get("required_sections", [])
+    if required is None:
+        required = []
+
+    # Rule: find all root-level sections before the first "Chapter X"
+    pre_sections = []
+    for s in sections:
+        title = getattr(s, "title", "") or ""
+        if re.match(r'^第[一二三四五六七八九十零〇]+[章节篇部]', title):
+            break
+        pre_sections.append(s)
+
+    if not pre_sections:
+        return format_requirements
+
+    # Prepare LLM input
+    sections_data = []
+    for s in pre_sections:
+        texts = []
+        for block in getattr(s, "content", []):
+            t = getattr(block, "text", "") or ""
+            if t.strip():
+                texts.append(t.strip())
+        content_str = " | ".join(texts[:8])
+        sections_data.append({
+            "title": getattr(s, "title", ""),
+            "content": content_str,
+            "raw_section": s,
+        })
+
+    # LLM classification
+    classifications = _classify_pre_chapter_sections(sections_data)
+
+    # Merge qualifying content
+    qual_entries = []
+    for c in classifications:
+        if not isinstance(c, dict):
+            continue
+        if c.get("classification", "") != "资格性文件的格式内容":
+            continue
+        title = c.get("title", "")
+        raw_sec = None
+        for sd in sections_data:
+            if sd["title"] == title:
+                raw_sec = sd["raw_section"]
+                break
+        if not raw_sec:
+            continue
+
+        # Build template_content matching _extract_required_sections format
+        tc = []
+        for block in getattr(raw_sec, "content", []):
+            block_type = getattr(block, "type", "") or ""
+            if block_type == "table":
+                headers = getattr(block, "headers", []) or []
+                rows = getattr(block, "rows", []) or []
+                if not headers and not rows:
+                    continue
+                tc.append({
+                    "type": "table",
+                    "headers": headers,
+                    "rows": rows,
+                    "merge_cells": getattr(block, "merge_cells", []),
+                    "column_widths": getattr(block, "column_widths", []),
+                })
+            else:
+                txt = getattr(block, "text", "") or ""
+                if txt.strip() and len(txt.strip()) >= 5:
+                    tc.append({
+                        "type": "text",
+                        "text": txt.strip()[:2000],
+                    })
+
+        qual_entries.append({
+            "title": title,
+            "order": len(qual_entries) + 1,
+            "required": True,
+            "has_template": any(b.get("type") == "table" for b in tc),
+            "template_texts": [b["text"] for b in tc if b.get("type") == "text"],
+            "template_content": tc,
+            "file_type": "cover",
+            "children": [],
+        })
+
+    if qual_entries:
+        existing = format_requirements.get("required_sections", []) or []
+        format_requirements["required_sections"] = existing + qual_entries
+        logger.info("[patchB] Merged %d qualifying pre-chapter entries into required_sections",
+                    len(qual_entries))
+
+    return format_requirements
 
 def start_analyze_v3(task, source_texts, adapter=None):
     """三层分析管线总入口 — 零LLM依赖。
@@ -626,6 +814,24 @@ def start_analyze_v3(task, source_texts, adapter=None):
                         len(format_requirements.get("required_sections", [])))
     except Exception as exc:
         logger.warning("[analysis_v3] 格式要求提取异常(非阻断): %s", exc)
+
+    # ── 补丁A: LLM兜底定位格式章节（当关键词匹配找不到时） ──
+    if not format_requirements:
+        try:
+            format_requirements = _patch_find_format_chapter(sections, format_requirements)
+            if format_requirements:
+                logger.info("[analysis_v3] 补丁A定位格式章节: chapter='%s', %d sections",
+                            format_requirements["chapter_title"],
+                            len(format_requirements.get("required_sections", [])))
+        except Exception as exc:
+            logger.warning("[analysis_v3] 补丁A异常(非阻断): %s", exc)
+
+    # ── 补丁B: 封面碎片分类（判断第1章前的根级章节是否属于资格性格式内容） ──
+    if format_requirements:
+        try:
+            format_requirements = _patch_pre_chapter_covers(sections, format_requirements)
+        except Exception as exc:
+            logger.warning("[analysis_v3] 补丁B异常(非阻断): %s", exc)
 
     # Phase 2: 专家级生死线扫描（零bid_type/doc_type依赖）
     # 使用新的章节定位v2：评分机制 + 法规固定清单 + 动态提取

@@ -19,6 +19,8 @@ from .llm_prompts import (
     PROMPT_SCORING,
     PROMPT_BUSINESS,
     PROMPT_TECHNICAL,
+    PROMPT_FIND_FORMAT_CHAPTER,
+    PROMPT_CLASSIFY_PRE_CHAPTER,
 )
 
 logger = logging.getLogger(__name__)
@@ -242,3 +244,62 @@ def extract_technical(section_text):
 
     reqs = result.get("technical_requirements", [])
     return reqs if isinstance(reqs, list) else []
+
+
+
+# ========== Patch A: LLM locate format chapter ==========
+
+def find_format_chapter_by_llm(chapter_titles):
+    """Use LLM to locate the format requirements chapter from section titles.
+
+    Fallback when keyword matching fails.
+
+    Args:
+        chapter_titles: list[str], root-level section titles
+
+    Returns:
+        str or None: found chapter title, None if not found
+    """
+    if not chapter_titles:
+        return None
+
+    titles_text = "\n".join(f"- {t}" for t in chapter_titles[:30] if t)
+    if not titles_text.strip():
+        return None
+
+    prompt = PROMPT_FIND_FORMAT_CHAPTER.format(chapter_titles=titles_text)
+    result = call_llm_json(prompt, max_tokens=300)
+
+    if isinstance(result, dict) and result.get("has_format_chapter"):
+        return result.get("chapter_title") or None
+    return None
+
+
+# ========== Patch B: classify pre-chapter sections ==========
+
+def classify_pre_chapter_sections(sections_data):
+    """Use LLM to classify pre-chapter root-level sections.
+
+    Args:
+        sections_data: list[dict], each has title and content
+
+    Returns:
+        list[dict]: classification results
+    """
+    if not sections_data:
+        return []
+
+    content_lines = []
+    for s in sections_data:
+        title = s.get("title", "")
+        content_str = s.get("content", "") or ""
+        snippet = content_str[:200] if content_str else ""
+        content_lines.append("标题: " + title + "\n内容: " + snippet)
+
+    prompt_text = "\n---\n".join(content_lines)
+    prompt = PROMPT_CLASSIFY_PRE_CHAPTER.format(content_list=prompt_text)
+    result = call_llm_json(prompt, max_tokens=500)
+
+    if isinstance(result, list):
+        return result
+    return []

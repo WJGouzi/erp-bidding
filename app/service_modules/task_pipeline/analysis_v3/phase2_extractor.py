@@ -367,6 +367,26 @@ def _find_qualification_sections_v2(sections):
     threshold = max(top_score * 0.7, 5)  # 最低 5 分（70%阈值确保不遗漏相关章节）
     result = [s for s_score, s in scored if s_score >= threshold]
 
+    # ── 标题匹配路径：补充评分法未覆盖的文件格式类章节 ──
+    # 此类章节（如投标文件格式响应文件格式）内含资格性文件模板，
+    # 标题特征明显但内容密度评分可能不够，与评分法取并集
+    _TITLE_QUAL_PATTERNS = [
+        "投标文件格式", "响应文件格式", "比选文件格式",
+        "磋商文件格式", "谈判文件格式", "询价文件格式",
+    ]
+    _seen_ids = {id(s) for s in result}
+    for section in sections:
+        _title = getattr(section, "title", "") or ""
+        if any(p in _title for p in _TITLE_QUAL_PATTERNS):
+            if id(section) not in _seen_ids:
+                result.append(section)
+                _seen_ids.add(id(section))
+            # 其子章节也纳入（文件格式章节的子节也是资格模板的一部分）
+            for child in getattr(section, "children", []):
+                if id(child) not in _seen_ids:
+                    result.append(child)
+                    _seen_ids.add(id(child))
+
     logger.info(
         "[phase2_extractor] 章节定位完成: top_score=%d, threshold=%.1f, found=%d",
         top_score, threshold, len(result),

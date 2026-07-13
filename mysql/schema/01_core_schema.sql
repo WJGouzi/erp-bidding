@@ -9,6 +9,7 @@ CREATE TABLE IF NOT EXISTS `file_storage` (
   `file_name` VARCHAR(255) NOT NULL COMMENT '文件原始名称（含扩展名）',
   `file_ext` VARCHAR(32) DEFAULT NULL COMMENT '文件扩展名（如：.pdf, .docx, .xlsx）',
   `file_size` BIGINT NOT NULL DEFAULT 0 COMMENT '文件大小（字节）',
+  `file_sha256` VARCHAR(64) DEFAULT NULL COMMENT '文件SHA256（用于缓存校验）',
   `storage_provider` VARCHAR(32) NOT NULL DEFAULT 'LOCAL' COMMENT '存储提供商（LOCAL=本地存储, MINIO=MinIO对象存储）',
   `minio_bucket` VARCHAR(128) DEFAULT NULL COMMENT 'MinIO存储桶名称',
   `minio_object_name` VARCHAR(512) DEFAULT NULL COMMENT 'MinIO对象名称（存储路径+文件名）',
@@ -173,6 +174,7 @@ CREATE TABLE IF NOT EXISTS `bidding_task_chapter` (
 CREATE TABLE IF NOT EXISTS `subject_company` (
   `id` BIGINT NOT NULL AUTO_INCREMENT COMMENT '主键ID',
   `company_name` VARCHAR(255) NOT NULL COMMENT '公司名称（投标主体全称）',
+  `short_name` VARCHAR(64) DEFAULT NULL COMMENT '公司简称（用作 ChromaDB collection 名）',
   `chroma_tenant` VARCHAR(128) DEFAULT NULL COMMENT 'Chroma向量数据库租户名（该公司专属向量空间）',
   `chroma_database` VARCHAR(128) DEFAULT NULL COMMENT 'Chroma向量数据库名',
   `chroma_collection` VARCHAR(128) DEFAULT NULL COMMENT 'Chroma向量表名',
@@ -268,64 +270,35 @@ CREATE TABLE IF NOT EXISTS `bidding_task_execution` (
   KEY `idx_task_execution` (`task_id`, `execution_type`, `status`) COMMENT '按任务ID、执行类型和状态的联合查询索引'
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='标书后台任务执行表：异步任务执行记录与进度追踪';
 
-
--- ==========================================
--- document-parse-and-multi-recall 变更
--- ==========================================
-
--- subject_company 增加 short_name 字段
-ALTER TABLE `subject_company`
-  ADD COLUMN `short_name` VARCHAR(64) DEFAULT NULL COMMENT '公司简称（用作 ChromaDB collection 名）' AFTER `company_name`;
-
--- file_storage 增加 file_sha256 字段
-ALTER TABLE `file_storage`
-  ADD COLUMN `file_sha256` VARCHAR(64) DEFAULT NULL COMMENT '文件SHA256（用于缓存校验）' AFTER `file_size`;
-
--- 文档解析缓存表
+-- 文档解析缓存表：避免重复解析相同文件，
+-- 通过文件SHA256和解析器版本控制缓存有效性。
 CREATE TABLE IF NOT EXISTS `doc_parse_cache` (
-  `id`           BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键ID',
-  `file_id`      BIGINT NOT NULL COMMENT '文件ID',
-  `file_sha256`  VARCHAR(64) NOT NULL COMMENT '文件SHA256，用于缓存失效判断',
+  `id` BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键ID',
+  `file_id` BIGINT NOT NULL COMMENT '文件ID',
+  `file_sha256` VARCHAR(64) NOT NULL COMMENT '文件SHA256，用于缓存失效判断',
   `parse_version` VARCHAR(16) NOT NULL DEFAULT '1.0' COMMENT '解析器版本，升级后旧缓存失效',
-  `parsed_json`  LONGBLOB NOT NULL COMMENT '结构化解析结果（JSON）',
-  `chunk_count`  INT NOT NULL DEFAULT 0 COMMENT '切片数量',
-  `created_at`   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
-  `updated_at`   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+  `parsed_json` LONGBLOB NOT NULL COMMENT '结构化解析结果（JSON）',
+  `chunk_count` INT NOT NULL DEFAULT 0 COMMENT '切片数量',
+  `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
   UNIQUE KEY `uk_file_id` (`file_id`),
   KEY `idx_sha256` (`file_sha256`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='文档解析缓存表：避免重复解析相同文件';
 
--- 文档切片数据表（含全文索引）
+-- 文档切片数据表：存储文档解析后的文本切片，
+-- 支持全文索引进行关键词检索，同时记录Chroma向量数据库引用。
 CREATE TABLE IF NOT EXISTS `doc_chunks` (
-  `id`           BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键ID',
-  `file_id`      BIGINT NOT NULL COMMENT '所属文件ID',
-  `chunk_index`  INT NOT NULL COMMENT '切片序号',
-  `content`      LONGTEXT NOT NULL COMMENT '切片文本内容',
+  `id` BIGINT AUTO_INCREMENT PRIMARY KEY COMMENT '主键ID',
+  `file_id` BIGINT NOT NULL COMMENT '所属文件ID',
+  `chunk_index` INT NOT NULL COMMENT '切片序号',
+  `content` LONGTEXT NOT NULL COMMENT '切片文本内容',
   `section_path` TEXT DEFAULT NULL COMMENT '章节路径（如：第一章>1.2）',
   `content_type` VARCHAR(32) NOT NULL DEFAULT 'paragraph' COMMENT '内容类型：heading/paragraph/table/mixed',
   `extra_metadata` JSON DEFAULT NULL COMMENT '扩展元数据',
-  `chroma_id`    VARCHAR(128) DEFAULT NULL COMMENT 'ChromaDB中的ID',
-  `created_at`   DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  `chroma_id` VARCHAR(128) DEFAULT NULL COMMENT 'ChromaDB中的ID',
+  `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   FULLTEXT INDEX `ft_content` (`content`) WITH PARSER `ngram`,
   KEY `idx_file_id` (`file_id`),
   KEY `idx_chroma_id` (`chroma_id`),
   UNIQUE KEY `idx_file_chunk` (`file_id`, `chunk_index`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='文档切片数据表，支持FULLTEXT关键词检索';
-
-
--- ============================================================
--- Migration 001: 新增分包字段 + 文档分类 + task包选择 + analysis_data LONGTEXT
--- 说明：已有数据库执行以下增量更新
--- 适用：从旧版升级的数据库
--- ============================================================
-ALTER TABLE bidding_analysis_result
-  ADD COLUMN IF NOT EXISTS `packages_json` TEXT COMMENT '分包列表JSON（包号、包名、预算等信息）' AFTER `analysis_data`,
-  ADD COLUMN IF NOT EXISTS `document_type` VARCHAR(32) DEFAULT '' COMMENT '文档分类类型（TENDER/SELECTION/NEGOTIATION/INQUIRY）' AFTER `packages_json`,
-  ADD COLUMN IF NOT EXISTS `package_count` INT NOT NULL DEFAULT 0 COMMENT '分包数量（0表示无分包）' AFTER `document_type`,
-  MODIFY COLUMN `analysis_data` LONGTEXT COMMENT '结构化分析数据JSON（投标人须知/资格审查/商务/技术/评分等结构化对象）';
-
-ALTER TABLE bidding_task
-  ADD COLUMN IF NOT EXISTS `selected_package_no` VARCHAR(32) DEFAULT NULL COMMENT '选定投标的包号（分包项目用户选择投哪个包）' AFTER `result_file_id`,
-  ADD COLUMN IF NOT EXISTS `selected_package_name` VARCHAR(255) DEFAULT NULL COMMENT '选定投标的包名（冗余，方便展示）' AFTER `selected_package_no`;
-
-ALTER TABLE doc_chunks MODIFY COLUMN section_path TEXT DEFAULT NULL COMMENT '章节路径（如：第一章>1.2）';

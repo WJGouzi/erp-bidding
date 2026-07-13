@@ -168,10 +168,13 @@ def _complete_analysis(task_id, execution_id=None):
                 # 重新序列化 analysis_data
                 result.analysis_data = json.dumps(v3_data, ensure_ascii=False)
             if budget_total:
-                if budget_total % 10000 == 0:
-                    result.overview += f" | 预算: {budget_total//10000}万元"
+                if isinstance(budget_total, (int, float)):
+                    if budget_total % 10000 == 0:
+                        result.overview += f" | 预算: {budget_total//10000}万元"
+                    else:
+                        result.overview += f" | 预算: {budget_total/10000:.2f}万元"
                 else:
-                    result.overview += f" | 预算: {budget_total/10000:.2f}万元"
+                    result.overview += f" | 预算: {budget_total}"
             if pkg_count:
                 result.overview += f" | 共{pkg_count}包"
             if deadline:
