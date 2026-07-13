@@ -1,27 +1,21 @@
-## 1. 二选一检测与填充核心函数
+## 1. ContentBlock 渲染路径集成（核心缺口）
 
-- [ ] 1.1 在 `app/service_modules/task_pipeline/helpers.py` 中新增 `_fill_two_choice_placeholders(text: str) -> str` 函数
-- [ ] 1.2 实现正则检测：`[（(]\s*([\u4e00-\u9fff]{1,4})\s*[、/]\s*([\u4e00-\u9fff]{1,4})\s*[）)]`
-- [ ] 1.3 实现 `_is_negative_context(text: str, position: int) -> bool` 辅助函数，检测附近 100 字符内的负面关键词
-- [ ] 1.4 实现语义选择逻辑：负面上下文→选否定选项；正面/未知→选肯定选项
-- [ ] 1.5 选项替换为 `**option**` 加粗标记格式
-- [ ] 1.6 定义 `NEGATIVE_KEYWORDS` 和 `POSITIVE_KEYWORDS` 常量词表
+- [x] 1.1 将 `two_choice_placeholders` 提取提升到 `_build_docx_bytes` 的更外层作用域，让 `_write_outline_item` 嵌套函数也能访问（当前 line 4088-4094 只对封面提取）
+- [x] 1.2 在 ContentBlock 段落渲染处（line 4398-4402），渲染前调用 `_fill_two_choice_placeholders(text, section_title=title, two_choice_fills=_tc_fills_all)`
+- [x] 1.3 当返回文本含 `**option**` 标记时，使用 `_add_run_with_bold` 代替 `run.add_run` 渲染加粗
+- [x] 1.4 在 ContentBlock 表格单元格渲染处，对单元格文本同样调用 `_fill_two_choice_placeholders`（注意表格中不需要加粗标记，替换后去除 `**`）
 
-## 2. 集成到模板填充管道
+## 2. 清理不必要的封面调用
 
-- [ ] 2.1 在 `_fill_template` 返回后、或调用 `_fill_template` 的位置新增 `_fill_two_choice_placeholders` 后处理调用
-- [ ] 2.2 确保标准占位符替换（`XXX（字段名）`、`______`）不受二选一处理影响
-- [ ] 2.3 在表格填充管道中也应用二选一处理（`_fill_template` 对表格单元格的处理路径）
+- [x] 2.1 移除以 `_tc_fills_cover` 命名的变量，改为通用的 `_tc_fills_all`（封面和正文共用）
+- [x] 2.2 封面渲染处（line 4154、4643、4684）的二选一调用可以移除（封面无 `（有、无）` 内容）
 
-## 3. 加粗渲染支持
+## 3. 加粗渲染一致性
 
-- [ ] 3.1 检查现有 docx 渲染管道是否处理 `**text**` 标记
-- [ ] 3.2 如不支持，在最终写入 docx 文本段落的 run 对象时扫描 `**text**` 标记并应用 `run.bold = True`
+- [x] 3.1 确保 `_add_run_with_bold` 在 ContentBlock 段落渲染时可被调用（已在 `_build_docx_bytes` 内作为嵌套函数定义，可直接使用）
 
 ## 4. 测试与验证
 
-- [ ] 4.1 编写单元测试：`（有、无）`在负面上下文中→`**无**`
-- [ ] 4.2 编写单元测试：`（是、否）`→`**是**`
-- [ ] 4.3 编写单元测试：`（有、无）`在正面上下文中→`**有**`
-- [ ] 4.4 编写单元测试：非二选一括号内容（如 `（描述：...）`）不被处理
-- [ ] 4.5 运行现有测试确认无回归
+- [x] 4.1 验证模板章节（如承诺函、声明函）的 `（有、无）` 被正确替换为 `**无**` 并加粗渲染
+- [x] 4.2 验证同章节多个不同二选一时 `text_snippet` 精确匹配生效
+- [x] 4.3 运行现有测试确认无回归

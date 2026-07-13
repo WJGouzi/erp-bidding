@@ -2925,7 +2925,7 @@ def _generate_chapter_content(task, chapter, analysis_result, subject_context, k
                 logger.info("[template] 章节「%s」填空完成，占位符%s个，未填充%s个",
                             chapter_title, len(placeholders), len(unfilled))
                 # 二选一占位符正向填充（优先使用分析阶段预存数据）
-                _tc_fills = _analysis_data.get("format_requirements", {}).get("two_choice_placeholders", []) if isinstance(_analysis_data, dict) else []
+                _tc_fills = _analysis_data.get("two_choice_placeholders", []) if isinstance(_analysis_data, dict) else []
                 filled = _fill_two_choice_placeholders(filled, section_title=chapter_title, two_choice_fills=_tc_fills)
                 return filled
         # TEXT_TEMPLATE 在原文中找不到模板文本→留空，绝不落入 LLM
@@ -4080,19 +4080,20 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
             borders.append(border)
         tblPr.append(borders)
     # ====== 从 format_requirements 构建 section_lookup 用于查找封面数据 ======
-    _ad_raw_for_cover = getattr(analysis_result, "analysis_data", None) if analysis_result else None
+    _ad_raw = getattr(analysis_result, "analysis_data", None) if analysis_result else None
     _cover_section_lookup = {}
-    if _ad_raw_for_cover:
+    _ad_c = {}
+    if _ad_raw:
         try:
             import json as _json_c
-            _ad_c = _json_c.loads(_ad_raw_for_cover) if isinstance(_ad_raw_for_cover, str) else (_ad_raw_for_cover or {})
+            _ad_c = _json_c.loads(_ad_raw) if isinstance(_ad_raw, str) else (_ad_raw or {})
             _fmt_c = _ad_c.get("format_requirements", {}) if isinstance(_ad_c, dict) else {}
             _cover_section_lookup = _fmt_c.get("section_lookup", {}) or {}
         except Exception:
             _cover_section_lookup = {}
-    # 提取分析阶段检测到的二选一占位符数据
-    _two_choice_raw = _fmt_c.get("two_choice_placeholders", []) if isinstance(_fmt_c, dict) else []
-    _tc_fills_cover = _two_choice_raw if isinstance(_two_choice_raw, list) else []
+    # 提取分析阶段检测到的二选一占位符数据，供正文 ContentBlock 渲染使用
+    _two_choice_raw = _ad_c.get("two_choice_placeholders", []) if isinstance(_ad_c, dict) else []
+    _tc_fills_all = _two_choice_raw if isinstance(_two_choice_raw, list) else []
     
     for _cover_idx, _cover_item in enumerate(_cover_outline_items):
         if _cover_idx > 0:
@@ -4151,7 +4152,6 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                     _font = _blk.get("font", {}) or {}
                     
                     _text = _fill_placeholder_text(_text)
-                    _text = _fill_two_choice_placeholders(_text, section_title=_cover_title, two_choice_fills=_tc_fills_cover)
                     
                     _p = document.add_paragraph()
                     _alignment = _font.get("alignment", "")
@@ -4417,9 +4417,15 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                 for _block in _chapter_cc:
                     if isinstance(_block, dict):
                         if _block.get("type") in ("text", "paragraph"):
-                            _p = document.add_paragraph(_strip_xml_control_chars(_block.get("text", "")))
+                            _text = _block.get("text", "")
+                            _text = _fill_two_choice_placeholders(_text, section_title=title, two_choice_fills=_tc_fills_all)
+                            _tc_clean = _strip_xml_control_chars(_text)
+                            _p = document.add_paragraph()
                             _p.style = document.styles["Normal"]
-                            for _r in _p.runs:
+                            if '**' in _tc_clean:
+                                _add_run_with_bold(_p, _tc_clean, font_name="仿宋", font_size=12)
+                            else:
+                                _r = _p.add_run(_tc_clean)
                                 _r.font.name = "仿宋"
                                 _r.font.size = Pt(12)
                                 _r.element.rPr.rFonts.set(qn("w:eastAsia"), "仿宋")
@@ -4438,6 +4444,12 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                                 _cw = _block.get("column_widths", [])
                                 _all_rows = [_hd] + _rw if _hd else _rw
                                 td = to_per_cell(_hd, _all_rows, _mc, _cw)
+                            # 二选一占位符填充（表格单元格）
+                            for _row in td.rows:
+                                for _cell in _row.cells:
+                                    _cell_text = _cell.text
+                                    _filled = _fill_two_choice_placeholders(_cell_text, section_title=title, two_choice_fills=_tc_fills_all)
+                                    _cell.text = _filled.replace('**', '')
                             # 注入默认格式
                             for _row in td.rows:
                                 for _cell in _row.cells:
@@ -4492,6 +4504,12 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                             from app.infrastructure.table_codec import to_per_cell, write_table_from_data
                             all_rows = [headers] + rows
                             td = to_per_cell(headers, all_rows, merges, column_widths, row_heights)
+                            # 二选一占位符填充（表格单元格）
+                            for _row in td.rows:
+                                for _cell in _row.cells:
+                                    _cell_text = _cell.text
+                                    _filled = _fill_two_choice_placeholders(_cell_text, section_title=title, two_choice_fills=_tc_fills_all)
+                                    _cell.text = _filled.replace('**', '')
                             # 注入默认格式
                             for _row in td.rows:
                                 for _cell in _row.cells:
@@ -4640,7 +4658,6 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                     
                     # 基础占位符填充（作为 LLM 填充的补充）
                     _text = _fill_placeholder_text(_text)
-                    _text = _fill_two_choice_placeholders(_text, section_title=_cover_title_text, two_choice_fills=_tc_fills_cover)
                     
                     _p = document.add_paragraph()
                     _alignment = _font.get("alignment", "")
@@ -4681,7 +4698,6 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
                         for _ri, _row in enumerate(_rows):
                             for _ci, _cell in enumerate(_row):
                                 _filled = _fill_placeholder_text(_cell)
-                                _filled = _fill_two_choice_placeholders(_filled, section_title=_cover_title_text, two_choice_fills=_tc_fills_cover)
                                 _filled = _filled.replace('**', '')
                                 _t.rows[_ri].cells[_ci].text = _filled
             document.add_page_break()

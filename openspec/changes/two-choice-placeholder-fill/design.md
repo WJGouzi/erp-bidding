@@ -1,64 +1,75 @@
 ## Context
 
-当前标书生成流程中，模板填充阶段（`_fill_template` / `_identify_placeholders_via_llm`）聚焦于 `XXX（字段名）` 和 `______` 格式的占位符，通过 `field_map` 映射填充。但招标文件模板中同时存在 `（有、无）`、`（是、否）` 等二选一占位符，这些不是"空白待填"而是"二选一选择题"，现有逻辑无法处理。
+当前标书生成流程中，二选一占位符（如 `（有、无）`）的填充逻辑已经实现，但**渲染阶段存在缺口**。
 
-扫描 12 份招标文件后确认：真实出现的二选一模式为 `（有、无）`（比选文件中出现 1 处）、`（是、否）`（模板中出现但当前文档未匹配到）。其他 `（姓名、职务）`、`（含零部件、配件等）` 等模式因选项长度或语义明显非二元选择，应被排除。
+### 现状（已实现部分）
 
-关键约束：
-- 不能依赖 LLM 做选择（违反 AGENTS.md "严禁 LLM 自由发挥"规则）
-- 二选一填充必须在现有模板填充管道之后、最终文档组装之前执行
-- 填充结果应对投标方正向积极
+**分析阶段** (`phase1_5_format.py`):
+- `_detect_two_choice_patterns()` 扫描 `template_content` 中的 `（有、无）` / `（是、否）` 模式
+- 根据上下文关键词启发式选择正向选项
+- 生成结果存入 `analysis_data.two_choice_placeholders`，每条包含：
+  - `section_key` — 清洗后的章节标题
+  - `raw` — 原始占位符文本（如 `（有、无）`）
+  - `selected` — 选定的选项（如 `无`）
+  - `text_snippet` — 该段落前 120 字符，用于精确匹配
+  - `reason` — 选择理由
+
+**生成阶段** (`helpers.py`):
+- `_fill_two_choice_placeholders()` 函数已存在
+- 在以下路径已调用：
+  - Path C — 传统 TEXT_TEMPLATE 路径（line 2929，带完整上下文）✅
+  - `_write_formatted_content` — LLM 文本渲染（line 3646，无 section 上下文，降级到正则关键词猜测）
+  - 封面渲染（line 4154、4643、4684 — 实际上封面不需要处理）
+
+### 缺口
+
+**Path A — ContentBlock 渲染路径（line 4398-4402）未调用 `_fill_two_choice_placeholders`**
+
+这是 template_binder 路径的输出渲染位置。当章节有原文模板时：
+1. `bind_template()` 检测到模板 → `has_template=True`
+2. `fill_content()` 复制模板原文，替换 XXX/___ 占位符，但不对 `（有、无）` 做处理
+3. ContentBlocks 被序列化存储
+4. 渲染时（line 4398）：`document.add_paragraph(text)` 直接写入原文 → `（有、无）` 原样出现在输出中
+
+### text_snippet 匹配可行性
+
+`text_snippet` 来自分析阶段 `template_content` 的 block_text，ContentBlock 渲染时的 text 来自同一个 `template_content`（经过 `fill_content` 仅替换 XXX/___）。由于 `（有、无）` 周围的原文未被修改，`text_snippet` 在渲染时能精确匹配，保证了：
+- 同章节多条二选一时：通过 `text_snippet` 区分不同段落
+- 单条时：简单 `text.replace(raw, **selected**)` 即可
 
 ## Goals / Non-Goals
 
 **Goals:**
-- 正则检测 `（X、Y）` 二选一占位符（X/Y 为 1-4 个汉字）
-- 根据上下文语义（负面/正面关键词）自动选择正向选项
-- 正向选项加粗渲染
-- 集成到现有 `_fill_template` 后处理管道
+- 在 ContentBlock 段落渲染路径（line 4398）加上 `_fill_two_choice_placeholders` 调用
+- 在 ContentBlock 表格单元格渲染路径（line 4420+）加上调用
+- 利用分析阶段预存的 `two_choice_placeholders`（含 `text_snippet`）做精确匹配
+- 封面渲染路径的二选一调用可以移除（封面无二选一内容）
+- `**option**` 加粗标记在 ContentBlock 段落中正确渲染
 
 **Non-Goals:**
-- 不修改现有占位符识别机制（`_identify_placeholders_via_llm` / `_fallback_extract_placeholders`）
-- 不修改 `field_map` 数据流
-- 不处理非二选一的括号内容（如 `（描述：...）`、`（含零部件、配件等）`）
-- 不考虑 LLM 驱动的选项选择（必须是规则引擎）
+- 不修改 `_detect_two_choice_patterns` 分析阶段逻辑
+- 不修改 `_fill_two_choice_placeholders` 函数签名
+- 不改变 LLM 生成文本的处理（LLM 自行处理二选一）
 
 ## Decisions
 
-### Decision 1: 后处理 vs 前处理
+### Decision 1: 数据源
 
-- **选择**：后处理（在 `_fill_template` 返回后执行）
-- **理由**：二选一占位符和标准占位符格式不同（`（有、无）` vs `XXX（字段名）`），且语义选择不依赖 `field_map`，独立处理更清晰
-- **替代方案**：前处理（在 `_fill_template` 前替换）——会干扰标准占位符的位置计算，不可行
+- **选择**：使用 `analysis_data.two_choice_placeholders` 作为填充依据
+- **理由**：分析阶段已根据上下文关键词做了预选，且含 `text_snippet` 可用于精确匹配。避免在渲染阶段重复做关键词猜谜
+- 当前的 `_build_docx_bytes` 函数已经在 line 4088-4094 提取了 `_two_choice_raw`，但只用于封面。需要将其提升到更广泛的作用域
 
-### Decision 2: 正则检测 vs LLM 检测
+### Decision 2: 渲染时替换 vs 生成时替换
 
-- **选择**：纯正则检测
-- **理由**：模式高度可预测（`（X、Y）` 格式），无需 LLM 的灵活性。AGENTS.md 禁止 LLM 自由发挥
-- **模式**：`[（(]\s*([\u4e00-\u9fff]{1,4})\s*[、/]\s*([\u4e00-\u9fff]{1,4})\s*[）)]`
-- **长度限定 1-4 字**：排除 `（描述：多个要求...）` 等描述性括号
+- **选择**：在渲染时（`_build_docx_bytes` 内的 `_write_outline_item`）替换
+- **理由**：template_binder 路径的 ContentBlocks 在生成阶段（`_generate_chapter_content`）就已序列化返回，后续不再经过文本处理管道。渲染时是最后的拦截点
 
-### Decision 3: 上下文关键词启发式 vs LLM 语义分析
+### Decision 3: 封面调用移除
 
-- **选择**：关键词启发式（配置化负面/正面词表）
-- **理由**：AGENTS.md 要求"所有数据都要有来源"，关键词匹配完全可预测和审计
-- **词表设计**：分为 `NEGATIVE_KEYWORDS`（犯罪、失信、处罚、违规、违法、不良、诉讼、纠纷、黑名单、惩戒、禁止）和 `POSITIVE_KEYWORDS`（资质、能力、许可、认证、具备），可扩展
-- **默认值**：未匹配时选 `有`（对投标方乐观默认）
-
-### Decision 4: 加粗实现方式
-
-- **选择**：在文本管道中用标记 `**text**` 标记，渲染阶段转换为 Word 的 `w:b` 粗体格式
-- **理由**：python-docx 的 `run.bold = True` 需要操作 run 对象，在纯文本管道后处理时无法直接使用。采用标记法，在最终写入 docx 时扫描标记并应用粗体格式
-
-### Decision 5: 函数设计
-
-- **新增函数**：`_fill_two_choice_placeholders(text: str) -> str`
-- **辅助函数**：`_is_negative_context(text: str, position: int) -> bool` 判断占位符附近 100 字内是否有负面关键词
-- **函数签名清晰**：输入文本，输出替换后的文本
+- **选择**：封面上不会有 `（有、无）` 这类二选一内容，封面渲染的 `_fill_two_choice_placeholders` 调用可以安全移除或保留（无害但冗余）
 
 ## Risks / Trade-offs
 
-- **关键词覆盖不全** → 词表维护在函数内常量中，可通过配置扩展；乐观默认值 `有` 确保未覆盖时也不会选错方向
-- **复杂否定句误判**（如"我公司承诺（有、无）犯罪"——"承诺"非负面词但"犯罪"是负面词）→ 负面关键词权重高，只要附近有负面词就选 `无`，这是保守策略
-- **加粗标记在纯文本管道中丢失** → 需要在最终写入 docx 时解析 `**text**` 标记并应用 `run.bold = True`，需确认现有渲染管道支持此流程，若不支持则新增标记解析步骤
-- **多文件扫描时仅发现 1 处真实匹配**，其他地方可能隐含在表格或深层嵌套中 → 需在表格填充管道中也应用此函数
+- **text_snippet 匹配失败**：如果 `fill_content` 替换了 `text_snippet` 内的 XXX 占位符，可能导致 snippet 不能被精确匹配 → 降级到 `text.replace(raw, selected)` 按原始占位符替换
+- **同一章节多个相同 raw**：如同一章节出现两次 `（有、无）`，但语义不同 → 需要 `text_snippet` 精确匹配，`>1` 路径已有处理
+- **xml 控制字符**：渲染前已通过 `_strip_xml_control_chars` 处理，`text_snippet` 匹配时需要注意两侧都做清洗

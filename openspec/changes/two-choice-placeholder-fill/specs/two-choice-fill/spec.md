@@ -82,3 +82,19 @@ The system SHALL apply two-choice filling as a post-processing step after the ex
 #### Scenario: No interference with standard placeholders
 - **WHEN** text contains both `XXX（公司名称）` and `（有、无）`
 - **THEN** `XXX（公司名称）` is handled by existing fill logic, `（有、无）` is handled by two-choice fill
+
+### Requirement: ContentBlock rendering path integration
+
+The system SHALL apply two-choice filling in the ContentBlock rendering path (template_binder output), not just in the legacy TEXT_TEMPLATE path.
+
+- During `_build_docx_bytes`, ContentBlock paragraphs from template_binder MUST be processed through `_fill_two_choice_placeholders` before being written to the document
+- The `two_choice_placeholders` from `analysis_data` (containing `text_snippet` for precise matching) MUST be accessible in the rendering scope
+- ContentBlock table cells MUST also be processed for two-choice patterns
+- The analysis-phase `two_choice_placeholders` with `section_key` matching takes priority over runtime keyword guessing
+
+#### Scenario: ContentBlock paragraph with 有/无 is filled
+- **GIVEN** a chapter has a commitment letter template containing `我公司（有、无）记入诚信档案且在有效期内的失信行为`
+- **AND** `analysis_data.two_choice_placeholders` has an entry with `section_key` matching this chapter
+- **WHEN** the ContentBlock paragraph is rendered in `_build_docx_bytes`
+- **THEN** the `（有、无）` is replaced with `**无**` (based on analysis-phase selection)
+- **AND** the `**无**` is rendered as bold text in the output document

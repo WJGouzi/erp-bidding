@@ -115,6 +115,11 @@ def _complete_analysis(task_id, execution_id=None):
                 v3_data["format_requirements"] = fmt_req
                 logger.info("[analysis] 注入格式要求到 analysis_data: %d sections",
                            len(fmt_req["required_sections"]))
+            # 将二选一占位符提升到 analysis_data 顶层，独立于 format_requirements
+            if fmt_req and isinstance(fmt_req, dict):
+                _tc = fmt_req.get("two_choice_placeholders", [])
+                if _tc and isinstance(_tc, list):
+                    v3_data["two_choice_placeholders"] = _tc
             result.analysis_data = json.dumps(v3_data, ensure_ascii=False)
             # 回填旧版本兼容字段（供前端旧接口使用）
             meta = v3_data.get("metadata", {})
@@ -376,6 +381,10 @@ def _complete_analysis(task_id, execution_id=None):
                     ad = _json.loads(result.analysis_data) if isinstance(result.analysis_data, str) else (result.analysis_data or {})
                     if isinstance(ad, dict):
                         ad["format_requirements"] = v3_result["format_requirements"]
+                        # 将二选一占位符提升到 analysis_data 顶层
+                        _tc2 = v3_result["format_requirements"].get("two_choice_placeholders", [])
+                        if _tc2 and isinstance(_tc2, list):
+                            ad["two_choice_placeholders"] = _tc2
                         result.analysis_data = _json.dumps(ad, ensure_ascii=False)
                 except Exception as exc:
                     logger.warning("[analysis] 格式要求存储异常: %s", exc)
