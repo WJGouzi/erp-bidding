@@ -62,6 +62,7 @@ def _llm_polish(merged: dict, segment_results: list) -> dict:
 def assemble(
     segment_results: list,
     section_index: list = None,
+    table_classification: dict = None,
 ) -> dict:
     """将段级解析结果组装为综合分析 JSON。
 
@@ -70,6 +71,8 @@ def assemble(
             每项: {segment_id, title, page_range, mandate_level,
                    metadata, eligibility, scoring, raw_excerpt}
         section_index: 章节索引（可选，用于来源定位）
+        table_classification: 数据表分类结果（可选），
+            从 table_classifier.classify_data_tables() 输出注入
 
     Returns:
         comprehensive_analysis.json
@@ -79,6 +82,11 @@ def assemble(
 
     # Step 1: 基础合并（规则驱动，不依赖 LLM）
     merged = _basic_merge(segment_results)
+
+    # Step 1.2: 数据表分类结果注入
+    if table_classification:
+        _inject_table_classification(merged, table_classification)
+
     # Step 1.5: LLM 精修（方案B：规则合并 → LLM 冲突解决）
     merged = _llm_polish(merged, segment_results)
 
@@ -110,6 +118,57 @@ def _empty_result() -> dict:
         "_segment_binding": {},
         "_section_index": [],
     }
+
+
+def _inject_table_classification(result: dict, tc: dict) -> None:
+    """从 table_classification 注入数据到合并结果。"""
+    seen_reqs = {r.get("requirement", "") for r in result.get("technical_requirements", [])}
+    seen_products = {p.get("name", "") for p in result.get("products", [])}
+
+    # 技术规格表 → technical_requirements
+    for tbl in tc.get("tech_requirements", []):
+        for item in tbl.get("items", []):
+            name = item.get("name", "")
+            spec = item.get("specification", "")
+            if name and spec:
+                text = f"{name}: {spec}"
+            elif name:
+                text = name
+            else:
+                continue
+            if text not in seen_reqs:
+                seen_reqs.add(text)
+                result.setdefault("technical_requirements", []).append({
+                    "requirement": text,
+                    "source": "table_classification.tech_requirements",
+                })
+
+    # 采购清单表 → products
+    for tbl in tc.get("product_lists", []):
+        for item in tbl.get("items", []):
+            name = item.get("name", "")
+            if name and name not in seen_products:
+                seen_products.add(name)
+                result.setdefault("products", []).append({
+                    "name": name,
+                    "unit_price": item.get("unit_price", ""),
+                    "quantity": item.get("quantity", ""),
+                    "source": "table_classification.product_lists",
+                })
+
+    # 评分表 → 补充 scoring.dimensions
+    tc_scoring = tc.get("scoring", {})
+    if tc_scoring.get("dimensions"):
+        existing_names = {d.get("name", "") for d in result.get("scoring", {}).get("dimensions", [])}
+        for dim in tc_scoring["dimensions"]:
+            if dim.get("name", "") not in existing_names:
+                existing_names.add(dim["name"])
+                result.setdefault("scoring", {}).setdefault("dimensions", []).append({
+                    "name": dim["name"],
+                    "score": dim.get("score", 0),
+                    "criteria": dim.get("criteria", ""),
+                    "source": "table_classification.scoring",
+                })
 
 
 def _basic_merge(segment_results: list) -> dict:

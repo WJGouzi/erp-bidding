@@ -47,6 +47,20 @@ def assemble_scoring(result, analysis: dict) -> dict:
         except (json.JSONDecodeError, TypeError):
             dimensions = []
 
+    # 从 _comprehensive 补充评分维度（table_classification 注入的额外维度）
+    comp = analysis.get("_comprehensive", {})
+    if isinstance(comp, dict):
+        comp_scoring = comp.get("scoring", {})
+        if isinstance(comp_scoring, dict):
+            comp_dims = comp_scoring.get("dimensions", [])
+            if isinstance(comp_dims, list):
+                existing_names = {d.get("name", "") for d in dimensions}
+                for dim in comp_dims:
+                    name = (dim.get("name", "") or "").strip()
+                    if name and name not in existing_names:
+                        existing_names.add(name)
+                        dimensions.append(dim)
+
     business_dims = []
     technical_dims = []
 

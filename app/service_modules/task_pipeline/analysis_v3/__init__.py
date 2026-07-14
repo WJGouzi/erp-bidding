@@ -50,6 +50,7 @@ from .check_items import generate_check_items, assemble_check_items
 
 from ....infrastructure.document_parser import ContentBlock, Section
 from ....infrastructure.table_parser import parse_all_tables
+from ....infrastructure.table_classifier import classify_data_tables
 from .segmented import run_segmented_analysis as _run_segmented_analysis
 logger = logging.getLogger(__name__)
 
@@ -333,6 +334,50 @@ def _get_biz_rule_cache():
     return result
 
 
+def _get_tech_rule_cache():
+    global _tech_rule_cache
+    result = dict(_tech_rule_cache)
+    _tech_rule_cache = {}
+    return result
+
+
+def _merge_technical_items(extra, items, source):
+    """将技术条目去重后写入 metadata.extra。"""
+    if not isinstance(extra, dict) or not items:
+        return []
+
+    existing = extra.get("technical_items", []) or []
+    merged = []
+    seen = set()
+
+    for item in existing:
+        if not isinstance(item, dict):
+            continue
+        text = str(item.get("requirement") or item.get("text") or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        merged.append(item)
+
+    appended = []
+    for item in items:
+        if isinstance(item, dict):
+            text = str(item.get("requirement") or item.get("text") or item.get("title") or "").strip()
+        else:
+            text = str(item or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        record = {"requirement": text, "source": source}
+        merged.append(record)
+        appended.append(record)
+
+    if merged:
+        extra["technical_items"] = merged
+        extra["technical_terms_raw"] = "\n".join(item["requirement"] for item in merged)
+    return appended
+
+
 def _find_technical_section_text(sections, raw_text="", max_chars=0) -> str:
     """定位技术章节并提取原文（规则优先，LLM 兜底）。"""
     if not raw_text:
@@ -340,7 +385,16 @@ def _find_technical_section_text(sections, raw_text="", max_chars=0) -> str:
     
     section_text = _extract_section_text(
         raw_text,
-        start_markers=["三、技术、服务要求", "技术、服务要求", "★三、技术", "技术要求", "技术参数"],
+        start_markers=[
+            "项目技术、服务、商务及其他要求",
+            "采购需求",
+            "三、技术、服务要求",
+            "技术、服务要求",
+            "技术参数及要求",
+            "★三、技术",
+            "技术要求",
+            "技术参数",
+        ],
         end_markers=["\n★", "\n第", "\n四、", "\n五、", "\n六、", "\n七、", "\n八、", "\n第六章", "\n第七章"],
     )
     if not section_text:
@@ -354,7 +408,8 @@ def _find_technical_section_text(sections, raw_text="", max_chars=0) -> str:
         logger.info("[analysis_v3] 规则提取技术要求完成: %d items", len(rule_result))
         return ""
     
-    return section_text[:1000]
+    limit = max_chars or 4000
+    return section_text[:limit]
 
 
 
@@ -787,21 +842,33 @@ def start_analyze_v3(task, source_texts, adapter=None):
     try:
         if not has_rule_biz or True:  # 技术要求一直尝试 LLM 补充
             tech_section_text = _find_technical_section_text(sections, raw_text)
-            if tech_section_text:
+            rule_tech = _get_tech_rule_cache()
+            if rule_tech.get("items") and isinstance(metadata, dict):
+                if "extra" not in metadata:
+                    metadata["extra"] = {}
+                appended = _merge_technical_items(metadata["extra"], rule_tech["items"], "rule")
+                if appended:
+                    logger.info("[analysis_v3] 规则提取技术要求完成: %d items", len(appended))
+            elif tech_section_text:
                 logger.info("[analysis_v3] 尝试 LLM 技术要求提取 (text_len=%d)", len(tech_section_text))
                 llm_tech = llm_extract_technical(tech_section_text)
                 if llm_tech and isinstance(llm_tech, list) and len(llm_tech) > 0:
-                    tech_texts = []
+                    tech_items = []
                     for item in llm_tech:
                         name = item.get("name", "")
                         requirement = item.get("requirement", "")
                         if name and requirement:
-                            tech_texts.append(f"{name}: {requirement}")
-                    if tech_texts and isinstance(metadata, dict):
+                            tech_items.append(f"{name}: {requirement}")
+                        elif requirement:
+                            tech_items.append(requirement)
+                        elif name:
+                            tech_items.append(name)
+                    if tech_items and isinstance(metadata, dict):
                         if "extra" not in metadata:
                             metadata["extra"] = {}
-                        metadata["extra"]["llm_technical_raw"] = "\n".join(tech_texts)
-                        logger.info("[analysis_v3] LLM技术提取完成: %d items", len(llm_tech))
+                        appended = _merge_technical_items(metadata["extra"], tech_items, "llm")
+                        metadata["extra"]["llm_technical_raw"] = "\n".join(tech_items)
+                        logger.info("[analysis_v3] LLM技术提取完成: %d items", len(appended))
     except Exception as exc:
         logger.warning("[analysis_v3] LLM技术增强异常(非阻断): %s", exc)
 
@@ -888,9 +955,6 @@ def start_analyze_v3(task, source_texts, adapter=None):
     # ════════════════════════════════════════════
 
     # 组装 analysis_data
-    # 表格数据已通过 format_requirements 按章节存储
-    # 不再需要独立的 table_classification
-    
     # ── 收集文档章节标题（用于后续目录生成） ──
     chapter_titles = []
     seen_titles = set()
@@ -915,10 +979,21 @@ def start_analyze_v3(task, source_texts, adapter=None):
         packages=packages,
         strategy=strategy,
     )
-    # 防御性清理：确保 analysis_data 不含废弃的 table_classification
-    analysis_data.pop("table_classification", None)
     # 注入章节标题到 analysis_data
     analysis_data["document_chapters"] = chapter_titles
+    # ── 数据表分类（独立于 format_requirements，只识别三类数据表） ──
+    try:
+        if hasattr(doc, 'tables') and doc.tables:
+            tc_result = classify_data_tables(doc.tables)
+            analysis_data["table_classification"] = tc_result
+            logger.info("[data_tables] 分类完成: tech=%d, product=%d, scoring=%s, total=%d tables",
+                        len(tc_result.get("tech_requirements", [])),
+                        len(tc_result.get("product_lists", [])),
+                        "yes" if tc_result.get("scoring", {}).get("dimensions") else "no",
+                        len(tc_result.get("table_index", {})))
+    except Exception as exc:
+        logger.warning("[data_tables] 分类异常(非阻断): %s", exc)
+
 
     # ── 分段分析注入 ──
     if section_index:
@@ -930,7 +1005,7 @@ def start_analyze_v3(task, source_texts, adapter=None):
                 # 过滤 section_index 中的合同模板章节（不传给汇编器）
                 _si_filtered = [s for s in section_index 
                                 if not any(kw in (s.get("title","") or "") for kw in ["合同模板","合同条款","合同样本","合同范本"])]
-                comprehensive = _assemble_segments(segment_results, _si_filtered)
+                comprehensive = _assemble_segments(segment_results, _si_filtered, table_classification=analysis_data.get("table_classification"))
                 if comprehensive:
                     analysis_data["_comprehensive"] = comprehensive
                     logger.info("[segmented] 已注入: %d segments", len(segment_results))
@@ -1171,4 +1246,3 @@ def _backfill_merge_cells_from_tables(doc):
                 _walk_sections(section.children)
     
     _walk_sections(doc.sections)
-

@@ -214,7 +214,7 @@ def _infer_skeleton_fallback(analysis_data):
     return skeleton
 
 
-def build_base_skeleton(analysis_data):
+def build_base_skeleton(analysis_data, technical_section=None):
     """阶段1主入口：构建基础骨架。"""
     if not isinstance(analysis_data, dict):
         analysis_data = {}
@@ -345,8 +345,8 @@ def _build_fallback_skeleton(analysis_data, classified_items):
     
     # 3. 技术/服务响应（来自 technical items 或 packages）
     tech_items = []
-    if isinstance(analysis_data.get("technical"), dict):
-        tech_items = analysis_data["technical"].get("items", [])
+    if isinstance(technical_section, dict):
+        tech_items = technical_section.get("items", []) or []
     if not tech_items:
         packages = analysis_data.get("packages", [])
         if packages and isinstance(packages, list):
@@ -627,7 +627,7 @@ def enrich_section_details(skeleton, analysis_data, classified_items):
         _fill_business_children(skeleton, business_items)
     
     # 3.2 技术偏离表描述
-    technical_items = analysis_data.get("technical", {}).get("items", []) if isinstance(analysis_data.get("technical"), dict) else []
+    technical_items = technical_section.get("items", []) if isinstance(technical_section, dict) else []
     packages = analysis_data.get("packages", [])
     if technical_items or packages:
         _fill_tech_description(skeleton, technical_items, packages)
@@ -843,7 +843,7 @@ def _extract_volume_name(cover_title):
     return name if name else "封面"
 
 
-def build_catalog(analysis_data, classified_items, section_index=None):
+def build_catalog(analysis_data, classified_items, section_index=None, technical_section=None):
     """目录合并引擎主入口。
 
     Args:
@@ -866,7 +866,7 @@ def build_catalog(analysis_data, classified_items, section_index=None):
     source_type = None  # track where skeleton came from
 
     # 第一级：从格式要求构建（唯一权威来源）
-    skeleton = build_base_skeleton(analysis_data)
+    skeleton = build_base_skeleton(analysis_data, technical_section=technical_section)
     if skeleton:
         source_type = "format_requirements"
         logger.info("[catalog] 使用格式要求骨架: %d 个节点", len(skeleton))
@@ -972,7 +972,17 @@ def _build_package_aware_outline(task, analysis_result, filtered_analysis_data, 
             section_index = payload.get('_section_index') if isinstance(payload, dict) else None
         except Exception:
             pass
-    return build_catalog(filtered_analysis_data, classified_items, section_index=section_index)
+    technical_section = (
+        analysis_result.parsed_technical_requirements
+        if analysis_result and hasattr(analysis_result, "parsed_technical_requirements")
+        else {}
+    )
+    return build_catalog(
+        filtered_analysis_data,
+        classified_items,
+        section_index=section_index,
+        technical_section=technical_section,
+    )
 
 
 

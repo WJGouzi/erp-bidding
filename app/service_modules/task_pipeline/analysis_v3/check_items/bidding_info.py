@@ -73,17 +73,45 @@ def _get_current_package_info(result) -> dict:
     }
 
 
-def _extract_budget(meta) -> dict:
-    """从 metadata 提取预算信息。"""
+def _extract_budget(meta, selected_package_no=0) -> dict:
+    """从 metadata 提取预算信息，支持分包预算三级降级。
+
+    降级链：
+      1. budget.packages[str(package_no)] → 所选包的预算
+      2. budget.total → 项目总预算
+      3. 0 → 无预算信息
+    
+    Args:
+        meta: analysis_data.metadata
+        selected_package_no: 当前选中的包号（0 表示未选择或无分包）
+    """
     budget_raw = meta.get("budget", 0)
-    if isinstance(budget_raw, dict):
+    if not isinstance(budget_raw, dict):
+        if isinstance(budget_raw, (int, float)):
+            return {"total": budget_raw, "note": ""}
+        return {"total": 0, "note": str(budget_raw)}
+
+    # 第1级：查包预算
+    if selected_package_no > 0:
+        packages = budget_raw.get("packages", {})
+        if isinstance(packages, dict):
+            pkg_budget = packages.get(str(selected_package_no))
+            if pkg_budget is not None and str(pkg_budget).strip():
+                return {
+                    "total": str(pkg_budget),
+                    "note": budget_raw.get("note", ""),
+                }
+
+    # 第2级：降级到项目总预算
+    total = budget_raw.get("total", 0)
+    if total is not None and str(total).strip() and str(total) != "0":
         return {
-            "total": budget_raw.get("total", 0),
+            "total": str(total),
             "note": budget_raw.get("note", ""),
         }
-    if isinstance(budget_raw, (int, float)):
-        return {"total": budget_raw, "note": ""}
-    return {"total": 0, "note": str(budget_raw)}
+
+    # 第3级：无预算信息
+    return {"total": 0, "note": budget_raw.get("note", "")}
 
 
 def assemble_bidding_info(result, analysis: dict) -> dict:
@@ -119,7 +147,7 @@ def assemble_bidding_info(result, analysis: dict) -> dict:
         "project_code": meta.get("project_code", {}).get("value", "") if isinstance(meta.get("project_code"), dict) else (meta.get("project_code") or ""),
         "package_no": pkg_info["package_no"],
         "package_name": pkg_info["package_name"],
-        "budget": _extract_budget(meta),
+        "budget": _extract_budget(meta, selected_package_no=pkg_info["package_no"]),
         "purchaser": _extract_name(meta.get("purchaser", "")),
         "agency": _extract_name(meta.get("agent", "")),
         "domain": meta.get("domain", ""),

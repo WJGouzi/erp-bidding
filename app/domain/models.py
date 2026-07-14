@@ -14,6 +14,54 @@ def _safe_json_load(val):
         return None
 
 
+def _normalize_technical_requirements(value):
+    """将 technical_requirements 统一规范为 {items} 结构。"""
+    if isinstance(value, str):
+        raw_text = value.strip()
+        parsed = _safe_json_load(value) if raw_text else None
+        if parsed is not None:
+            value = parsed
+        elif raw_text:
+            return {
+                "items": [{"content": raw_text, "source_section": "legacy"}],
+            }
+        else:
+            value = None
+
+    if isinstance(value, dict):
+        items = value.get("items", []) or []
+        normalized_items = []
+        for item in items:
+            if isinstance(item, dict):
+                content = str(item.get("content", "")).strip()
+                if content:
+                    normalized_items.append({
+                        "content": content,
+                        "source_section": item.get("source_section", ""),
+                    })
+            elif isinstance(item, str) and item.strip():
+                normalized_items.append({"content": item.strip(), "source_section": ""})
+        return {"items": normalized_items}
+
+    if isinstance(value, list):
+        normalized_items = []
+        for item in value:
+            if isinstance(item, dict):
+                content = str(item.get("content", "")).strip()
+                if content:
+                    normalized_items.append({
+                        "content": content,
+                        "source_section": item.get("source_section", ""),
+                    })
+            elif isinstance(item, str) and item.strip():
+                normalized_items.append({"content": item.strip(), "source_section": ""})
+        return {
+            "items": normalized_items,
+        }
+
+    return {"items": []}
+
+
 class FileStorage(db.Model):
     """记录上传文件、生成文件和知识库文件的统一存储元数据。"""
 
@@ -294,6 +342,26 @@ class BiddingAnalysisResult(db.Model):
         except Exception:
             return self.business_requirements or "暂未提取到商务要求。"
 
+    @property
+    def parsed_technical_requirements(self) -> dict:
+        """解析顶层 technical_requirements，返回结构化对象。"""
+        return _normalize_technical_requirements(self.technical_requirements)
+
+    @property
+    def computed_technical_requirements(self) -> str:
+        """从顶层 structured technical_requirements 生成文本视图。"""
+        technical = self.parsed_technical_requirements
+        items = technical.get("items", []) if isinstance(technical, dict) else []
+        if isinstance(items, list) and items:
+            text = "\n".join(
+                item.get("content", "").strip()
+                for item in items
+                if isinstance(item, dict) and item.get("content", "").strip()
+            )
+            if text:
+                return text
+        return "暂未提取到技术要求。"
+
     def to_dict(self):
         """将分析结果转换为接口返回结构。
         
@@ -317,7 +385,7 @@ class BiddingAnalysisResult(db.Model):
                         "requirements": self.requirements or "",
                         "business_requirements": self.business_requirements or "",
                         "qualification_requirements": self.qualification_requirements or "",
-                        "technical_requirements": self.technical_requirements or "",
+                        "technical_requirements": self.parsed_technical_requirements,
                         "scoring_items": _safe_json_load(self.scoring_items) if self.scoring_items else [],
                         "disqualification_items": _safe_json_load(self.disqualification_items) if self.disqualification_items else [],
                         "packages_json": _safe_json_load(self.packages_json) if self.packages_json else None,
@@ -337,7 +405,7 @@ class BiddingAnalysisResult(db.Model):
             "requirements": self.requirements or "",
             "business_requirements": self.business_requirements or "",
             "qualification_requirements": self.qualification_requirements or "",
-            "technical_requirements": self.technical_requirements or "",
+            "technical_requirements": self.parsed_technical_requirements,
             "scoring_items": _safe_json_load(self.scoring_items) if self.scoring_items else [],
             "disqualification_items": _safe_json_load(self.disqualification_items) if self.disqualification_items else [],
             "packages_json": _safe_json_load(self.packages_json) if self.packages_json else None,

@@ -195,6 +195,81 @@ def _analyze_scoring_for_segment(seg_text):
     return result
 
 
+_TECH_TITLE_KEYWORDS = (
+    "技术要求",
+    "技术参数",
+    "技术规格",
+    "规格型号",
+    "采购需求",
+    "服务要求",
+    "项目需求",
+    "参数要求",
+)
+
+_TECH_EXCLUDE_TITLE_KEYWORDS = (
+    "评分",
+    "资格",
+    "商务",
+    "合同",
+    "报价",
+    "投标文件格式",
+    "响应文件格式",
+)
+
+_TECH_LINE_SIGNAL_RE = re.compile(
+    r"(?:★|▲|技术|参数|规格|性能|配置|指标|服务要求|采购需求|规格型号及技术要求)"
+)
+
+
+def _is_technical_segment(title, text):
+    """根据标题和文本信号判断是否为技术章节。"""
+    title = (title or "").strip()
+    if any(kw in title for kw in _TECH_EXCLUDE_TITLE_KEYWORDS):
+        return False
+    if any(kw in title for kw in _TECH_TITLE_KEYWORDS):
+        return True
+    return "规格型号及技术要求" in (text or "") or "技术参数与性能指标" in (text or "")
+
+
+def _analyze_technical_for_segment(title, seg_text):
+    """从技术相关章节提取技术要求文本。"""
+    if not seg_text or not _is_technical_segment(title, seg_text):
+        return []
+
+    items = []
+    seen = set()
+    lines = [line.strip() for line in seg_text.splitlines() if line.strip()]
+
+    for line in lines:
+        if len(line) < 6 or len(line) > 300:
+            continue
+        if line == title:
+            continue
+        if re.match(r"^第[一二三四五六七八九十零〇百千万亿]+[章节篇部]", line):
+            continue
+        if any(kw in line for kw in _TECH_EXCLUDE_TITLE_KEYWORDS):
+            continue
+        if _TECH_LINE_SIGNAL_RE.search(line) or ("|" in line and _is_technical_segment(title, line)):
+            if line not in seen:
+                seen.add(line)
+                items.append({"requirement": line})
+        if len(items) >= 20:
+            break
+
+    # 章节明显是技术章但没抓到信号行时，保留前几行正文作为兜底
+    if not items:
+        for line in lines:
+            if len(line) < 10 or len(line) > 300 or line == title:
+                continue
+            if line not in seen:
+                seen.add(line)
+                items.append({"requirement": line})
+            if len(items) >= 10:
+                break
+
+    return items
+
+
 def _analyze_mandate_for_segment(title, text):
     """对 segment 运行强制条款分类。"""
     default = {"level": "FREE", "reason": "未检测", "source": ""}
@@ -232,6 +307,7 @@ def analyze_single_segment(doc, seg_node, section_index, full_text):
     mandate = _analyze_mandate_for_segment(seg_title, seg_text)
     eligibility = _analyze_eligibility_for_segment(seg_sections)
     scoring = _analyze_scoring_for_segment(seg_text)
+    technical = _analyze_technical_for_segment(seg_title, seg_text)
 
     return {
         "segment_id": seg_id,
@@ -241,6 +317,7 @@ def analyze_single_segment(doc, seg_node, section_index, full_text):
         "metadata": {},
         "eligibility": eligibility,
         "scoring": scoring,
+        "technical_requirements": technical,
         "raw_excerpt": seg_text[:500],
     }
 

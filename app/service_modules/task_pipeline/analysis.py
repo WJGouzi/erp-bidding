@@ -2,7 +2,6 @@
 
 import json
 import logging; logger = logging.getLogger(__name__)
-import re
 import time
 
 from flask import current_app
@@ -39,13 +38,13 @@ from .helpers import (
     _extract_effective_text,
     _extract_package_numbers,
     _read_file_text,
+    sanitize_analysis_payload,
 )
 
 
 
 def _save_v3_check_items(shared_resource_id, check_items):
     """保存 v3 管线产生的核对项。"""
-    from .analysis_v3.check_items import generate_check_items
     from ...domain import BiddingCheckItem
     
     # 删除旧的核对项
@@ -65,6 +64,92 @@ def _save_v3_check_items(shared_resource_id, check_items):
             sort_no=i + 1,
         )
         db.session.add(record)
+
+
+def _append_unique_text(parts, seen, text):
+    """向结果列表追加去重后的文本。"""
+    text = str(text or "").strip()
+    if not text:
+        return
+    if text in seen:
+        return
+    seen.add(text)
+    parts.append(text)
+
+
+def _collect_v3_technical_parts(v3_data, extra):
+    """从 v3 结构化数据汇总技术要求文本。"""
+    parts = []
+    seen = set()
+
+    comp = v3_data.get("_comprehensive", {}) or {}
+    for item in comp.get("technical_requirements", []) or []:
+        if not isinstance(item, dict):
+            continue
+        text = item.get("requirement") or item.get("text") or item.get("title") or ""
+        _append_unique_text(parts, seen, text)
+
+    tc = v3_data.get("table_classification", {}) or {}
+    for tbl in tc.get("tech_requirements", []) or []:
+        if not isinstance(tbl, dict):
+            continue
+        for item in tbl.get("items", []) or []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "")).strip()
+            spec = str(item.get("specification", "")).strip()
+            _append_unique_text(parts, seen, f"{name}: {spec}" if name and spec else name)
+
+    for tbl in tc.get("product_lists", []) or []:
+        if not isinstance(tbl, dict):
+            continue
+        for item in tbl.get("items", []) or []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "")).strip()
+            spec = str(item.get("specification", "")).strip()
+            remark = str(item.get("remark", "")).strip()
+            if name and spec:
+                text = f"{name}: {spec}"
+            elif name and remark:
+                text = f"{name}: {remark}"
+            else:
+                text = name
+            _append_unique_text(parts, seen, text)
+
+    if isinstance(extra, dict):
+        for item in extra.get("technical_items", []) or []:
+            if isinstance(item, dict):
+                text = item.get("requirement") or item.get("text") or ""
+            else:
+                text = item
+            _append_unique_text(parts, seen, text)
+        _append_unique_text(parts, seen, extra.get("technical_terms_raw", ""))
+        _append_unique_text(parts, seen, extra.get("llm_technical_raw", ""))
+
+    if parts:
+        return parts
+
+    for p in v3_data.get("packages", []) or []:
+        if not isinstance(p, dict):
+            continue
+        pname = p.get("name", f"第{p.get('package_no')}包")
+        params = p.get("parameters") or {}
+        counts = []
+        if params.get("starred_count"):
+            counts.append(f"★{params['starred_count']}项")
+        if params.get("important_count"):
+            counts.append(f"▲{params['important_count']}项")
+        if params.get("general_count"):
+            counts.append(f"一般{params['general_count']}项")
+        if counts:
+            _append_unique_text(parts, seen, f"{pname}：技术参数 {'/'.join(counts)}")
+        core_products = params.get("core_products") or []
+        if core_products:
+            _append_unique_text(parts, seen, f"{pname}核心产品：{'、'.join(core_products[:5])}")
+
+    return parts
+
 
 def _complete_analysis(task_id, execution_id=None):
     """完成招标文件分析并写入分析、核对和分包结果。"""
@@ -106,6 +191,7 @@ def _complete_analysis(task_id, execution_id=None):
     # v3 管线唯一路径（三层分析，零LLM）
     try:
         from .analysis_v3 import start_analyze_v3 as _start_v3_llm_free
+        from .analysis_v3.check_items.technical import build_technical_section as _build_technical_section
         v3_result = _start_v3_llm_free(task, source_texts)
         if v3_result and v3_result.get("analysis_data"):
             v3_data = v3_result["analysis_data"]
@@ -120,7 +206,7 @@ def _complete_analysis(task_id, execution_id=None):
                 _tc = fmt_req.get("two_choice_placeholders", [])
                 if _tc and isinstance(_tc, list):
                     v3_data["two_choice_placeholders"] = _tc
-            result.analysis_data = json.dumps(v3_data, ensure_ascii=False)
+            result.analysis_data = json.dumps(sanitize_analysis_payload(v3_data), ensure_ascii=False)
             # 回填旧版本兼容字段（供前端旧接口使用）
             meta = v3_data.get("metadata", {})
             project_name = meta.get("project_name", {}).get("value", "") if isinstance(meta.get("project_name"), dict) else (meta.get("project_name") or "")
@@ -166,7 +252,7 @@ def _complete_analysis(task_id, execution_id=None):
                 if agent_name:
                     bidder_notice_entry["agent"] = agent_name
                 # 重新序列化 analysis_data
-                result.analysis_data = json.dumps(v3_data, ensure_ascii=False)
+                result.analysis_data = json.dumps(sanitize_analysis_payload(v3_data), ensure_ascii=False)
             if budget_total:
                 if isinstance(budget_total, (int, float)):
                     if budget_total % 10000 == 0:
@@ -246,70 +332,15 @@ def _complete_analysis(task_id, execution_id=None):
                 biz_parts.append(extra["llm_business_raw"])
             result.business_requirements = "\n".join(biz_parts) if biz_parts else "暂未提取到商务要求。"
 
-            # 回填技术要求（从包参数 + ★条款提取）
-            tech_parts = []
-            pkgs = v3_data.get("packages", [])
-            for p in pkgs:
-                if not isinstance(p, dict):
-                    continue
-                pname = p.get("name", f"第{p.get('package_no')}包")
-                params = p.get("parameters") or {}
-                counts = []
-                if params.get("starred_count"):
-                    counts.append(f"★{params['starred_count']}项")
-                if params.get("important_count"):
-                    counts.append(f"▲{params['important_count']}项")
-                if params.get("general_count"):
-                    counts.append(f"一般{params['general_count']}项")
-                if counts:
-                    tech_parts.append(f"{pname}：技术参数 {'/'.join(counts)}")
-                if params.get("core_products"):
-                    tech_parts.append(f"{pname}核心产品：{'、'.join(params['core_products'][:5])}")
-            # LLM 兜底：包参数提取为空时使用 LLM 结果
-            if not tech_parts and extra.get("llm_technical_raw"):
-                tech_parts.append(extra["llm_technical_raw"])
-            result.technical_requirements = "\n".join(tech_parts) if tech_parts else "暂未提取到技术要求。"
+            # 回填技术要求：优先使用结构化技术数据，再降级到弱摘要
+            technical_section = _build_technical_section(result, v3_data)
+            result.technical_requirements = json.dumps(technical_section, ensure_ascii=False)
+            v3_data.pop("technical", None)
+            v3_data.pop("technical_requirements", None)
             
             # 从表格分类结果补充技术/商务要求（政府采购一体化平台格式）
-            tc = v3_data.get("format_requirements", {})  # table_classification removed
+            tc = v3_data.get("format_requirements", {})
             if tc:
-                # 技术要求表
-                if result.technical_requirements == "暂未提取到技术要求。":
-                    tech_table_parts = []
-                    for tr in tc.get("tech_requirements", []):
-                        if not isinstance(tr, dict):
-                            continue
-                        for item in tr.get("items", []):
-                            if not isinstance(item, dict):
-                                continue
-                            name = item.get("技术要求名称", "")
-                            params = item.get("技术参数与性能指标", "")
-                            if name and params:
-                                tech_table_parts.append(f"  {name}: {params[:100]}")
-                    # 从 product_lists 补充产品规格（兼容★前缀的列名）
-                    for pl in tc.get("product_lists", []):
-                        if not isinstance(pl, dict):
-                            continue
-                        items = pl.get("items", [])
-                        for item in items:
-                            if not isinstance(item, dict):
-                                continue
-                            name = item.get("采购产品名称", "") or item.get("产品名称", "")
-                            spec = (item.get("★规格参数", "") or item.get("技术参数与性能指标", "") 
-                                    or item.get("规格参数", "") or item.get("规格", ""))
-                            if name:
-                                if spec:
-                                    tech_table_parts.append(f"  {name}: {spec[:150]}")
-                                else:
-                                    unit = item.get("★计量单位", "") or item.get("计量单位", "")
-                                    max_price = item.get("★单价最高限价", "") or item.get("单价最高限价", "")
-                                    if unit or max_price:
-                                        tech_table_parts.append(f"  {name} (单位: {unit}, 限价: {max_price})")
-                                    else:
-                                        tech_table_parts.append(f"  {name}")
-                    if tech_table_parts:
-                        result.technical_requirements = "技术参数要求:\n" + "\n".join(tech_table_parts[:30])
-                
                 # 商务要求表（含交货时间、交货地点、付款方式等）
                 biz_table_parts = []
                 for br in tc.get("business_requirements", []):
@@ -348,6 +379,8 @@ def _complete_analysis(task_id, execution_id=None):
                     else:
                         result.business_requirements = srv_extra
 
+            result.analysis_data = json.dumps(sanitize_analysis_payload(v3_data), ensure_ascii=False)
+
             # 更新 requirements（商务+评分摘要）
             req_parts = []
             if biz_parts:
@@ -357,6 +390,7 @@ def _complete_analysis(task_id, execution_id=None):
             result.requirements = " | ".join(req_parts) if req_parts else dim_summary
 
             # 保存分包列表到独立列
+            pkgs = v3_data.get("packages", [])
             if pkgs:
                 result.packages_json = json.dumps(pkgs, ensure_ascii=False)
                 result.package_count = len(pkgs)
@@ -388,7 +422,7 @@ def _complete_analysis(task_id, execution_id=None):
                         _tc2 = v3_result["format_requirements"].get("two_choice_placeholders", [])
                         if _tc2 and isinstance(_tc2, list):
                             ad["two_choice_placeholders"] = _tc2
-                        result.analysis_data = _json.dumps(ad, ensure_ascii=False)
+                        result.analysis_data = _json.dumps(sanitize_analysis_payload(ad), ensure_ascii=False)
                 except Exception as exc:
                     logger.warning("[analysis] 格式要求存储异常: %s", exc)
             
@@ -543,6 +577,23 @@ def get_packages(task_id):
         raise LookupError("共享资源不存在")
     packages = []
     analysis_result = BiddingAnalysisResult.query.filter_by(shared_resource_id=task.shared_resource_id).first()
+
+    # 从 analysis_data 读取包预算映射
+    pkg_budget_map = {}
+    _analysis_data = None
+    if analysis_result and analysis_result.analysis_data:
+        try:
+            import json as _j
+            _analysis_data = _j.loads(analysis_result.analysis_data) if isinstance(analysis_result.analysis_data, str) else analysis_result.analysis_data
+            if isinstance(_analysis_data, dict):
+                ad_pkgs = _analysis_data.get("packages") or []
+                if isinstance(ad_pkgs, list):
+                    for ap in ad_pkgs:
+                        if ap.get("package_no") and ap.get("budget"):
+                            pkg_budget_map[str(ap["package_no"])] = str(ap["budget"])
+        except Exception:
+            pass
+
     # 优先从 v3 analysis_data 读取包号
     detected_packages = _get_packages_from_analysis_data(analysis_result)
     if not detected_packages:
@@ -550,10 +601,12 @@ def get_packages(task_id):
     for pkg in detected_packages:
         package_no = pkg["package_no"]
         package_name = pkg.get("package_name") or f"第{package_no}包"
+        budget = pkg_budget_map.get(str(package_no), "")
         packages.append(
             {
                 "package_no": package_no,
                 "package_name": package_name,
+                "budget": budget,
                 "selected": str(shared_resource.selected_package_no or "") == str(package_no),
             }
         )
@@ -702,7 +755,7 @@ def save_review(task_id, data):
                 if isinstance(analysis[field], dict):
                     analysis[field]["dimensions"] = original_dims
 
-    result.analysis_data = json.dumps(analysis, ensure_ascii=False)
+    result.analysis_data = json.dumps(sanitize_analysis_payload(analysis), ensure_ascii=False)
 
     # 状态推进：仅第一次（ANALYZED → CHECKED）
     if task.status == "ANALYZED":
@@ -727,5 +780,3 @@ def save_review(task_id, data):
         "progress": task.progress,
         "current_step": task.current_step,
     }
-
-

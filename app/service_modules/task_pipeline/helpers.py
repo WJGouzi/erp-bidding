@@ -56,6 +56,17 @@ from ..storage import StorageService
 logger = logging.getLogger(__name__)
 
 
+def sanitize_analysis_payload(payload):
+    """清理 analysis_data 中的重复/废弃字段，避免冗余写回数据库。"""
+    if not isinstance(payload, dict):
+        return payload
+
+    payload.pop("technical", None)
+    payload.pop("technical_requirements", None)
+
+    return payload
+
+
 def _apply_black_solid_borders(table):
     """为 python-docx Table 的 XML 设置黑色实线边框。"""
     from docx.oxml.ns import qn
@@ -270,6 +281,7 @@ def _extract_analysis_context(analysis_result):
         "business_requirements": "",
         "qualification_requirements": "",
         "technical_requirements": "",
+        "technical_items": [],
         "scoring_items": "",
         "disqualification_items": "",
     }
@@ -299,8 +311,21 @@ def _extract_analysis_context(analysis_result):
             or getattr(analysis_result, "qualification_requirements", "")
             or ""
         )
+        technical_section = getattr(analysis_result, "parsed_technical_requirements", {}) or {}
+        technical_items = technical_section.get("items", []) if isinstance(technical_section, dict) else []
+        if isinstance(technical_items, list):
+            context["technical_items"] = technical_items
+        structured_tech_text = ""
+        if technical_items:
+            structured_tech_text = "\n".join(
+                item.get("content", "").strip()
+                for item in technical_items
+                if isinstance(item, dict) and item.get("content", "").strip()
+            )
         context["technical_requirements"] = (
-            payload.get("technical_requirements", "") or getattr(analysis_result, "technical_requirements", "") or ""
+            structured_tech_text
+            or getattr(analysis_result, "computed_technical_requirements", "")
+            or ""
         )
         context["scoring_items"] = payload.get("scoring_items", "") or getattr(analysis_result, "scoring_items", "") or ""
         context["disqualification_items"] = (
@@ -353,7 +378,7 @@ def _extract_analysis_context(analysis_result):
         context["requirements"] = getattr(analysis_result, "requirements", "") or ""
         context["business_requirements"] = getattr(analysis_result, "business_requirements", "") or ""
         context["qualification_requirements"] = getattr(analysis_result, "qualification_requirements", "") or ""
-        context["technical_requirements"] = getattr(analysis_result, "technical_requirements", "") or ""
+        context["technical_requirements"] = getattr(analysis_result, "computed_technical_requirements", "") or ""
         context["scoring_items"] = getattr(analysis_result, "scoring_items", "") or ""
         context["disqualification_items"] = getattr(analysis_result, "disqualification_items", "") or ""
     return context
@@ -761,7 +786,7 @@ def _build_product_context(task):
     if not task.use_product_library:
         return {}
     analysis_result = BiddingAnalysisResult.query.filter_by(shared_resource_id=task.shared_resource_id).first()
-    requirements = analysis_result.technical_requirements if analysis_result else ""
+    requirements = analysis_result.computed_technical_requirements if analysis_result else ""
     effective = analysis_result.effective_text if analysis_result and analysis_result.effective_text else (analysis_result.raw_text if analysis_result else "")
     
     # 从 format_requirements.required_sections[].template_content 提取产品名称
@@ -1749,6 +1774,7 @@ def _persist_generation_plan_snapshot(analysis_result, generation_plan):
     if not payload.get("version"):
         payload["version"] = "v2"
     payload["generation_plan"] = generation_plan
+    payload = sanitize_analysis_payload(payload)
     analysis_result.analysis_data = json.dumps(payload, ensure_ascii=False)
 
 
@@ -1834,6 +1860,7 @@ def _persist_generation_coverage_snapshot(analysis_result, coverage_snapshot):
     if not payload.get("version"):
         payload["version"] = "v2"
     payload["generation_coverage"] = coverage_snapshot
+    payload = sanitize_analysis_payload(payload)
     analysis_result.analysis_data = json.dumps(payload, ensure_ascii=False)
 
 
