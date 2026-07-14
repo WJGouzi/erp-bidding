@@ -5,7 +5,6 @@
 
 每个子模块从 bidding_analysis_result 表单行读取数据，独立组装。
 """
-import json
 import logging
 
 from app.domain.models import BiddingAnalysisResult, BiddingCheckItem
@@ -29,6 +28,21 @@ def get_task_id(shared_resource_id: int) -> int:
     return 0
 
 
+def _get_package_filter(result, analysis: dict) -> tuple[str, bool]:
+    """获取当前 check-items 链路需要使用的包过滤上下文。"""
+    selected_package_no = ""
+    has_package = bool((analysis or {}).get("has_package"))
+    try:
+        from app.domain.models import BiddingSharedResource
+        sr = BiddingSharedResource.query.get(result.shared_resource_id)
+        if sr:
+            selected_package_no = str(sr.selected_package_no or "").strip()
+            has_package = has_package or bool(sr.has_package)
+    except Exception:
+        pass
+    return selected_package_no, has_package
+
+
 def assemble_check_items(shared_resource_id: int) -> dict:
     """统一入口：从 bidding_analysis_result 表组装完整 check-items 响应。"""
     result = BiddingAnalysisResult.query.filter_by(
@@ -43,17 +57,25 @@ def assemble_check_items(shared_resource_id: int) -> dict:
     # 导入各子模块（延迟导入避免循环）
     from .bidding_info import assemble_bidding_info
     from .business import assemble_business
-    from .technical import assemble_technical
+    from .technical import assemble_technical, filter_technical_section
     from .qualification import assemble_qualification
     from .scoring import assemble_scoring
     from .packages import assemble_packages
     from .checklist import assemble_checklist
 
+    selected_package_no, has_package = _get_package_filter(result, analysis)
+    technical = assemble_technical(result, analysis)
+    technical = filter_technical_section(
+        technical,
+        selected_package_no=selected_package_no,
+        has_package=has_package,
+    )
+
     return {
         "task_id": get_task_id(shared_resource_id),
         "bidding_info": assemble_bidding_info(result, analysis),
         "business": assemble_business(result, analysis),
-        "technical": assemble_technical(result, analysis),
+        "technical": technical,
         "qualification": assemble_qualification(result, analysis),
         "scoring": assemble_scoring(result, analysis),
         "packages": assemble_packages(result, analysis),

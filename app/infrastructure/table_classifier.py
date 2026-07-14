@@ -14,6 +14,7 @@
 """
 
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,57 @@ TYPE_TECH_REQUIREMENT = "TECH_REQUIREMENT"
 TYPE_PRODUCT = "PRODUCT_LIST"
 TYPE_SCORING = "SCORING"
 TYPE_OTHER = "OTHER"
+
+
+TECH_NAME_HEADERS = [
+    "标的名称", "产品名称", "采购产品名称", "货物名称", "品名", "名称",
+]
+TECH_SPEC_HEADERS = [
+    "规格型号及技术要求", "规格型号及技术参数", "技术参数与性能指标",
+    "技术参数", "技术要求", "技术指标", "规格参数", "规格型号", "规格", "型号",
+]
+PRODUCT_PRICE_HEADERS = [
+    "单价限价", "最高限价", "单价", "预算单价", "限价",
+]
+PRODUCT_QTY_HEADERS = [
+    "预估数量", "数量", "需求量", "采购数量",
+]
+PRODUCT_UNIT_HEADERS = [
+    "单位", "计量单位",
+]
+PRODUCT_REMARK_HEADERS = [
+    "备注", "说明",
+]
+SCORING_NAME_HEADERS = ["评分因素", "评分项", "评分项目", "评审因素", "评审项目", "评审内容", "评分内容"]
+SCORING_SCORE_HEADERS = ["分值", "分数", "权重", "标准分值", "标准分数", "权值"]
+SCORING_CRITERIA_HEADERS = ["评分标准", "评审标准", "评审细则", "评分细则", "评审准则", "评标标准", "评分规则"]
+
+
+def _normalize_header(text):
+    """规范化表头文本，便于做语义匹配。"""
+    normalized = str(text or "").strip()
+    normalized = normalized.replace("\n", "").replace("\r", "")
+    normalized = re.sub(r"[：:()（）\[\]【】\s]+", "", normalized)
+    normalized = normalized.replace("★", "").replace("▲", "")
+    return normalized
+
+
+def _find_col_index(headers, candidates):
+    """按候选语义在表头中寻找列索引。"""
+    normalized_headers = [_normalize_header(h) for h in headers]
+    normalized_candidates = [_normalize_header(c) for c in candidates if str(c or "").strip()]
+
+    for i, header in enumerate(normalized_headers):
+        for candidate in normalized_candidates:
+            if header == candidate:
+                return i
+
+    for i, header in enumerate(normalized_headers):
+        for candidate in normalized_candidates:
+            if candidate and candidate in header:
+                return i
+
+    return None
 
 
 def _safe_full_headers(table):
@@ -57,39 +109,48 @@ def _all_rows(table):
 def _classify_table(headers):
     """根据表头判断表格类型。
 
-    规则（基于实际 9 包 docx 表头特征）：
-      - 技术规格表: 同时含"标的名称"+"规格型号"
-      - 采购清单表: 同时含"标的名称"+"单价限价"（含★变体）
-      - 评分表: 同时含"评分因素"+"分值"+"评分标准"
+    规则：
+      - 技术规格表: 存在名称列 + 技术/规格列
+      - 采购清单表: 存在名称列 + 价格/数量/单位等商务列
+      - 评分表: 存在评分因素列 + 分值列 + 评分标准列
     """
-    header_text = " ".join(headers)
+    name_idx = _find_col_index(headers, TECH_NAME_HEADERS)
+    spec_idx = _find_col_index(headers, TECH_SPEC_HEADERS)
+    price_idx = _find_col_index(headers, PRODUCT_PRICE_HEADERS)
+    qty_idx = _find_col_index(headers, PRODUCT_QTY_HEADERS)
+    unit_idx = _find_col_index(headers, PRODUCT_UNIT_HEADERS)
+    scoring_name_idx = _find_col_index(headers, SCORING_NAME_HEADERS)
+    scoring_score_idx = _find_col_index(headers, SCORING_SCORE_HEADERS)
+    scoring_criteria_idx = _find_col_index(headers, SCORING_CRITERIA_HEADERS)
 
-    # 技术规格表: 必须同时含"标的名称" + "规格型号及技术要求"（完整短语）
-    # 排除格式模板表（仅含"规格型号"不带"及技术要求"）
-    if "标的名称" in header_text and "规格型号及技术要求" in header_text:
+    if name_idx is not None and spec_idx is not None:
         return TYPE_TECH_REQUIREMENT
 
-    # 采购清单表: "标的名称" + "单价限价"
-    if "标的名称" in header_text:
-        if "单价限价" in header_text:
-            return TYPE_PRODUCT
+    if name_idx is not None and any(idx is not None for idx in (price_idx, qty_idx, unit_idx)):
+        return TYPE_PRODUCT
 
-    # 评分表: "评分因素" + "分值" + "评分标准"
-    if "评分因素" in header_text and "分值" in header_text and "评分标准" in header_text:
+    if scoring_name_idx is not None and scoring_score_idx is not None and scoring_criteria_idx is not None:
         return TYPE_SCORING
 
     return TYPE_OTHER
 
 
 def _extract_tech_requirement(rows):
-    """从技术规格表提取数据。格式：序号 | 标的名称 | 规格型号及技术要求"""
+    """从技术规格表提取数据。按表头语义抽取名称列和技术列。"""
     items = []
+    headers = rows[0] if rows else []
+    name_idx = _find_col_index(headers, TECH_NAME_HEADERS)
+    spec_idx = _find_col_index(headers, TECH_SPEC_HEADERS)
+    if name_idx is None and len(headers) > 1:
+        name_idx = 1
+    if spec_idx is None and len(headers) > 2:
+        spec_idx = 2
     for row in rows[1:]:  # 跳过表头
-        if len(row) < 3:
+        if not row:
             continue
-        name = row[1].strip() if len(row) > 1 else ""
-        spec = row[2].strip() if len(row) > 2 else ""
-        if name:
+        name = row[name_idx].strip() if name_idx is not None and name_idx < len(row) else ""
+        spec = row[spec_idx].strip() if spec_idx is not None and spec_idx < len(row) else ""
+        if name or spec:
             items.append({
                 "name": name,
                 "specification": spec,
@@ -98,17 +159,25 @@ def _extract_tech_requirement(rows):
 
 
 def _extract_product_list(rows):
-    """从采购清单表提取数据。格式：序号 | 标的名称 | ★单价限价 | 预估数量 | 单位 | 备注"""
+    """从采购清单表提取数据。按表头语义抽取各列。"""
     items = []
+    headers = rows[0] if rows else []
+    name_idx = _find_col_index(headers, TECH_NAME_HEADERS)
+    price_idx = _find_col_index(headers, PRODUCT_PRICE_HEADERS)
+    qty_idx = _find_col_index(headers, PRODUCT_QTY_HEADERS)
+    unit_idx = _find_col_index(headers, PRODUCT_UNIT_HEADERS)
+    remark_idx = _find_col_index(headers, PRODUCT_REMARK_HEADERS)
+    if name_idx is None and len(headers) > 1:
+        name_idx = 1
     for row in rows[1:]:
-        if len(row) < 2:
+        if not row:
             continue
-        name = row[1].strip() if len(row) > 1 else ""
+        name = row[name_idx].strip() if name_idx is not None and name_idx < len(row) else ""
         if name and name != "统一下浮率" and name != "...":
-            unit_price = row[2].strip() if len(row) > 2 else ""
-            qty = row[3].strip() if len(row) > 3 else ""
-            unit = row[4].strip() if len(row) > 4 else ""
-            remark = row[5].strip() if len(row) > 5 else ""
+            unit_price = row[price_idx].strip() if price_idx is not None and price_idx < len(row) else ""
+            qty = row[qty_idx].strip() if qty_idx is not None and qty_idx < len(row) else ""
+            unit = row[unit_idx].strip() if unit_idx is not None and unit_idx < len(row) else ""
+            remark = row[remark_idx].strip() if remark_idx is not None and remark_idx < len(row) else ""
             items.append({
                 "name": name,
                 "unit_price": unit_price,
@@ -181,6 +250,11 @@ def classify_data_tables(tables):
             continue
 
         rows = _all_rows(table)
+        # ContentBlock 表格的 headers 和 rows 分开存储，_all_rows 只返回数据行
+        # 但 _extract_* 函数期望 rows[0] 是表头行，需要将 headers 合并到 rows 开头
+        if headers and hasattr(table, "headers") and getattr(table, "headers", None) is not None:
+            if not rows or rows[0] != headers:
+                rows.insert(0, headers)
         if not rows or len(rows) < 2:
             continue
 

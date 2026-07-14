@@ -90,6 +90,22 @@ def _text_from_all_sections(doc, raw_text=""):
 
 def _detect_package_count(metadata, doc, raw_text=""):
     """检测分包数量。优先用 metadata 的 package_count，没有则从文档中找。"""
+    def _cn_to_int(text):
+        text = str(text or "").strip()
+        if not text:
+            return 0
+        if text.isdigit():
+            return int(text)
+        mapping = {"零": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+        if text == "十":
+            return 10
+        if "十" in text:
+            left, _, right = text.partition("十")
+            tens = mapping.get(left, 1 if left == "" else 0)
+            units = mapping.get(right, 0)
+            return tens * 10 + units
+        return mapping.get(text, 0)
+
     pkg_count = metadata.get("package_count", 0)
     if pkg_count and pkg_count > 0:
         return list(range(1, int(pkg_count) + 1))
@@ -98,23 +114,23 @@ def _detect_package_count(metadata, doc, raw_text=""):
     doc_text = _text_from_first_sections(doc, count=6, raw_text=raw_text)
 
     # 1. 显式声明："本项目共X个包"
-    m = re.search(r"(?:共计|分为|共)\s*(\d+)\s*个包", doc_text)
+    m = re.search(r"(?:共计|分为|共)\s*([0-9一二三四五六七八九十百零]+)\s*个包", doc_text)
     if m:
-        count = int(m.group(1))
+        count = _cn_to_int(m.group(1))
         return list(range(1, count + 1))
 
     # 2. "第X包" 格式
     max_pkg = 0
-    pkg_nums = re.findall(r"第(\d+)包", doc_text)
+    pkg_nums = re.findall(r"第([0-9一二三四五六七八九十百零]+)包", doc_text)
     for num in pkg_nums:
-        n = int(num)
+        n = _cn_to_int(num)
         if n > max_pkg:
             max_pkg = n
 
     # 3. "采购包X" 格式（最常见，覆盖公开招标/比选/竞争性谈判等）
-    cg_nums = re.findall(r"采购包(\d+)", doc_text)
+    cg_nums = re.findall(r"采购包([0-9一二三四五六七八九十百零]+)", doc_text)
     for num in cg_nums:
-        n = int(num)
+        n = _cn_to_int(num)
         if n > max_pkg:
             max_pkg = n
 
@@ -386,16 +402,24 @@ def _find_technical_section_text(sections, raw_text="", max_chars=0) -> str:
     section_text = _extract_section_text(
         raw_text,
         start_markers=[
+            "★三、技术要求",
+            "★3、技术要求",
+            "三、技术要求",
+            "3、技术要求",
+            "第三部分 技术要求",
+            "技术要求",
+            "★三、技术参数",
+            "三、技术参数",
+            "3、技术参数",
             "项目技术、服务、商务及其他要求",
             "采购需求",
             "三、技术、服务要求",
             "技术、服务要求",
             "技术参数及要求",
             "★三、技术",
-            "技术要求",
             "技术参数",
         ],
-        end_markers=["\n★", "\n第", "\n四、", "\n五、", "\n六、", "\n七、", "\n八、", "\n第六章", "\n第七章"],
+        end_markers=["\n四、", "\n4、", "\n五、", "\n5、", "\n六、", "\n6、", "\n七、", "\n7、", "\n八、", "\n8、", "\n★", "\n第", "\n第六章", "\n第七章"],
     )
     if not section_text:
         return ""
@@ -1070,11 +1094,33 @@ def _extract_package_names(raw_text, package_nos):
     """从 raw_text 中提取各包的名称。"""
     if not package_nos or not raw_text:
         return {}
+
+    def _normalize_package_no(value):
+        text = str(value or "").strip()
+        if not text:
+            return None
+        if text.isdigit():
+            return int(text)
+        mapping = {"零": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+        if text == "十":
+            return 10
+        if "十" in text:
+            left, _, right = text.partition("十")
+            tens = mapping.get(left, 1 if left == "" else 0)
+            units = mapping.get(right, 0)
+            total = tens * 10 + units
+            return total if total > 0 else None
+        if text in mapping:
+            return mapping[text]
+        return None
+
     # 匹配 "第X包：名称" 或 "采购包X：名称" 模式
     pkg_names = {}
-    for m in re.finditer(r"(?:第|采购包)(\d+)包[：:]\s*([^；;。]+)", raw_text):
-        pkg_no = int(m.group(1))
-        name = m.group(2).strip()
+    for m in re.finditer(r"(?:第\s*([A-Za-z0-9一二三四五六七八九十百零]+)\s*包|采购包\s*([A-Za-z0-9一二三四五六七八九十百零]+))[：:]\s*([^\n\r；;。]+)", raw_text):
+        pkg_no = _normalize_package_no(m.group(1) or m.group(2))
+        if pkg_no is None:
+            continue
+        name = m.group(3).strip()
         if pkg_no in package_nos:
             pkg_names[pkg_no] = name
     return pkg_names

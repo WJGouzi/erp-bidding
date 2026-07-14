@@ -14,52 +14,84 @@ def _safe_json_load(val):
         return None
 
 
+def _normalize_technical_tree(nodes):
+    """规范化 technical_requirements.items 树结构。"""
+    normalized = []
+    if not isinstance(nodes, list):
+        return normalized
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        title = str(node.get("title", "")).strip()
+        content = str(node.get("content", "")).strip()
+        children = _normalize_technical_tree(node.get("children", []) or [])
+        item = {
+            "id": str(node.get("id", "")).strip(),
+            "content": content,
+            "node_type": str(node.get("node_type", "")).strip() or "requirement",
+            "source_section": str(node.get("source_section", "")).strip(),
+            "level": int(node.get("level", 0) or 0),
+            "children": children,
+        }
+        package_no = str(node.get("package_no", "")).strip()
+        clause_no = str(node.get("clause_no", "")).strip()
+        parent_id = str(node.get("parent_id", "")).strip()
+        if title:
+            item["title"] = title
+        if package_no:
+            item["package_no"] = package_no
+        if clause_no:
+            item["clause_no"] = clause_no
+        if parent_id:
+            item["parent_id"] = parent_id
+        normalized.append(item)
+    return normalized
+
+
 def _normalize_technical_requirements(value):
-    """将 technical_requirements 统一规范为 {items} 结构。"""
+    """将 technical_requirements 统一规范为 {items} 树结构。"""
     if isinstance(value, str):
-        raw_text = value.strip()
-        parsed = _safe_json_load(value) if raw_text else None
-        if parsed is not None:
-            value = parsed
-        elif raw_text:
-            return {
-                "items": [{"content": raw_text, "source_section": "legacy"}],
-            }
-        else:
-            value = None
+        value = _safe_json_load(value)
 
     if isinstance(value, dict):
-        items = value.get("items", []) or []
-        normalized_items = []
-        for item in items:
-            if isinstance(item, dict):
-                content = str(item.get("content", "")).strip()
-                if content:
-                    normalized_items.append({
-                        "content": content,
-                        "source_section": item.get("source_section", ""),
-                    })
-            elif isinstance(item, str) and item.strip():
-                normalized_items.append({"content": item.strip(), "source_section": ""})
-        return {"items": normalized_items}
-
-    if isinstance(value, list):
-        normalized_items = []
-        for item in value:
-            if isinstance(item, dict):
-                content = str(item.get("content", "")).strip()
-                if content:
-                    normalized_items.append({
-                        "content": content,
-                        "source_section": item.get("source_section", ""),
-                    })
-            elif isinstance(item, str) and item.strip():
-                normalized_items.append({"content": item.strip(), "source_section": ""})
         return {
-            "items": normalized_items,
+            "scope_mode": str(value.get("scope_mode", "")).strip(),
+            "items": _normalize_technical_tree(value.get("items", []) or []),
         }
 
-    return {"items": []}
+    return {"scope_mode": "", "items": []}
+
+
+def _flatten_technical_tree(nodes):
+    """将技术要求树展开为叶子/内容节点列表。"""
+    flat = []
+    if not isinstance(nodes, list):
+        return flat
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        if str(node.get("content", "")).strip():
+            flat.append(node)
+        flat.extend(_flatten_technical_tree(node.get("children", []) or []))
+    return flat
+
+
+def _render_technical_tree(nodes, indent=0):
+    """将技术要求树渲染为缩进文本。"""
+    lines = []
+    if not isinstance(nodes, list):
+        return lines
+    prefix = "  " * max(indent, 0)
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        title = str(node.get("title", "")).strip()
+        content = str(node.get("content", "")).strip()
+        text = content or title
+        if text:
+            lines.append(f"{prefix}{text}")
+        lines.extend(_render_technical_tree(node.get("children", []) or [], indent + 1))
+    return lines
 
 
 class FileStorage(db.Model):
@@ -351,6 +383,19 @@ class BiddingAnalysisResult(db.Model):
     def computed_technical_requirements(self) -> str:
         """从顶层 structured technical_requirements 生成文本视图。"""
         technical = self.parsed_technical_requirements
+        tree_items = technical.get("items", []) if isinstance(technical, dict) else []
+        tree_lines = _render_technical_tree(tree_items)
+        if tree_lines:
+            return "\n".join(line for line in tree_lines if line.strip())
+        flat_items = _flatten_technical_tree(tree_items)
+        if isinstance(flat_items, list) and flat_items:
+            text = "\n".join(
+                item.get("content", "").strip()
+                for item in flat_items
+                if isinstance(item, dict) and item.get("content", "").strip()
+            )
+            if text:
+                return text
         items = technical.get("items", []) if isinstance(technical, dict) else []
         if isinstance(items, list) and items:
             text = "\n".join(

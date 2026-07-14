@@ -389,10 +389,26 @@ def _complete_analysis(task_id, execution_id=None):
                 req_parts.append(f"评分共{len(dims)}项，重点：{dims[0]['name']}({dims[0]['score']}分)")
             result.requirements = " | ".join(req_parts) if req_parts else dim_summary
 
-            # 保存分包列表到独立列
+            # 保存分包列表到独立列（精简：只保留包标识信息，技术参数已独立存储于 technical_requirements）
             pkgs = v3_data.get("packages", [])
             if pkgs:
-                result.packages_json = json.dumps(pkgs, ensure_ascii=False)
+                clean_pkgs = []
+                for pkg in pkgs:
+                    clean_pkg = {
+                        "package_no": pkg.get("package_no"),
+                        "name": pkg.get("name", ""),
+                        "budget": pkg.get("budget", 0),
+                        "strategy": pkg.get("strategy", {}),
+                    }
+                    # 仅保留策略摘要，去除长文本
+                    strategy = clean_pkg.get("strategy", {})
+                    if isinstance(strategy, dict):
+                        for key in ("focus", "risk"):
+                            val = strategy.get(key, "")
+                            if isinstance(val, str) and len(val) > 200:
+                                strategy[key] = val[:200]
+                    clean_pkgs.append(clean_pkg)
+                result.packages_json = json.dumps(clean_pkgs, ensure_ascii=False)
                 result.package_count = len(pkgs)
             
             # 保存文档分类到独立列

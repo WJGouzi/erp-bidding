@@ -8,6 +8,7 @@ from flask import current_app
 from ...core.extensions import db
 from ...domain import BiddingAnalysisResult, BiddingCatalog, BiddingCheckItem, BiddingSharedResource, BiddingTask, TemplateCatalog
 from ..common import log_operation
+from .analysis_v3.check_items.technical import filter_technical_section
 from .helpers import _extract_analysis_context, _get_catalog_generation_profile, _normalize_catalog_generation_level
 
 
@@ -279,12 +280,14 @@ def _find_insert_position(skeleton, dim_name):
 
 
 
-def _build_fallback_skeleton(analysis_data, classified_items):
+def _build_fallback_skeleton(analysis_data, classified_items, technical_section=None):
     """第四级兜底：从 check_items 和业务/技术数据推断骨架，不依赖评分维度。"""
     if not isinstance(analysis_data, dict):
         analysis_data = {}
     if not isinstance(classified_items, dict):
         classified_items = {}
+    if not isinstance(technical_section, dict):
+        technical_section = {}
     skeleton = []
     
     # 1. 资格证明文件（来自 qualification check_items）
@@ -346,7 +349,7 @@ def _build_fallback_skeleton(analysis_data, classified_items):
     # 3. 技术/服务响应（来自 technical items 或 packages）
     tech_items = []
     if isinstance(technical_section, dict):
-        tech_items = technical_section.get("items", []) or []
+        tech_items = _flatten_technical_tree_items(technical_section.get("items", []) or [])
     if not tech_items:
         packages = analysis_data.get("packages", [])
         if packages and isinstance(packages, list):
@@ -455,6 +458,20 @@ def _fill_tech_description(skeleton, technical_items, packages):
             if product_count > 0:
                 node["description"] = f"共{product_count}种产品，逐项响应技术参数要求"
             break
+
+
+def _flatten_technical_tree_items(nodes):
+    """将 technical_requirements.items 树展开为节点列表。"""
+    flat = []
+    if not isinstance(nodes, list):
+        return flat
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        if str(node.get("content", "")).strip():
+            flat.append(node)
+        flat.extend(_flatten_technical_tree_items(node.get("children", []) or []))
+    return flat
 
 
 
@@ -615,19 +632,21 @@ def _fill_compliance(skeleton, classified_items):
         ]
 
 
-def enrich_section_details(skeleton, analysis_data, classified_items):
+def enrich_section_details(skeleton, analysis_data, classified_items, technical_section=None):
     """阶段3：用各数据源填充章节详情。"""
     if not isinstance(analysis_data, dict):
         analysis_data = {}
     if not isinstance(classified_items, dict):
         classified_items = {}
+    if not isinstance(technical_section, dict):
+        technical_section = {}
     # 3.1 商务偏离表子项
     business_items = analysis_data.get("business", {}).get("items", []) if isinstance(analysis_data.get("business"), dict) else []
     if business_items:
         _fill_business_children(skeleton, business_items)
     
     # 3.2 技术偏离表描述
-    technical_items = technical_section.get("items", []) if isinstance(technical_section, dict) else []
+    technical_items = _flatten_technical_tree_items(technical_section.get("items", []) or []) if isinstance(technical_section, dict) else []
     packages = analysis_data.get("packages", [])
     if technical_items or packages:
         _fill_tech_description(skeleton, technical_items, packages)
@@ -906,12 +925,16 @@ def build_catalog(analysis_data, classified_items, section_index=None, technical
         return []
     
     # 阶段3：填充详情（格式要求来源时，不额外补充章节）
-    enrich_section_details(skeleton, analysis_data, classified_items)
+    enrich_section_details(skeleton, analysis_data, classified_items, technical_section=technical_section)
     
     # 只有非格式要求来源时，才补充推测章节
     if source_type != "format_requirements":
         # 从 check_items 和业务/技术数据推断骨架
-        fallback = _build_fallback_skeleton(analysis_data, classified_items)
+        fallback = _build_fallback_skeleton(
+            analysis_data,
+            classified_items,
+            technical_section=technical_section,
+        )
         if fallback:
             import re as _re
             _cn_prefix = _re.compile(r'^[一二三四五六七八九十]+、')
@@ -976,6 +999,11 @@ def _build_package_aware_outline(task, analysis_result, filtered_analysis_data, 
         analysis_result.parsed_technical_requirements
         if analysis_result and hasattr(analysis_result, "parsed_technical_requirements")
         else {}
+    )
+    technical_section = filter_technical_section(
+        technical_section,
+        selected_package_no=getattr(task, "selected_package_no", None) or "",
+        has_package=bool(filtered_analysis_data.get("has_package")),
     )
     return build_catalog(
         filtered_analysis_data,
@@ -1056,7 +1084,10 @@ def _build_dynamic_outline(task, analysis_result, variant="requirement", generat
 
     catalog_profile = _get_catalog_generation_profile(generation_level or getattr(task, "catalog_generation_level", None))
     description_max_length = catalog_profile["description_max_length"]
-    analysis_context = _extract_analysis_context(analysis_result)
+    analysis_context = _extract_analysis_context(
+        analysis_result,
+        selected_package_no=getattr(task, "selected_package_no", None),
+    )
     overview_text = _build_catalog_description(
         analysis_context.get("overview", ""),
         getattr(analysis_result, "effective_text", "") or getattr(analysis_result, "raw_text", "") or "暂无项目概述",

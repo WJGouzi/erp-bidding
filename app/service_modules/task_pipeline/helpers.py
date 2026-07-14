@@ -51,6 +51,11 @@ from ..common import (
     normalize_knowledge_base_ids,
     validate_subject_knowledge_bases,
 )
+from .analysis_v3.check_items.technical import (
+    filter_technical_section,
+    flatten_technical_nodes,
+    render_technical_text,
+)
 from ..storage import StorageService
 
 logger = logging.getLogger(__name__)
@@ -270,7 +275,7 @@ def _build_shared_resource_analysis_text(shared_resource_id, package_no=None):
     }
 
 
-def _extract_analysis_context(analysis_result):
+def _extract_analysis_context(analysis_result, selected_package_no=None):
     """统一从 analysis_data/兼容字段中提取目录与正文生成需要的分析上下文。"""
     context = {
         "bidder_notice": {},
@@ -296,6 +301,7 @@ def _extract_analysis_context(analysis_result):
             payload = {}
 
     if isinstance(payload, dict):
+        has_package = bool(payload.get("has_package"))
         bidder_notice = payload.get("bidder_notice", {}) or {}
         qualification_review = payload.get("qualification_review", {}) or {}
         context["source_files"] = payload.get("source_files", []) or []
@@ -311,22 +317,13 @@ def _extract_analysis_context(analysis_result):
             or getattr(analysis_result, "qualification_requirements", "")
             or ""
         )
-        technical_section = getattr(analysis_result, "parsed_technical_requirements", {}) or {}
-        technical_items = technical_section.get("items", []) if isinstance(technical_section, dict) else []
-        if isinstance(technical_items, list):
-            context["technical_items"] = technical_items
-        structured_tech_text = ""
-        if technical_items:
-            structured_tech_text = "\n".join(
-                item.get("content", "").strip()
-                for item in technical_items
-                if isinstance(item, dict) and item.get("content", "").strip()
-            )
-        context["technical_requirements"] = (
-            structured_tech_text
-            or getattr(analysis_result, "computed_technical_requirements", "")
-            or ""
+        technical_section = filter_technical_section(
+            getattr(analysis_result, "parsed_technical_requirements", {}) or {},
+            selected_package_no=selected_package_no or "",
+            has_package=has_package,
         )
+        context["technical_items"] = flatten_technical_nodes(technical_section)
+        context["technical_requirements"] = render_technical_text(technical_section) or "暂未提取到技术要求。"
         context["scoring_items"] = payload.get("scoring_items", "") or getattr(analysis_result, "scoring_items", "") or ""
         context["disqualification_items"] = (
             qualification_review.get("disqualification_items", "")
@@ -370,6 +367,7 @@ def _extract_analysis_context(analysis_result):
         context["_format_requirements"] = fmt
         context["_scoring"] = payload.get("scoring", {}) if isinstance(payload, dict) else {}
         context["_packages"] = payload.get("packages", []) if isinstance(payload, dict) else []
+        context["_technical_requirements"] = technical_section
 
     
     else:
@@ -378,7 +376,14 @@ def _extract_analysis_context(analysis_result):
         context["requirements"] = getattr(analysis_result, "requirements", "") or ""
         context["business_requirements"] = getattr(analysis_result, "business_requirements", "") or ""
         context["qualification_requirements"] = getattr(analysis_result, "qualification_requirements", "") or ""
-        context["technical_requirements"] = getattr(analysis_result, "computed_technical_requirements", "") or ""
+        technical_section = filter_technical_section(
+            getattr(analysis_result, "parsed_technical_requirements", {}) or {},
+            selected_package_no=selected_package_no or "",
+            has_package=False,
+        )
+        context["technical_items"] = flatten_technical_nodes(technical_section)
+        context["technical_requirements"] = render_technical_text(technical_section) or "暂未提取到技术要求。"
+        context["_technical_requirements"] = technical_section
         context["scoring_items"] = getattr(analysis_result, "scoring_items", "") or ""
         context["disqualification_items"] = getattr(analysis_result, "disqualification_items", "") or ""
     return context
@@ -786,8 +791,20 @@ def _build_product_context(task):
     if not task.use_product_library:
         return {}
     analysis_result = BiddingAnalysisResult.query.filter_by(shared_resource_id=task.shared_resource_id).first()
-    requirements = analysis_result.computed_technical_requirements if analysis_result else ""
+    selected_package_no = getattr(task, "selected_package_no", None) or ""
+    requirements = ""
+    if analysis_result:
+        filtered_technical_section = filter_technical_section(
+            getattr(analysis_result, "parsed_technical_requirements", {}) or {},
+            selected_package_no=selected_package_no,
+            has_package=bool(analysis_result.safe_analysis_data().get("has_package")),
+        )
+        requirements = render_technical_text(filtered_technical_section) or ""
     effective = analysis_result.effective_text if analysis_result and analysis_result.effective_text else (analysis_result.raw_text if analysis_result else "")
+    if selected_package_no and effective:
+        filtered_effective = _extract_effective_text(effective, selected_package_no)
+        if filtered_effective:
+            effective = filtered_effective
     
     # 从 format_requirements.required_sections[].template_content 提取产品名称
     product_names_from_tables = []
@@ -2883,7 +2900,10 @@ def _generate_chapter_content(task, chapter, analysis_result, subject_context, k
     chapter_desc = chapter.get("description", "") or ""
 
     effective_text = analysis_result.effective_text if analysis_result and analysis_result.effective_text else (analysis_result.raw_text if analysis_result else "暂无招标依据文本。")
-    analysis_context = _extract_analysis_context(analysis_result)
+    analysis_context = _extract_analysis_context(
+        analysis_result,
+        selected_package_no=getattr(task, "selected_package_no", None),
+    )
 
     catalog_profile = _get_catalog_generation_profile(task.catalog_generation_level)
     selected_package_no = getattr(task, "selected_package_no", None) or ""
@@ -3364,6 +3384,25 @@ def _extract_package_numbers(text):
 
 def _extract_packages_fallback(text):
     """正则方式回退提取包号。"""
+    def _normalize_package_no(value):
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        if text.isdigit():
+            return str(int(text))
+        mapping = {"零": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+        if text == "十":
+            return "10"
+        if "十" in text:
+            left, _, right = text.partition("十")
+            tens = mapping.get(left, 1 if left == "" else 0)
+            units = mapping.get(right, 0)
+            total = tens * 10 + units
+            return str(total) if total > 0 else text
+        if text in mapping:
+            return str(mapping[text])
+        return text
+
     results = []
     seen = set()
 
@@ -3372,7 +3411,7 @@ def _extract_packages_fallback(text):
         r"第\s*([A-Za-z0-9一二三四五六七八九十百零]+)\s*包\s*[：:、\s]*([^\n。，,；;]{0,50})",
         text,
     ):
-        package_no = match.group(1).strip()
+        package_no = _normalize_package_no(match.group(1))
         package_name = (match.group(2) or "").strip()
         if package_no and package_no not in seen:
             seen.add(package_no)
@@ -3381,7 +3420,7 @@ def _extract_packages_fallback(text):
     # 模式2: "包号：1" 此类格式
     if not results:
         for match in re.finditer(r"包号\s*[:：]\s*([A-Za-z0-9一二三四五六七八九十百零]+)", text):
-            package_no = match.group(1).strip()
+            package_no = _normalize_package_no(match.group(1))
             if package_no and package_no not in seen:
                 seen.add(package_no)
                 results.append({"package_no": package_no, "package_name": ""})
@@ -3389,7 +3428,7 @@ def _extract_packages_fallback(text):
     # 模式3: "采购包1"、"标包01" 等
     if not results:
         for match in re.finditer(r"(?:采购|标|招投标?)[包匹]\s*([A-Za-z0-9一二三四五六七八九十百零]+)", text):
-            package_no = match.group(1).strip()
+            package_no = _normalize_package_no(match.group(1))
             if package_no and package_no not in seen:
                 seen.add(package_no)
                 results.append({"package_no": package_no, "package_name": ""})
@@ -3399,17 +3438,36 @@ def _extract_packages_fallback(text):
 
 def _extract_effective_text(raw_text, package_no):
     """根据包号选择结果裁剪后续流程使用的有效文本。"""
+    def _normalize_package_no(value):
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        if text.isdigit():
+            return str(int(text))
+        mapping = {"零": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+        if text == "十":
+            return "10"
+        if "十" in text:
+            left, _, right = text.partition("十")
+            tens = mapping.get(left, 1 if left == "" else 0)
+            units = mapping.get(right, 0)
+            total = tens * 10 + units
+            return str(total) if total > 0 else text
+        if text in mapping:
+            return str(mapping[text])
+        return text
+
     if not raw_text:
         return ""
     if not package_no:
         return raw_text
-    package_no = str(package_no).strip()
+    package_no = _normalize_package_no(package_no)
     pattern = r"(第\s*([A-Za-z0-9一二三四五六七八九十]+)\s*包|包号\s*[:：]?\s*([A-Za-z0-9一二三四五六七八九十]+))"
     matches = list(re.finditer(pattern, raw_text))
     if not matches:
         return raw_text
     for index, match in enumerate(matches):
-        current_package_no = str(match.group(2) or match.group(3) or "").strip()
+        current_package_no = _normalize_package_no(match.group(2) or match.group(3) or "")
         if current_package_no == package_no:
             start = match.start()
             if index + 1 < len(matches):
@@ -3452,7 +3510,10 @@ def _build_docx_bytes(task, catalog_record, analysis_result, knowledge_contexts,
     outline = catalog_payload.get("outline", []) if isinstance(catalog_payload, dict) else []
 
     company_name = subject_context.get("company_name", "") if subject_context else ""
-    analysis_context = _extract_analysis_context(analysis_result) if analysis_result else {}
+    analysis_context = _extract_analysis_context(
+        analysis_result,
+        selected_package_no=getattr(task, "selected_package_no", None),
+    ) if analysis_result else {}
     coverage_snapshot = _get_generation_coverage_snapshot(analysis_result)
     generation_plan = _get_generation_plan_snapshot(analysis_result)
     bidder_notice = analysis_context.get("bidder_notice", {}) or {}

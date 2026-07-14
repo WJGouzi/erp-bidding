@@ -220,6 +220,12 @@ _TECH_LINE_SIGNAL_RE = re.compile(
     r"(?:★|▲|技术|参数|规格|性能|配置|指标|服务要求|采购需求|规格型号及技术要求)"
 )
 
+# 分包标记检测：遇到"第X包"或"采购包X"时停止提取技术要求
+# 后续内容由 extract_packages 专门处理包级技术表格
+_PKG_MARKER_IN_LINE_RE = re.compile(
+    r"(?:第\s*[A-Za-z0-9一二三四五六七八九十百零]+\s*包|采购包\s*[A-Za-z0-9一二三四五六七八九十百零]+)"
+)
+
 
 def _is_technical_segment(title, text):
     """根据标题和文本信号判断是否为技术章节。"""
@@ -247,6 +253,11 @@ def _analyze_technical_for_segment(title, seg_text):
             continue
         if re.match(r"^第[一二三四五六七八九十零〇百千万亿]+[章节篇部]", line):
             continue
+        # 遇到分包标记（"第一包"/"采购包1"等），停止提取技术要求
+        # 包级内容由 extract_packages + _merge_product_rows 独立处理
+        if _PKG_MARKER_IN_LINE_RE.search(line):
+            logger.info("[segmented] 遇到分包标记停止技术要求提取: %s", line[:60])
+            break
         if any(kw in line for kw in _TECH_EXCLUDE_TITLE_KEYWORDS):
             continue
         if _TECH_LINE_SIGNAL_RE.search(line) or ("|" in line and _is_technical_segment(title, line)):

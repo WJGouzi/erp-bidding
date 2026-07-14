@@ -14,6 +14,8 @@ import json
 import logging
 import re
 
+from ....infrastructure.table_classifier import classify_data_tables
+
 
 # ── 通用标题前置符剥离 ──
 _HEADING_PREFIX_RE = re.compile(r'^[^\w\u4e00-\u9fff\d]+')
@@ -25,6 +27,47 @@ def _strip_heading_prefix(text: str) -> str:
         return text
     return _HEADING_PREFIX_RE.sub('', text)
 logger = logging.getLogger(__name__)
+
+
+_CN_PACKAGE_NO_MAP = {
+    "零": 0, "一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
+    "六": 6, "七": 7, "八": 8, "九": 9, "十": 10,
+}
+
+_PACKAGE_MARKER_RE = re.compile(
+    r"(?:第\s*([A-Za-z0-9一二三四五六七八九十百零]+)\s*包|采购包\s*([A-Za-z0-9一二三四五六七八九十百零]+))"
+)
+
+
+def _normalize_package_no(value):
+    """将包号统一规范为阿拉伯数字字符串。"""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if text.isdigit():
+        return str(int(text))
+    if text == "十":
+        return "10"
+    if "十" in text:
+        left, _, right = text.partition("十")
+        tens = _CN_PACKAGE_NO_MAP.get(left, 1 if left == "" else 0)
+        units = _CN_PACKAGE_NO_MAP.get(right, 0)
+        total = tens * 10 + units
+        return str(total) if total > 0 else text
+    if text in _CN_PACKAGE_NO_MAP:
+        return str(_CN_PACKAGE_NO_MAP[text])
+    return text
+
+
+def _detect_package_marker(text):
+    """从标题或段落文本中识别包号标记。"""
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    match = _PACKAGE_MARKER_RE.search(raw)
+    if not match:
+        return ""
+    return _normalize_package_no(match.group(1) or match.group(2))
 
 
 # ══════════════════════════════════════════
@@ -205,68 +248,113 @@ def _detect_tech_table(headers, rows):
 
 
 def _find_tech_section(sections):
-    """加强版：标题匹配 → 内容表格探测 两阶段。
-    
-    Phase 1: 标题匹配（现有逻辑）
-    Phase 2: 内容表格探测（新增 fallback）
-    """
-    targets = ["技术要求", "技术参数", "技术规格", "技术标准", "采购需求", "需求一览表", "采购项目技术", "比选项目及要求", "项目及要求", "采购项目"]
-    
-    # Phase 1: 标题匹配（剥离前缀后匹配 ★◆● 等标记）
+    """优先定位最具体的技术要求章节，而不是笼统的大章标题。"""
+    specific_targets = [
+        "技术要求", "技术参数", "技术规格",
+        "规格型号", "技术标准", "技术需求",
+        "技术规范", "技术指标",
+    ]
+    broad_targets = [
+        "采购需求", "服务要求", "项目需求",
+        "参数要求", "需求一览表",
+        "采购项目技术", "比选项目及要求",
+        "项目及要求", "采购项目",
+    ]
+
+    def _title_score(title):
+        raw_title = str(title or "").strip()
+        stripped = _strip_heading_prefix(raw_title)
+        score = 0
+        for target in specific_targets:
+            if target in raw_title or target in stripped:
+                score = max(score, 100 - min(len(raw_title), 20))
+        for target in broad_targets:
+            if target in raw_title or target in stripped:
+                score = max(score, 40 - min(len(raw_title), 20))
+        return score
+
+    def _table_score(node):
+        score = 0
+        for block in getattr(node, "content", []):
+            if getattr(block, "type", "") != "table":
+                continue
+            headers = getattr(block, "headers", []) or []
+            rows = getattr(block, "rows", []) or []
+            if _detect_tech_table(headers, rows):
+                score = max(score, 30)
+        return score
+
+    best_node = None
+    best_score = 0
+
+    def _visit(node):
+        nonlocal best_node, best_score
+        node_score = _title_score(getattr(node, "title", "") or "") + _table_score(node)
+        if node_score > best_score:
+            best_score = node_score
+            best_node = node
+        for child in getattr(node, "children", []):
+            _visit(child)
+
     for section in sections:
-        title = getattr(section, "title", "") or ""
-        stripped = _strip_heading_prefix(title)
-        for t in targets:
-            if t in title or t in stripped:
-                return section
-        for child in getattr(section, "children", []):
-            child_title = getattr(child, "title", "") or ""
-            child_stripped = _strip_heading_prefix(child_title)
-            for t in targets:
-                if t in child_title or t in child_stripped:
-                    return child
-    
-    # Phase 2: 内容表格探测（标题未匹配时检测表格内容）
-    for section in sections:
-        for block in getattr(section, "content", []):
-            if getattr(block, "type", "") == "table":
-                headers = getattr(block, "headers", []) or []
-                rows = getattr(block, "rows", []) or []
-                if _detect_tech_table(headers, rows):
-                    return section
-        for child in getattr(section, "children", []):
-            for block in getattr(child, "content", []):
-                if getattr(block, "type", "") == "table":
-                    headers = getattr(block, "headers", []) or []
-                    rows = getattr(block, "rows", []) or []
-                    if _detect_tech_table(headers, rows):
-                        return child
-    
-    return None
+        _visit(section)
+
+    return best_node
 
 
 def _find_package_sections(source_sections, package_nos):
     """在各包对应的子章节中查找。"""
     pkg_map = {pkg_no: None for pkg_no in package_nos}
 
-    def _find_by_title(node, title_keyword):
+    def _find_by_title(node, target_pkg_no):
         title = getattr(node, "title", "") or ""
-        # 剥离前缀后匹配（★第1包 → 第1包）
-        if title_keyword in title or title_keyword in _strip_heading_prefix(title):
-            return node
+        normalized_title = _strip_heading_prefix(title)
+        for text in (title, normalized_title):
+            match = re.search(r"第\s*([A-Za-z0-9一二三四五六七八九十百零]+)\s*包", text)
+            if match and _normalize_package_no(match.group(1)) == str(target_pkg_no):
+                return [node]
+            match = re.search(r"采购包\s*([A-Za-z0-9一二三四五六七八九十百零]+)", text)
+            if match and _normalize_package_no(match.group(1)) == str(target_pkg_no):
+                return [node]
+        if f"第{target_pkg_no}包" in title or f"第{target_pkg_no}包" in normalized_title:
+            return [node]
+        results = []
         for child in getattr(node, "children", []):
-            result = _find_by_title(child, title_keyword)
-            if result:
-                return result
-        return None
+            child_results = _find_by_title(child, target_pkg_no)
+            if child_results:
+                results.extend(child_results)
+        return results if results else None
+
+    def _find_best_pkg_node(nodes):
+        """从多个匹配节点中选取最佳者：优先选择包含表格的节点（真正的包内容章节）。"""
+        if not nodes:
+            return None
+        if len(nodes) == 1:
+            return nodes[0]
+        # 优先选节点自身或子节点包含表格的
+        def _has_table(sec):
+            for b in getattr(sec, "content", []):
+                if getattr(b, "type", "") == "table":
+                    return True
+            for child in getattr(sec, "children", []):
+                if _has_table(child):
+                    return True
+            return False
+        with_table = [n for n in nodes if _has_table(n)]
+        if with_table:
+            return with_table[0]
+        # 都没表格时选子节点数最多的（更可能是正文而非目录占位）
+        nodes.sort(key=lambda n: len(getattr(n, "children", []) or []), reverse=True)
+        return nodes[0]
 
     for section in source_sections:
         for pkg_no in package_nos:
-            keyword = f"第{pkg_no}包"
             if pkg_map.get(pkg_no) is None:
-                found = _find_by_title(section, keyword)
-                if found:
-                    pkg_map[pkg_no] = found
+                found_nodes = _find_by_title(section, pkg_no)
+                if found_nodes:
+                    best = _find_best_pkg_node(found_nodes)
+                    if best:
+                        pkg_map[pkg_no] = best
 
     return pkg_map
 
@@ -309,6 +397,74 @@ def _find_tables_in_section(section):
     for child in getattr(section, "children", []):
         tables.extend(_find_tables_in_section(child))
     return tables
+
+
+def _extract_package_table_results(section):
+    """提取单个包章节下的表格分类结果。"""
+    if not section:
+        return {}
+    tables = _find_tables_in_section(section)
+    if not tables:
+        return {}
+    try:
+        return classify_data_tables(tables)
+    except Exception as exc:
+        logger.warning("[phase3] 包章节表格分类异常: section=%s err=%s", getattr(section, "title", ""), exc)
+        return {}
+
+
+def _extract_inline_package_data(section, package_nos):
+    """在同一技术章节内按最近的包标记归属文本和表格。
+
+    适用于“第一包/采购包1”只是段落或 heading，而不是独立子章节的文档结构。
+    """
+    if not section or not package_nos:
+        return {}, {}
+
+    allowed = {str(no) for no in package_nos if str(no).strip()}
+    package_tables = {pkg_no: [] for pkg_no in allowed}
+    package_texts = {pkg_no: [] for pkg_no in allowed}
+
+    def _walk(node, current_pkg=""):
+        title = getattr(node, "title", "") or ""
+        detected_pkg = _detect_package_marker(title)
+        if detected_pkg in allowed:
+            current_pkg = detected_pkg
+            package_texts[current_pkg].append(title)
+
+        for block in getattr(node, "content", []):
+            block_type = getattr(block, "type", "") or ""
+            if block_type == "table":
+                if current_pkg in allowed:
+                    package_tables[current_pkg].append(block)
+                continue
+            text = getattr(block, "text", "") or ""
+            marker_pkg = _detect_package_marker(text)
+            if marker_pkg in allowed:
+                current_pkg = marker_pkg
+            if current_pkg in allowed and text.strip():
+                package_texts[current_pkg].append(text.strip())
+
+        for child in getattr(node, "children", []):
+            _walk(child, current_pkg)
+
+    _walk(section)
+
+    classified = {}
+    for pkg_no, tables in package_tables.items():
+        if not tables:
+            continue
+        try:
+            classified[pkg_no] = classify_data_tables(tables)
+        except Exception as exc:
+            logger.warning("[phase3] 技术章节内联包表格分类异常: package=%s err=%s", pkg_no, exc)
+
+    joined_texts = {
+        pkg_no: "\n".join(parts).strip()
+        for pkg_no, parts in package_texts.items()
+        if any(str(part or "").strip() for part in parts)
+    }
+    return classified, joined_texts
 
 
 def _find_col_index(headers, candidates):
@@ -848,6 +1004,15 @@ def extract_packages(sections, package_nos, metadata_budget=None, pkg_name_map=N
     tech_section = _find_tech_section(sections)
     source_sections = [tech_section] if tech_section else sections
     pkg_section_map = _find_package_sections(source_sections, package_nos)
+    # 回退：当包章节未在技术章节内找到（常见于包标题与技术要求同级的文档结构），搜索全部章节
+    missing_pkgs = [pkg_no for pkg_no, sec in pkg_section_map.items() if sec is None]
+    if missing_pkgs:
+        logger.info("[phase3] 包章节 %s 未在技术章节内找到，尝试搜索全部章节", missing_pkgs)
+        all_pkg_map = _find_package_sections(sections, missing_pkgs)
+        for pkg_no, section in all_pkg_map.items():
+            if section is not None and pkg_no in pkg_section_map:
+                pkg_section_map[pkg_no] = section
+    inline_pkg_results, inline_pkg_texts = _extract_inline_package_data(tech_section, package_nos) if tech_section else ({}, {})
 
     budget_per_pkg = {}
     budget_total = 0
@@ -859,24 +1024,31 @@ def extract_packages(sections, package_nos, metadata_budget=None, pkg_name_map=N
     packages = []
     for pkg_no in package_nos:
         section = pkg_section_map.get(pkg_no)
+        inline_result = inline_pkg_results.get(str(pkg_no), {}) if isinstance(inline_pkg_results, dict) else {}
+        inline_text = inline_pkg_texts.get(str(pkg_no), "") if isinstance(inline_pkg_texts, dict) else ""
         if not section:
             # 单包场景：使用 tech_section 或 source_sections[0] 回退
             if not (len(package_nos) == 1 and source_sections):
-                # 多包场景下未找到包章节，使用兜底名
-                pkg_fallback = (pkg_name_map or {}).get(pkg_no, "") or f"第{pkg_no}包"
-                pkg_entry = {
-                    "package_no": pkg_no,
-                    "name": pkg_fallback,
-                    "budget": budget_per_pkg.get(str(pkg_no), budget_total) if budget_per_pkg else budget_total,
-                    "parameters": None,
-                }
-                pkg_entry["strategy"] = analyze_package_strategy(pkg_entry)
-                packages.append(pkg_entry)
-                continue
+                # 多包场景下，如果技术章节内部已识别到该包的表格或正文，继续按该包构建参数
+                if inline_result or inline_text:
+                    logger.info("[phase3] 多包场景命中技术章节内联包数据: package=%s", pkg_no)
+                else:
+                    # 多包场景下未找到包章节，使用兜底名
+                    pkg_fallback = (pkg_name_map or {}).get(pkg_no, "") or f"第{pkg_no}包"
+                    pkg_entry = {
+                        "package_no": pkg_no,
+                        "name": pkg_fallback,
+                        "budget": budget_per_pkg.get(str(pkg_no), budget_total) if budget_per_pkg else budget_total,
+                        "parameters": None,
+                    }
+                    pkg_entry["strategy"] = analyze_package_strategy(pkg_entry)
+                    packages.append(pkg_entry)
+                    continue
             # 单包场景：使用 source_section 作为回退
-            section = source_sections[0]
-            logger.info("[phase3] 单包场景，使用 source_section 作为包 %s 的章节: %s",
-                        pkg_no, getattr(section, 'title', '') or '全文')
+            if len(package_nos) == 1 and source_sections:
+                section = source_sections[0]
+                logger.info("[phase3] 单包场景，使用 source_section 作为包 %s 的章节: %s",
+                            pkg_no, getattr(section, 'title', '') or '全文')
 
         # 包名优先级：pkg_name_map（从原文提取）> 章节标题 > 兜底名
         # 包名优先级：pkg_name_map（从原文提取） > 仅用于单包且有意义的章节标题 > 兜底名
@@ -892,7 +1064,7 @@ def extract_packages(sections, package_nos, metadata_budget=None, pkg_name_map=N
                 pkg_name = section_title
             else:
                 pkg_name = ""
-        pkg_text = _section_to_text(section)
+        pkg_text = _section_to_text(section) if section else inline_text
         starred, important, general = _count_pkg_params(pkg_text)
         core_products = _detect_core_products(pkg_text)
         params = {
@@ -902,20 +1074,43 @@ def extract_packages(sections, package_nos, metadata_budget=None, pkg_name_map=N
             "core_products": core_products,
             "online_platform_items": ("挂网" in pkg_text or "药械" in pkg_text),
         }
+        pkg_table_results = _extract_package_table_results(section) if section else {}
+        if not pkg_table_results and inline_result:
+            pkg_table_results = inline_result
+        if pkg_table_results.get("product_lists"):
+            product_items = []
+            for table in pkg_table_results.get("product_lists", []):
+                product_items.extend(table.get("items", []) or [])
+            if product_items:
+                params["product_table_items"] = product_items
+                params["table_items"] = product_items
+        if pkg_table_results.get("tech_requirements"):
+            tech_items = []
+            for table in pkg_table_results.get("tech_requirements", []):
+                tech_items.extend(table.get("items", []) or [])
+            if tech_items:
+                params["tech_table_items"] = tech_items
         pkg_entry = {
             "package_no": pkg_no,
             "name": pkg_name,
             "budget": budget_per_pkg.get(str(pkg_no), budget_total) if budget_per_pkg else budget_total,
             "parameters": params,
         }
-        # 融合表格分类结果中的产品清单数据
-        if table_results and params.get("table_items") is None:
+        # 回退：当包章节内未识别到表格，再降级使用全局结果。
+        if table_results and params.get("table_items") is None and params.get("tech_table_items") is None:
             try:
                 classification = table_results.get("_classification", {})
                 for pl in classification.get("product_lists", []):
                     items = pl.get("items", [])
                     if items:
                         pkg_entry["parameters"]["table_items"] = items
+                        pkg_entry["parameters"]["product_table_items"] = items
+                        break
+                for tech_tbl in classification.get("tech_requirements", []):
+                    items = tech_tbl.get("items", [])
+                    if items:
+                        pkg_entry["parameters"]["tech_table_items"] = items
+                        break
             except Exception:
                 pass
         pkg_entry["strategy"] = analyze_package_strategy(pkg_entry)

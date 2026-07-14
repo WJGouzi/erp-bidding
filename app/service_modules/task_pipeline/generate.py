@@ -96,7 +96,10 @@ def _complete_generate(task_id, chapter_nos=None, retry_all=False, execution_id=
     chapter_records = _ensure_task_chapters(task, catalog_record)
     chapter_record_map = {item.chapter_no: item for item in chapter_records}
     target_chapter_nos = _resolve_retry_chapter_nos(chapter_nos, chapter_records, outline, retry_all=retry_all)
-    analysis_context = _extract_analysis_context(analysis_result) if analysis_result else {}
+    analysis_context = _extract_analysis_context(
+        analysis_result,
+        selected_package_no=getattr(task, "selected_package_no", None),
+    ) if analysis_result else {}
     if analysis_result:
         generation_plan = _build_generation_plan_snapshot(
             outline,
