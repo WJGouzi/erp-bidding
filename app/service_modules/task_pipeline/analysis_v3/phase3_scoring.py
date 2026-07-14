@@ -326,21 +326,42 @@ def _find_package_sections(source_sections, package_nos):
         return results if results else None
 
     def _find_best_pkg_node(nodes):
-        """从多个匹配节点中选取最佳者：优先选择包含表格的节点（真正的包内容章节）。"""
+        """从多个匹配节点中选取最佳者：优先选择包含技术规格表的节点，其次是包含任意表格的节点。"""
         if not nodes:
             return None
         if len(nodes) == 1:
             return nodes[0]
-        # 优先选节点自身或子节点包含表格的
-        def _has_table(sec):
+        
+        def _detect_tech_table_in_section(sec):
+            """检测章节内是否包含技术规格表。"""
+            for b in getattr(sec, "content", []):
+                if getattr(b, "type", "") == "table":
+                    headers = getattr(b, "headers", []) or []
+                    header_text = " ".join(h.lower()[:15] for h in headers)
+                    # 技术规格表的表头特征：包含规格/型号/技术等关键词
+                    tech_kw = ["规格", "型号", "技术参数", "技术规格", "技术要求", "规格型号"]
+                    if any(kw.lower() in header_text for kw in tech_kw):
+                        return True
+            for child in getattr(sec, "children", []):
+                if _detect_tech_table_in_section(child):
+                    return True
+            return False
+        
+        def _has_any_table(sec):
             for b in getattr(sec, "content", []):
                 if getattr(b, "type", "") == "table":
                     return True
             for child in getattr(sec, "children", []):
-                if _has_table(child):
+                if _has_any_table(child):
                     return True
             return False
-        with_table = [n for n in nodes if _has_table(n)]
+        
+        # 优先选包含技术规格表的节点
+        with_tech_table = [n for n in nodes if _detect_tech_table_in_section(n)]
+        if with_tech_table:
+            return with_tech_table[0]
+        # 其次选包含任意表格的节点
+        with_table = [n for n in nodes if _has_any_table(n)]
         if with_table:
             return with_table[0]
         # 都没表格时选子节点数最多的（更可能是正文而非目录占位）
@@ -1007,8 +1028,14 @@ def extract_packages(sections, package_nos, metadata_budget=None, pkg_name_map=N
     # 回退：当包章节未在技术章节内找到（常见于包标题与技术要求同级的文档结构），搜索全部章节
     missing_pkgs = [pkg_no for pkg_no, sec in pkg_section_map.items() if sec is None]
     if missing_pkgs:
-        logger.info("[phase3] 包章节 %s 未在技术章节内找到，尝试搜索全部章节", missing_pkgs)
-        all_pkg_map = _find_package_sections(sections, missing_pkgs)
+        logger.info("[phase3] 包章节 %s 未在技术章节内找到，从 tech_section 之后搜索", missing_pkgs)
+        # 限制搜索范围为 tech_section 之后的章节，避免选中采购清单区的包名（第1次出现）
+        if tech_section and tech_section in sections:
+            tech_idx = sections.index(tech_section)
+            search_sections = sections[tech_idx:]
+        else:
+            search_sections = sections
+        all_pkg_map = _find_package_sections(search_sections, missing_pkgs)
         for pkg_no, section in all_pkg_map.items():
             if section is not None and pkg_no in pkg_section_map:
                 pkg_section_map[pkg_no] = section
